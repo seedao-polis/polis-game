@@ -1,0 +1,1324 @@
+#!/usr/bin/env node
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { Agent } from '../core/agent.js';
+import { listSouls, soulExists } from '../core/soul.js';
+import { CliChannel } from '../channels/cli.js';
+import { channelForIdentity } from '../channels/index.js';
+import type { Channel } from '../channels/channel.js';
+import {
+  loadConfigs,
+  listAgents,
+  resolveAgent,
+  type ResolvedAgent,
+  type WorkerTarget,
+} from '../core/configs.js';
+
+/** Default workspace soul used when `serve` / `cli` is invoked without an explicit soul. */
+const DEFAULT_SOUL = 'tudigong';
+import { checkAndRecord } from '../core/auth.js';
+import { larkTimeToMs, recallMessage } from '../core/lark.js';
+import { runSupervisor, readServePid, isAlive } from '../core/supervisor.js';
+import { REPO_ROOT, RUNTIME_DIR } from '../core/paths.js';
+import { log } from '../core/log.js';
+import * as store from '../core/store.js';
+import { scanCorruptSessions, quarantineSession } from '../core/kimi-session.js';
+import { reloadSkillsIfChanged } from '../core/skills.js';
+import { fireEvent, listEventConfigs, getEventByRef, getEventConfig, describeSchedule } from '../core/events.js';
+import { enableLogSink, flushTelegramSync, isTelegramConfigured, sendTelegramMessage, sendTelegramAlert } from '../core/telegram.js';
+import { checkUserTokenExpiry, describeTokenExpiry } from '../core/token-watch.js';
+import { generateAndSendDailyReport, generateAndSendMonthlyReport } from '../core/ops-report.js';
+import { getFlag, hasFlag } from '../core/argv.js';
+
+// Load .env (Node >=20.12 built-in) so secrets like TELEGRAM_* reach process.env without a dotenv
+// dependency. Must run before anything reads the env; tolerant of a missing .env (env may come from
+// the shell instead). The supervisor inherits this into the worker it spawns.
+const loadEnvFile = (process as { loadEnvFile?: (p?: string) => void }).loadEnvFile;
+if (loadEnvFile) {
+  try {
+    loadEnvFile(path.join(REPO_ROOT, '.env'));
+  } catch {
+    /* no .env present (or unreadable) — fine */
+  }
+}
+
+function usage(): void {
+  console.log(`agent — 城邦土地神 常驻 agent 框架（kimi-cli + lark-cli）
+
+用法:
+  agent cli [soul]                              本地终端机 REPL，直接跟 agent 对话（不碰飞书，有对话记忆）
+  agent serve [soul] [--only <agentId>] [--sup] [--quiet]  启动常驻服务；不带 soul 默认 tudigong；加 --sup 才挂监督者（定时事件/LP 补底/会话守护/热重启/PID 锁）+ 自动跑 user-token 数据采集（群成员/文档访问，采集不回复、不替你本人发言），不加则裸跑 worker、无采集；--quiet 静默模式：照常采集对话与数据、但不回复任何飞书 p2p/群/@（CLI 不受影响）
+  agent update [--pull]                         重新构建并热重启运行中的 serve（--pull 先 git pull）
+  agent agents                                  列出 configs 里的 agent 与其 identity / listen / trigger
+  agent run <soul> [--channel cli]              本地 REPL 测试（不碰飞书）
+  agent ask <soul> <消息...>                    一次性问答（非互动）
+  agent souls                                   列出可用的 soul（workspaces/）
+  agent backfill                                把 .agent/transcripts/*.jsonl 的旧记录迁移到 SQLite 数据库
+  agent backfill-members                        从 logs/*.log 补录历史群成员同步轮次到 member_sync_rounds（仅补 live 记录开始之前）
+  agent calendar-events                          列出当前追踪的未开始活动及最新报名数（接受/拒绝/待定/待回复）
+  agent doc-views                                列出最近采集到的文档访问记录（访问者 + 最近访问时间）
+  agent token-check [--test]                     查看 user token 剩余有效期并按需推送到期提醒（--test 发一条测试提醒到 Telegram）
+  agent daily-reset [--floor <n>]               立即执行每日 LP 补底（预设下限 10）
+  agent reset-all-pt [--to <n>]                 把所有人的 LP 重置为同一数值（预设 120）
+  agent doctor [--fix]                           扫描损坏的 kimi 会话并查看最近错误（--fix 隔离损坏会话）
+  agent events                                   列出已定义的事件（含编号、范围、排程）
+  agent event <编号|id> [--test] [--to <oc/ou>] [--dry-run]  手动触发一个事件（仅 server 端；--test 只发给操作者本人 P2P；--dry-run 只预览不发送）
+  agent unsend <message_id> [--as bot|user]     撤回一条已发送的消息（默认 as bot；事件消息就是 bot 发的）
+  agent report daily|monthly [--date YYYY-MM-DD] [--lark-user <open_id>] [--lark-chat <chat_id>]  生成并发送运营数据报告（默认 Telegram；--lark-user 私聊预览，--lark-chat 发群）
+  agent tg-test [消息...]                        发一条测试消息到 Telegram（验证 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID）
+  agent help                                    显示说明
+
+范例:
+  agent cli                                     用默认 soul（tudigong）开 REPL 对话
+  agent cli tudigong                            指定 soul 开 REPL 对话
+  agent serve                                   启动 tudigong（默认 soul），裸跑 worker、不挂监督者
+  agent serve --sup                             启动 tudigong + 监督者（常驻、可热重启、跑定时事件）
+  agent serve tudigong --sup                    指定 soul 启动 + 监督者
+  agent serve --only tudigong-bot --quiet       只启动 tudigong-bot、静默采集、裸跑无监督者
+  agent update                                  改完 code 后热重启（需 serve --sup 在跑）
+  agent ask tudigong "你好"                     一次性问一句
+  agent backfill                                迁移旧 JSONL 采集数据到数据库
+  agent daily-reset --floor 20                  把余额低于 20 的用户补到 20
+  agent reset-all-pt                            把所有人的 LP 重置为 120
+  agent events                                  查看事件编号
+  agent event 1                                 手动触发 1 号事件（等同 agent event lurker-discovered）
+  agent event 1 --test                          只发给操作者本人 P2P（验收用，不发到真实目标群）
+`);
+}
+
+/** worker: read configs → for each enabled agent run an auth check, resolve it, build Agent + channel, and stay resident until a termination signal. */
+async function runWorker(target: WorkerTarget): Promise<void> {
+  const cfg = loadConfigs();
+  const ids = listAgents(cfg).filter((id) => {
+    const raw = cfg.agents.agents[id];
+    if (raw?.enabled !== true) return false;
+    if (target.only) return id === target.only;
+    if (target.soul) return raw.soul === target.soul;
+    return false;
+  });
+
+  // Startup cleanup: quarantine any sessions a previous crash / hot-reload left corrupt, so they
+  // don't trip --continue on the first message. The background janitor lives in the supervisor and
+  // is NOT reloaded by `pnpm agent update`, so doing it here guarantees every worker start is clean.
+  try {
+    const corrupt = scanCorruptSessions();
+    let healed = 0;
+    for (const c of corrupt) {
+      if (quarantineSession(c.sessionDir)) {
+        healed += 1;
+        log.warn(`启动清理：隔离损坏会话（orphans=${c.orphans}）${c.sessionDir}`);
+      }
+    }
+    if (healed > 0) log.info(`启动清理：共隔离 ${healed} 个损坏会话（多半是上次重启打断留下的）`);
+  } catch (e) {
+    log.warn('启动清理失败：', (e as Error).message);
+  }
+
+  // Resolve each agent to be started (including listen → oc_ list discovery).
+  const resolved: ResolvedAgent[] = ids.map((id) => resolveAgent(id, cfg));
+
+  // Under --sup the supervisor passes the served soul here (AGENT_COLLECTOR_SOUL): bring up that soul's
+  // user-identity channel as a collect-only collector. Roster sync / doc-view / RSVP / message capture all
+  // require a user token (a Feishu constraint), but the collector never replies on the operator's behalf —
+  // replies stay the bot's job. Any user-identity agent already in the set is likewise forced collect-only,
+  // so the user-token data plane is never tied to running an agent that answers as the operator.
+  const collectorSoul = process.env.AGENT_COLLECTOR_SOUL;
+  if (collectorSoul) {
+    for (const r of resolved) {
+      if (r.identity === 'user') r.collectOnly = true;
+    }
+    const userId = listAgents(cfg).find(
+      (id) => cfg.agents.agents[id]?.identity === 'user' && cfg.agents.agents[id]?.soul === collectorSoul
+    );
+    if (userId && !ids.includes(userId)) {
+      resolved.push({ ...resolveAgent(userId, cfg), collectOnly: true });
+    } else if (!userId) {
+      log.warn(`soul【${collectorSoul}】没有 user 身份的 agent，跳过 user-token 数据采集（群成员/文档访问需要 user token）。`);
+    }
+  }
+
+  if (resolved.length === 0) {
+    log.error(
+      target.only
+        ? `没有可启动的 agent（--only ${target.only} 未启用或不存在）`
+        : target.soul
+          ? `没有 soul 为 ${target.soul} 的 enabled agent`
+          : '没有任何 enabled 的 agent（请在 configs/agents.json 设置 enabled:true）'
+    );
+    process.exit(1);
+  }
+
+  // The runtime DB is named after the served soul (.agent/<soul>.db). Every agent in one worker shares a
+  // soul; pin it here — before any store access — so this process and the MCP server (its own process, via
+  // Agent.buildMcpConfig's env) open the same per-soul DB file.
+  process.env.AGENT_SOUL = resolved[0].workspace;
+
+  // Skill reload: kimi snapshots a session's skills at creation and never re-reads them on --continue.
+  // On every worker (re)start — which includes `agent update`'s hot-reload — reconcile the served soul's
+  // skill files against the last fingerprint; when they changed, the soul's sessions are quarantined so
+  // each chat's next message rebuilds a session that loads the new skills.
+  try {
+    const skillReload = reloadSkillsIfChanged(resolved[0].workspace);
+    if (skillReload.firstRun) {
+      log.info(`skill 基线已记录（soul=${resolved[0].workspace}）；之后改动 skill 会在重启 / update 时自动重置会话套用。`);
+    } else if (skillReload.changed) {
+      log.info(`skill 有变更：已重置 ${skillReload.quarantined} 个会话，相关群下次对话将载入新 skill。`);
+    }
+  } catch (e) {
+    log.warn('skill 重载检查失败：', (e as Error).message);
+  }
+
+  // Login expiry check: check each lark profile in use once.
+  const checkedProfiles = new Set<string>();
+  for (const r of resolved) {
+    if (checkedProfiles.has(r.larkProfile)) continue;
+    checkedProfiles.add(r.larkProfile);
+    const result = checkAndRecord(r.larkProfile, r.notifyChatId);
+    log.info(
+      `auth 检查 profile=${r.larkProfile}：${result.loggedIn ? '已登录' : '未登录'}` +
+        (result.refreshExpiresAt ? `，refresh 到期 ${result.refreshExpiresAt}` : '')
+    );
+  }
+
+  const runs: Promise<void>[] = [];
+  for (const r of resolved) {
+    log.info(
+      `启动 agent【${r.id}】（identity=${r.identity}，soul=${r.soul}，监听 ${r.chats.length} 群，trigger=${r.trigger}）`
+    );
+    const agent = new Agent(r.workspace, {
+      workspace: r.workspace,
+      larkProfile: r.larkProfile,
+      feishuChatId: r.chats[0]?.chatId,
+      kimiProfile: r.kimiProfile,
+    });
+    const channel = channelForIdentity(r.identity, r);
+    runs.push(channel.run(agent));
+  }
+
+  await Promise.all(runs);
+}
+
+/** Rebuild (tsc); on success notify the running serve supervisor to hot-reload (SIGHUP). */
+async function update(argv: string[]): Promise<void> {
+  if (hasFlag(argv, 'pull')) {
+    log.info('git pull --ff-only…');
+    try {
+      execFileSync('git', ['pull', '--ff-only'], { stdio: 'inherit', cwd: REPO_ROOT });
+    } catch {
+      log.error('git pull 失败，已中止（未重新构建）。');
+      process.exit(1);
+    }
+  }
+
+  log.info('构建中（pnpm build）…');
+  try {
+    // Run build with the same package manager (pnpm/npm) that launched this process, to avoid PATH issues.
+    const pm = process.env.npm_execpath;
+    if (pm) {
+      execFileSync(process.execPath, [pm, 'run', 'build'], { stdio: 'inherit', cwd: REPO_ROOT });
+    } else {
+      execFileSync('pnpm', ['run', 'build'], { stdio: 'inherit', cwd: REPO_ROOT });
+    }
+  } catch {
+    log.error('构建失败，已中止（不重载，运行中的 serve 仍用旧版）。');
+    process.exit(1);
+  }
+
+  const pid = readServePid();
+  if (pid && isAlive(pid)) {
+    process.kill(pid, 'SIGHUP');
+    log.info(`已通知运行中的 serve（pid=${pid}）热重启，应用新版程序。`);
+  } else {
+    log.info('构建完成。目前没有运行中的 serve；下次 pnpm agent serve 即用新版。');
+  }
+}
+
+/**
+ * Migrate historical JSONL transcript files from .agent/transcripts/ into the SQLite database.
+ * Each file is named <chatId>.jsonl; each line is a JSON object with at minimum
+ * message_id and create_time. Skips lines that are already present (INSERT OR IGNORE).
+ */
+function backfill(): void {
+  const transcriptsDir = path.join(RUNTIME_DIR, 'transcripts');
+  if (!fs.existsSync(transcriptsDir)) {
+    console.log('没有找到 .agent/transcripts/ 目录，无需迁移。');
+    return;
+  }
+  const files = fs.readdirSync(transcriptsDir).filter((f) => f.endsWith('.jsonl'));
+  if (files.length === 0) {
+    console.log('transcripts/ 目录内没有 .jsonl 文件，无需迁移。');
+    return;
+  }
+  let totalWritten = 0;
+  let totalSkipped = 0;
+  for (const file of files) {
+    const chatId = path.basename(file, '.jsonl');
+    store.upsertChat({ chatId, external: false });
+    const filePath = path.join(transcriptsDir, file);
+    const lines = fs.readFileSync(filePath, 'utf8').split('\n');
+    let written = 0;
+    let skipped = 0;
+    for (const line of lines) {
+      const s = line.trim();
+      if (!s) continue;
+      let obj: Record<string, unknown>;
+      try {
+        obj = JSON.parse(s) as Record<string, unknown>;
+      } catch {
+        skipped += 1;
+        continue;
+      }
+      const messageId = (obj['message_id'] as string | undefined) ?? '';
+      if (!messageId) { skipped += 1; continue; }
+      const inserted = store.insertMessage({
+        messageId,
+        chatId,
+        senderOpenId: (obj['sender_open_id'] as string | undefined) ?? '',
+        senderName: (obj['sender_name'] as string | undefined) ?? '',
+        msgType: (obj['msg_type'] as string | undefined) ?? 'text',
+        text: (obj['text'] as string | undefined) ?? '',
+        mentions: Array.isArray(obj['mentions']) ? (obj['mentions'] as string[]) : [],
+        createTime: larkTimeToMs(obj['create_time']),
+      });
+      if (inserted) { written += 1; } else { skipped += 1; }
+    }
+    console.log(`  ${file}: 写入 ${written} 条，跳过 ${skipped} 条`);
+    totalWritten += written;
+    totalSkipped += skipped;
+  }
+  console.log(`\n迁移完成：共写入 ${totalWritten} 条，跳过 ${totalSkipped} 条。`);
+}
+
+/**
+ * Reconstruct the member-sync round time-series (member_sync_rounds) from historical log files,
+ * for the period BEFORE live recording began. Parses the "群成员同步完成：…" completion lines under
+ * logs/*.log (oldest first); each becomes one round. Per-person (open_id, name) detail is left empty
+ * (the old logs never carried it). The 离开 (left) count is taken from the completion line when present
+ * (new format), else summed from the per-chat "…离开 N（已保留）…" lines emitted just before it.
+ *
+ * Deduped head-counts can't be read from the old logs, so they're ESTIMATED under an explicit model
+ * (assume nobody left historically):
+ *   present_distinct = roster_total   (no leavers → distinct present == distinct ever seen)
+ *   present_internal = min(current internal head-count, roster_total)   (internal held at today's value)
+ *   present_external = roster_total − present_internal                  (all historical growth is external)
+ * "current internal head-count" is directoryStats().presentInternal at backfill time.
+ *
+ * Re-runnable: existing backfill rows are deleted and rebuilt each run (live rows untouched). synced_at
+ * is UNIQUE and rounds at/after the earliest live round are skipped, so it never collides with live data.
+ */
+function backfillMemberRounds(): void {
+  const logsDir = path.join(REPO_ROOT, 'logs');
+  if (!fs.existsSync(logsDir)) {
+    console.log('没有找到 logs/ 目录，无可补录的日志。');
+    return;
+  }
+  const files = fs.readdirSync(logsDir).filter((f) => f.endsWith('.log')).sort();
+  if (files.length === 0) {
+    console.log('logs/ 目录内没有 .log 文件，无可补录的日志。');
+    return;
+  }
+  // Baseline for the internal-group estimate: today's distinct internal head-count, held constant
+  // across all historical rounds (external = roster − internal absorbs the growth).
+  const internalBaseline = store.directoryStats().presentInternal;
+  // Rebuild backfill rows from scratch so re-runs pick up the current model/baseline (live rows kept).
+  const wiped = store.deleteBackfillRounds();
+  // Only backfill rounds strictly before the first live-recorded round (when one exists), so we fill
+  // history without colliding with or duplicating the rounds the running service already records.
+  const liveFrom = store.earliestMemberRoundAt('live');
+  const TS = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.\d{3}\b/;
+  // Completion line; the 在群去重 and 离开 groups are both optional (only present in newer log formats),
+  // matched non-capturing so the numbered capture indices below stay stable across all three formats.
+  const DONE = /群成员同步完成：(\d+) 群、在群合计 (\d+) 人(?:、在群去重 \d+ 人)?、本轮新增 (\d+) 人(?:、离开 (\d+) 人)?、改名 (\d+) 人；名册累计 (\d+) 人/;
+  const PER_CHAT = /群成员同步【.*?】：在群 \d+ 人，新增 \d+，离开 (\d+)（已保留），改名 \d+/;
+
+  const tsToUnix = (line: string): number | null => {
+    const m = TS.exec(line);
+    if (!m) return null;
+    const [, y, mo, d, h, mi, s] = m.map(Number);
+    return Math.floor(new Date(y, mo - 1, d, h, mi, s).getTime() / 1000);
+  };
+
+  let inserted = 0;
+  let skipped = 0;
+  let pending: Array<{ at: number; left: number }> = []; // per-chat left counts awaiting a completion
+  for (const file of files) {
+    const lines = fs.readFileSync(path.join(logsDir, file), 'utf8').split('\n');
+    for (const line of lines) {
+      const at = tsToUnix(line);
+      if (at === null) continue;
+      const pc = PER_CHAT.exec(line);
+      if (pc) {
+        pending.push({ at, left: Number(pc[1]) });
+        continue;
+      }
+      const done = DONE.exec(line);
+      if (!done) continue;
+      const chatCount = Number(done[1]);
+      const presentTotal = Number(done[2]);
+      const joinedCount = Number(done[3]);
+      const leftFromLine = done[4] !== undefined ? Number(done[4]) : null;
+      const renamedCount = Number(done[5]);
+      const rosterTotal = Number(done[6]);
+      // Attribute per-chat left lines within the 2 minutes before this completion; drop older orphans
+      // (rounds whose completion line was dropped at DEBUG never reach here, so their left can't leak).
+      const recent = pending.filter((p) => p.at >= at - 120 && p.at <= at);
+      const leftCount = leftFromLine ?? recent.reduce((sum, p) => sum + p.left, 0);
+      pending = [];
+      if (liveFrom !== null && at >= liveFrom) { skipped += 1; continue; }
+      // Estimated deduped head-counts (see the model in this function's doc comment).
+      const presentDistinct = rosterTotal;
+      const presentInternal = Math.min(internalBaseline, rosterTotal);
+      const presentExternal = presentDistinct - presentInternal;
+      const ok = store.recordMemberSyncRound({
+        syncedAt: at,
+        chatCount,
+        presentTotal,
+        presentDistinct,
+        presentInternal,
+        presentExternal,
+        joinedCount,
+        leftCount,
+        renamedCount,
+        rosterTotal,
+        source: 'backfill',
+      });
+      if (ok) inserted += 1; else skipped += 1;
+    }
+  }
+  if (wiped > 0) console.log(`已清除旧的补录轮次 ${wiped} 条，按当前模型重建。`);
+  console.log(`内部群基准（现在的内部群去重人数）：${internalBaseline} 人；历史内部恒按此值、外部 = 名册累计 − 内部。`);
+  console.log(`成员同步轮次补录完成：写入 ${inserted} 轮，跳过 ${skipped} 轮（处于 live 记录区间）。`);
+  if (liveFrom !== null) {
+    const when = new Date(liveFrom * 1000).toISOString().replace('T', ' ').slice(0, 19);
+    console.log(`（live 记录最早从 ${when} 开始，仅补录此之前的历史轮次。）`);
+  }
+}
+
+/**
+ * Diagnose self-heal health: scan our kimi sessions for corruption (orphan tool calls), optionally
+ * quarantine them (--fix), and show the most recent failures from the error ledger.
+ */
+function doctor(argv: string[]): void {
+  const fix = hasFlag(argv, 'fix');
+  console.log('扫描损坏的 kimi 会话（仅 .agent/ 下、本框架自己的会话）…');
+  const corrupt = scanCorruptSessions();
+  if (corrupt.length === 0) {
+    console.log('  没有发现损坏会话。');
+  } else {
+    for (const c of corrupt) {
+      const where = c.workDir || c.sessionDir;
+      if (fix) {
+        const ok = quarantineSession(c.sessionDir);
+        console.log(`  ${ok ? '已隔离' : '隔离失败'}（orphans=${c.orphans}）${where}`);
+      } else {
+        console.log(`  损坏（orphans=${c.orphans}）${where}`);
+      }
+    }
+    if (!fix) console.log('\n  加上 --fix 可隔离这些会话（可逆，仅改名 + 移除索引行）。');
+  }
+
+  const errors = store.recentErrors(15);
+  console.log(`\n最近 ${errors.length} 条错误记录：`);
+  if (errors.length === 0) {
+    console.log('  （暂无）');
+  } else {
+    for (const e of errors) {
+      const when = new Date(e.created_at * 1000).toISOString().replace('T', ' ').slice(0, 19);
+      console.log(
+        `  ${when}  [${e.corr_id ?? '------'}]  ${e.kind}${e.healed ? '(已自愈)' : ''}  ${e.soul ?? ''}  ${e.summary}`
+      );
+    }
+  }
+
+  const inactive = store.listInactiveChats();
+  if (inactive.length > 0) {
+    console.log(`\n已停服的群 ${inactive.length} 个（已自动停止轮询与同步）：`);
+    for (const d of inactive) {
+      const when = new Date(d.inactiveAt * 1000).toISOString().replace('T', ' ').slice(0, 19);
+      const reasonZh = d.reason === 'inaccessible' ? '不可访问/被移出' : '已解散(232009)';
+      console.log(`  ${when}  [${reasonZh}]  ${d.name || '(无名)'}  ${d.chatId}`);
+    }
+  }
+}
+
+/** List the agents in configs along with their key settings. */
+function agentsList(): void {
+  const cfg = loadConfigs();
+  const ids = listAgents(cfg);
+  if (ids.length === 0) {
+    console.log('(configs/agents.json 尚无 agent)');
+    return;
+  }
+  for (const id of ids) {
+    const raw = cfg.agents.agents[id];
+    const listen = Array.isArray(raw.listen) ? raw.listen.join(',') : raw.listen;
+    console.log(
+      `${id}\t[${raw.enabled ? 'enabled' : 'disabled'}]\t` +
+        `identity=${raw.identity}\tlisten=${listen}\ttrigger=${raw.trigger ?? 'mention'}\tcapture=${raw.capture ?? raw.identity === 'user'}`
+    );
+  }
+}
+
+// ── command handlers ──────────────────────────────────────────
+// One handler per `agent <cmd>` subcommand. Each receives the full argv (the command name is at
+// argv[0]; positional args are argv[1..]). Handlers are registered in COMMANDS and dispatched by main().
+
+async function cmd_agents(_argv: string[]): Promise<void> {
+  agentsList();
+}
+
+async function cmd_backfill(_argv: string[]): Promise<void> {
+  backfill();
+}
+
+async function cmd_backfill_members(_argv: string[]): Promise<void> {
+  backfillMemberRounds();
+}
+
+async function cmd_calendar_events(_argv: string[]): Promise<void> {
+  // Deduplicate: keep only the latest round per event_id, then filter to upcoming (not yet started).
+  const allRows = store.recentCalendarEventRsvpRounds(500);
+  const latestPerEvent = new Map<string, typeof allRows[0]>();
+  for (const row of allRows) {
+    if (!latestPerEvent.has(row.eventId)) latestPerEvent.set(row.eventId, row);
+  }
+  const nowSec = Math.floor(Date.now() / 1000);
+  const upcoming = [...latestPerEvent.values()]
+    .filter((r) => r.startTime > nowSec)
+    .sort((a, b) => a.startTime - b.startTime);
+  if (upcoming.length === 0) {
+    console.log('(暂无追踪中的活动)');
+  } else {
+    for (const r of upcoming) {
+      const startStr = new Date(r.startTime * 1000).toLocaleString();
+      console.log(`【${r.title}】开始：${startStr}`);
+      console.log(`  报名(接受) ${r.accepted}  拒绝 ${r.declined}  待定 ${r.tentative}  待回复 ${r.needsAction}`);
+    }
+  }
+}
+
+async function cmd_doc_views(_argv: string[]): Promise<void> {
+  // Show the most recent document view events (one line per observed viewer-view), newest first.
+  const rows = store.recentDocViewEvents(100);
+  if (rows.length === 0) {
+    console.log('(暂无文档访问记录)');
+  } else {
+    for (const r of rows) {
+      const when = new Date(r.lastViewTime * 1000).toLocaleString();
+      console.log(`【${r.title || r.fileToken}】${r.viewerName || r.viewerId} 访问于 ${when}`);
+    }
+  }
+}
+
+async function cmd_token_check(argv: string[]): Promise<void> {
+  // Resolve the lark profile from the first enabled agent (same source the channels use).
+  let profile = '';
+  try {
+    const cfg = loadConfigs();
+    for (const id of listAgents(cfg)) {
+      if (cfg.agents.agents[id]?.enabled) {
+        profile = resolveAgent(id, cfg).larkProfile;
+        break;
+      }
+    }
+  } catch { /* ignore */ }
+  if (!profile) {
+    log.error('找不到可用的 lark profile（configs 里没有 enabled 的 agent）。');
+    process.exit(1);
+  }
+  if (hasFlag(argv, 'test')) {
+    // Send a sample reminder to the alert chat to verify delivery, without touching dedup state.
+    const ok = await sendTelegramAlert(
+      `【城邦土地神 提醒｜测试】这是 token 到期提醒的测试消息（profile ${profile}）。\n` +
+      `真实提醒会在到期前 3 天 / 2 天 / 1 天 / 当天各推一次，并附重新授权命令。`
+    );
+    console.log(ok ? '已发送测试提醒到 Telegram alert 频道。' : '发送失败：未配置 TELEGRAM_BOT_TOKEN 或 alert chat。');
+    return;
+  }
+  console.log(describeTokenExpiry(profile));
+  await checkUserTokenExpiry(profile);
+}
+
+async function cmd_doctor(argv: string[]): Promise<void> {
+  doctor(argv);
+}
+
+async function cmd_events(_argv: string[]): Promise<void> {
+  const list = listEventConfigs();
+  if (list.length === 0) {
+    console.log('(尚无事件定义)');
+  } else {
+    console.log('编号\t事件 id\t\t范围\t排程\t标题');
+    list.forEach((e, i) => {
+      const sch = e.schedule ? describeSchedule(e.schedule) : '手动';
+      console.log(`[${i + 1}]\t${e.eventTypeId}\t[${e.scope}]\t${sch}\t${e.title}`);
+    });
+    console.log('\n手动触发：pnpm agent event <编号|事件id> [--to <oc/ou>] [--actor <ou>]');
+  }
+}
+
+// Manually fire any event by its number (from `agent events`) or its event id. This is a server-side
+// CLI command only — it is never exposed to chat users or MCP, so triggering stays an operator action.
+async function cmd_event(argv: string[]): Promise<void> {
+  const ref = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+  if (!ref) {
+    log.error('用法: agent event <编号|事件id> [--test] [--to <oc_xxx|ou_xxx>] [--actor <ou_xxx>] [--reason <r>] [--profile <p>] [--dry-run]\n      （编号见 agent events；--test 只发给操作者本人 P2P）');
+    process.exit(1);
+  }
+  const cfgEvent = getEventByRef(ref);
+  if (!cfgEvent) {
+    log.error(`找不到事件【${ref}】。用 agent events 查看可用事件与编号。`);
+    process.exit(1);
+  }
+  // Resolve the lark profile (prefer --profile) and the operator's own open_id (the lark profile's
+  // userOpenId) from the first enabled agent — the latter is the --test destination.
+  let profile = getFlag(argv, 'profile');
+  let operatorOpenId: string | undefined;
+  try {
+    const cfg = loadConfigs();
+    for (const id of listAgents(cfg)) {
+      if (cfg.agents.agents[id]?.enabled) {
+        const r = resolveAgent(id, cfg);
+        if (!profile) profile = r.larkProfile;
+        operatorOpenId = r.larkProfileMeta.userOpenId;
+        break;
+      }
+    }
+  } catch { /* ignore */ }
+  const test = hasFlag(argv, 'test');
+  const to = getFlag(argv, 'to');
+  // --test wins: send only to the operator's own P2P (safe verification, no real group/recipient).
+  let target = to ? (to.startsWith('ou_') ? { userId: to } : { chatId: to }) : undefined;
+  if (test) {
+    if (!operatorOpenId) {
+      log.error('--test 需要 lark profile 的 userOpenId（操作者），但未解析到。');
+      process.exit(1);
+    }
+    target = { userId: operatorOpenId };
+  }
+  const actorOpenId = getFlag(argv, 'actor');
+  const reason = getFlag(argv, 'reason') ?? (test ? 'manual_test' : 'manual');
+  const dryRun = hasFlag(argv, 'dry-run');
+  // Manual runs force-fire: bypass schedule timing + probability, and relax prepare() audience gating.
+  const modeTag = `${dryRun ? '预览' : '手动触发'}${test ? '（test 模式·仅发给操作者本人 P2P）' : ''}`;
+  log.info(`${modeTag}事件【${cfgEvent.eventTypeId}】（强制，不受定时与概率限制）…`);
+  const res = await fireEvent(cfgEvent.eventTypeId, { triggerReason: reason, actorOpenId, target, profile, dryRun, force: true });
+  if (res.ok && dryRun) {
+    console.log('dry-run 完成（未发送、未发 LP）。见上方预览。');
+  } else if (res.ok) {
+    console.log(`已发送：message_id=${res.messageId ?? '?'}（dispatch=${res.dispatchId}）`);
+    if (res.messageId) console.log(`撤回：pnpm agent unsend ${res.messageId}`);
+  } else if (res.skipped) {
+    console.log(`已跳过：事件【${cfgEvent.eventTypeId}】判定本次无需发送（例如没有符合条件的对象）。`);
+  } else {
+    console.log(`发送失败：dispatch=${res.dispatchId} error=${res.error ?? '?'}`);
+    process.exit(1);
+  }
+}
+
+// Recall (撤回) a sent message by its message_id. Server-side operator command. Events are bot-sent,
+// so the default identity is bot; pass --as user to recall a user-identity message.
+async function cmd_unsend(argv: string[]): Promise<void> {
+  const messageId = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+  if (!messageId) {
+    log.error('用法: agent unsend <message_id> [--as bot|user] [--profile <p>]');
+    process.exit(1);
+  }
+  let profile = getFlag(argv, 'profile');
+  if (!profile) {
+    try {
+      const cfg = loadConfigs();
+      for (const id of listAgents(cfg)) {
+        if (cfg.agents.agents[id]?.enabled) { profile = resolveAgent(id, cfg).larkProfile; break; }
+      }
+    } catch { /* ignore */ }
+  }
+  const as = (getFlag(argv, 'as') as 'bot' | 'user' | undefined) ?? 'bot';
+  log.info(`撤回消息【${messageId}】（as ${as}）…`);
+  const res = recallMessage(messageId, { as, profile });
+  if (res.ok) {
+    console.log(`已撤回：${messageId}`);
+  } else {
+    console.log(`撤回失败：${res.error ?? '?'}`);
+    process.exit(1);
+  }
+}
+
+async function cmd_badge(argv: string[]): Promise<void> {
+  const sub = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+  if (!sub || sub === 'help') {
+    log.error([
+      '用法:',
+      '  agent badge import <json_file> [--profile <p>]      导入徽章定义（JSON 单对象或数组）',
+      '  agent badge award <badge-ref> <target> [--profile <p>] [--note <text>] [--dry-run]  发放徽章',
+      '  agent badge list [target]                           列出徽章（无参数=全部定义，有参数=成员持有）',
+    ].join('\n'));
+    process.exit(1);
+  }
+
+  // Resolve lark profile and operator open_id (same pattern as `event` command).
+  let profile = getFlag(argv, 'profile');
+  let operatorOpenId: string | undefined;
+  try {
+    const cfg = loadConfigs();
+    for (const id of listAgents(cfg)) {
+      if (cfg.agents.agents[id]?.enabled) {
+        const r = resolveAgent(id, cfg);
+        if (!profile) profile = r.larkProfile;
+        operatorOpenId = r.larkProfileMeta.userOpenId;
+        break;
+      }
+    }
+  } catch { /* ignore */ }
+
+  // badge import <json_file>
+  if (sub === 'import') {
+    const jsonFile = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
+    if (!jsonFile) {
+      log.error('用法: agent badge import <json_file>');
+      process.exit(1);
+    }
+    let raw: string;
+    try {
+      raw = fs.readFileSync(jsonFile, 'utf-8');
+    } catch (e) {
+      log.error(`读取文件失败：${jsonFile}：${(e as Error).message}`);
+      process.exit(1);
+    }
+    let items: unknown[];
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      items = Array.isArray(parsed) ? parsed : [parsed];
+    } catch (e) {
+      log.error(`JSON 解析失败：${(e as Error).message}`);
+      process.exit(1);
+    }
+    let imported = 0;
+    for (const item of items) {
+      if (typeof item !== 'object' || item === null) continue;
+      const b = item as Record<string, unknown>;
+      const headline = (b['headline'] as string | undefined) ?? '';
+      const category = (b['category'] as string | undefined) ?? '';
+      const duration = (b['duration'] as string | undefined) ?? '';
+      // Generate a stable badge_id from content hash when not provided.
+      const badgeId = (b['badge_id'] as string | undefined) ||
+        'badge-' + createHash('sha1').update(`${headline}|${category}|${duration}`).digest('hex').slice(0, 8);
+      const badgeName = (b['badge_name'] as string | undefined) || headline;
+      store.upsertBadge({
+        badgeId,
+        name: badgeName,
+        description: (b['description'] as string | undefined) ?? '',
+        emoji: (b['emoji'] as string | undefined) ?? '',
+        headline,
+        file: (b['file'] as string | undefined) ?? '',
+        title: (b['title'] as string | undefined) ?? '',
+        type: (b['type'] as string | undefined) ?? '',
+        role: (b['role'] as string | undefined) ?? '',
+        endorser: (b['endorser'] as string | undefined) ?? '',
+        duration,
+        category,
+        event: (b['event'] as string | undefined) ?? '',
+      });
+      console.log(`导入：badge_id=${badgeId}  headline=${headline || badgeName}`);
+      imported++;
+    }
+    console.log(`共导入 ${imported} 条徽章定义。`);
+    return;
+  }
+
+  // badge award <badge-ref> <target...> [--note <text>] [--dry-run]
+  if (sub === 'award') {
+    const badgeRef = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
+    // Collect every positional target after the badge ref, skipping flags and their values so a
+    // value like `--note 恭喜` is never mistaken for a recipient.
+    const valueFlags = new Set(['profile', 'note']);
+    const targetArgs: string[] = [];
+    for (let i = 3; i < argv.length; i++) {
+      const a = argv[i]!;
+      if (a.startsWith('--')) {
+        if (valueFlags.has(a.slice(2))) i++;
+        continue;
+      }
+      targetArgs.push(a);
+    }
+    if (!badgeRef || targetArgs.length === 0) {
+      log.error('用法: agent badge award <badge-ref> <target> [target2 ...] [--profile <p>] [--note <text>] [--dry-run]');
+      process.exit(1);
+    }
+    const note = getFlag(argv, 'note');
+    const dryRun = hasFlag(argv, 'dry-run');
+
+    // Mirror this award's logs — the award lines plus every event fireEvent emits — to Telegram so the
+    // supervisor's log stream captures badge activity even though this is a standalone CLI command. The
+    // sink's flush timer is unref'd, so drain it synchronously on exit. Skipped under --dry-run.
+    if (!dryRun) {
+      enableLogSink();
+      process.on('exit', () => { try { flushTelegramSync(); } catch { /* best-effort */ } });
+    }
+
+    // Resolve badge.
+    const badge = store.getBadge(badgeRef);
+    if (!badge) {
+      log.error(`找不到徽章【${badgeRef}】。用 agent badge list 查看可用徽章。`);
+      process.exit(1);
+    }
+    const badgeDisplay = badge.headline || badge.name;
+    const badgeName = badge.headline || badge.name;
+
+    // Resolve every target to an open_id + name. Any failure (not found / ambiguous) aborts the whole
+    // award so a batch never goes out half-resolved. Repeated targets are de-duplicated.
+    const recipients: Array<{ openId: string; name: string }> = [];
+    const seen = new Set<string>();
+    for (const t of targetArgs) {
+      let openId: string;
+      let name = '';
+      if (t.startsWith('ou_')) {
+        openId = t;
+        name = store.memberName(openId) || openId;
+      } else {
+        const matches = store.findOpenIdsByName(t);
+        if (matches.length === 0) {
+          log.error(`在成员目录中找不到名称为【${t}】的成员（仅搜索已同步的 chat_members）。`);
+          log.error('建议：改用 ou_xxxxxx 直接指定，或等待下一轮成员目录同步后重试。');
+          process.exit(1);
+        }
+        if (matches.length > 1) {
+          log.error(`名称【${t}】匹配到多名成员，请改用 ou_xxxxxx 明确指定：`);
+          for (const m of matches) console.log(`  ${m.openId}  ${m.name}`);
+          process.exit(1);
+        }
+        openId = matches[0]!.openId;
+        name = matches[0]!.name;
+      }
+      if (seen.has(openId)) continue;
+      seen.add(openId);
+      recipients.push({ openId, name: name || openId });
+    }
+
+    // Pick the announcement event: a badge's own event (first "/"-segment) overrides the defaults;
+    // otherwise the batch default for 2+ recipients, or the single default for one.
+    const announceEventId = (badge.event ? badge.event.split('/')[0]!.trim() : '')
+      || (recipients.length >= 2 ? 'badge-awarded-group' : 'badge-awarded-default');
+
+    if (dryRun) {
+      console.log(`[dry-run] 将发放徽章【${badgeDisplay}】（${badge.badgeId}）给 ${recipients.length} 人：`);
+      for (const r of recipients) console.log(`  ${r.name}（${r.openId}）`);
+      if (note) console.log(`[dry-run] 备注：${note}`);
+      console.log(`[dry-run] 私信事件：badge-awarded（逐人）；群公告事件：${announceEventId}`);
+      console.log('[dry-run] 完成（未写入数据库，未触发事件）。');
+      return;
+    }
+
+    // Award each recipient; collect those newly granted (awardBadge=false means already held → skip).
+    const granted: Array<{ openId: string; name: string }> = [];
+    for (const r of recipients) {
+      store.ensureProfile(r.openId, r.name || undefined);
+      if (store.awardBadge(r.openId, badge.badgeId, note ?? undefined)) {
+        granted.push(r);
+        log.info(`徽章发放：【${badgeDisplay}】（${badge.badgeId}）→ ${r.name}（${r.openId}）`);
+      } else {
+        log.info(`徽章发放跳过：${r.name}（${r.openId}）已持有【${badgeDisplay}】`);
+      }
+    }
+    if (granted.length === 0) {
+      log.info(`徽章发放结束：【${badgeDisplay}】无新增持有者（全部已持有），不触发事件。`);
+      return;
+    }
+    log.info(`徽章发放完成：【${badgeDisplay}】共 ${granted.length} 人：${granted.map((g) => g.name).join('、')}`);
+
+    // Personal P2P congratulation to every newly-awarded recipient.
+    for (const g of granted) {
+      const pr = await fireEvent('badge-awarded', {
+        actorOpenId: g.openId,
+        profile,
+        triggerReason: 'badge_award',
+        vars: { member_name: g.name, badge_name: badgeName },
+      });
+      if (pr.ok) log.info(`私信恭喜已发送 → ${g.name}（message_id=${pr.messageId ?? '?'}）`);
+      else if (pr.skipped) log.info(`私信恭喜已跳过 → ${g.name}（prepare 判定不发送）`);
+      else log.warn(`私信恭喜发送失败 → ${g.name}：${pr.error ?? '未知错误'}`);
+    }
+
+    // One group announcement listing everyone newly awarded. Re-pick by granted count so an all-but-one
+    // already-held batch still uses the single-recipient default.
+    const finalAnnounceId = (badge.event ? badge.event.split('/')[0]!.trim() : '')
+      || (granted.length >= 2 ? 'badge-awarded-group' : 'badge-awarded-default');
+    if (getEventConfig(finalAnnounceId)) {
+      const eventResult = await fireEvent(finalAnnounceId, {
+        actorOpenId: granted.length === 1 ? granted[0]!.openId : undefined,
+        profile,
+        triggerReason: 'badge_award',
+        recipients: granted,
+        vars: { member_name: granted[0]!.name, badge_name: badgeName },
+      });
+      if (eventResult.ok) {
+        log.info(`群公告已触发：${finalAnnounceId}（message_id=${eventResult.messageId ?? '?'}）`);
+      } else if (eventResult.skipped) {
+        log.info(`群公告已跳过：${finalAnnounceId}（prepare 判定不发送）`);
+      } else {
+        log.error(`群公告触发失败：${finalAnnounceId}：${eventResult.error ?? '未知错误'}`);
+      }
+    } else {
+      log.warn(`徽章事件未注册，跳过：${finalAnnounceId}`);
+    }
+    return;
+  }
+
+  // badge list [target]
+  if (sub === 'list') {
+    const targetArg = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
+    if (!targetArg) {
+      // List all badge definitions.
+      const all = store.listBadges();
+      if (all.length === 0) {
+        console.log('（暂无已定义徽章）');
+      } else {
+        console.log(`共 ${all.length} 条徽章定义：`);
+        for (const b of all) {
+          const display = b.headline || b.name;
+          console.log(`  ${b.badgeId}  ${display}  [${b.type || '-'}]`);
+        }
+      }
+      return;
+    }
+    // List badges held by a specific member.
+    let targetOpenId: string;
+    let targetName = '';
+    if (targetArg.startsWith('ou_')) {
+      targetOpenId = targetArg;
+      targetName = store.memberName(targetOpenId) || targetOpenId;
+    } else {
+      const matches = store.findOpenIdsByName(targetArg);
+      if (matches.length === 0) {
+        log.error(`找不到名称为【${targetArg}】的成员。`);
+        process.exit(1);
+      }
+      if (matches.length > 1) {
+        log.error(`名称【${targetArg}】匹配到多名成员，请改用 ou_xxxxxx 指定：`);
+        for (const m of matches) console.log(`  ${m.openId}  ${m.name}`);
+        process.exit(1);
+      }
+      targetOpenId = matches[0]!.openId;
+      targetName = matches[0]!.name;
+    }
+    const displayName = targetName || targetOpenId;
+    const badges = store.listBadges(targetOpenId);
+    if (badges.length === 0) {
+      console.log(`${displayName} 暂无徽章。`);
+    } else {
+      console.log(`${displayName} 持有 ${badges.length} 枚徽章：`);
+      for (const b of badges) {
+        const display = b.headline || b.name;
+        console.log(`  ${b.badgeId}  ${display}  [${b.type || '-'}]`);
+      }
+    }
+    return;
+  }
+
+  log.error(`未知 badge 子命令：${sub}。用 agent badge help 查看用法。`);
+  process.exit(1);
+}
+
+async function cmd_daily_reset(argv: string[]): Promise<void> {
+  const floorStr = getFlag(argv, 'floor');
+  const floor = floorStr !== undefined ? Number(floorStr) : 10;
+  if (!Number.isInteger(floor) || floor < 0) {
+    log.error('--floor 必须是非负整数');
+    process.exit(1);
+  }
+  const result = store.resetDailyPtFloor(floor);
+  console.log(`每日 LP 补底完成：补足 ${result.affected} 名用户（下限 ${floor}）`);
+}
+
+async function cmd_reset_all_pt(argv: string[]): Promise<void> {
+  const toStr = getFlag(argv, 'to');
+  let target: number | undefined;
+  if (toStr !== undefined) {
+    target = Number(toStr);
+    if (!Number.isInteger(target) || target < 0) {
+      log.error('--to 必须是非负整数');
+      process.exit(1);
+    }
+  }
+  const result = store.resetAllPtTo(target);
+  console.log(`LP 重置完成：${result.affected} 名用户已重置为 ${result.target} LP`);
+}
+
+async function cmd_serve(argv: string[]): Promise<void> {
+  const positionalSoul = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+  const onlyFlag = getFlag(argv, 'only');
+  // --quiet (静默/观察模式): keep running everything EXCEPT replying to feishu p2p/group/mention —
+  // messages are still captured, members synced, data recorded. Propagated to the worker via the
+  // AGENT_QUIET env var (the supervisor passes it through on spawn); channels read it from there.
+  const quiet = hasFlag(argv, 'quiet');
+  // --sup: opt-in to the resident supervisor (background event schedules, LP reset, session janitor,
+  // hot-reload via SIGHUP, PID lock, crash-respawn). Without it, serve runs a bare worker — the channel
+  // directly, with none of those side effects. The choice is explicit and independent of the soul.
+  const withSupervisor = hasFlag(argv, 'sup');
+  // Mirror serve logs to Telegram (if TELEGRAM_* is configured). Called for both the supervisor and
+  // the worker, so both processes' logs flow through — distinguished by a [sup]/[wkr] tag.
+  enableLogSink();
+
+  const target: WorkerTarget = onlyFlag ? { only: onlyFlag } : { soul: positionalSoul ?? DEFAULT_SOUL };
+
+  // AGENT_WORKER=1 means this process was spawned as a child by the supervisor → run the channel directly.
+  // Otherwise a direct serve: run the supervisor only when --sup is passed, else a bare worker.
+  if (process.env.AGENT_WORKER) {
+    await runWorker(target);
+  } else if (withSupervisor) {
+    await runSupervisor({ target, quiet });
+  } else {
+    await runWorker(target);
+  }
+}
+
+async function cmd_update(argv: string[]): Promise<void> {
+  await update(argv);
+}
+
+async function cmd_cli(argv: string[]): Promise<void> {
+  const souls = listSouls();
+  // Positional argument is the soul; if omitted use the default (prefer tudigong, otherwise the first available soul).
+  const arg = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+  const soul = arg ?? (souls.includes(DEFAULT_SOUL) ? DEFAULT_SOUL : souls[0]);
+  if (!soul || !soulExists(soul)) {
+    log.error(
+      arg
+        ? `找不到 soul【${arg}】。可用：${souls.join(', ') || '(无)'}`
+        : `找不到可用的 soul，请先在 workspaces/ 下创建。可用：${souls.join(', ') || '(无)'}`
+    );
+    process.exit(1);
+  }
+  process.env.AGENT_SOUL = soul; // names the DB file (.agent/<soul>.db)
+  const agent = new Agent(soul);
+  // Each startup gets a fixed session so this REPL conversation has short-term memory (/reset starts over).
+  const session = `cli-${soul}-${process.pid}`;
+  const channel: Channel = new CliChannel({ session });
+  await channel.run(agent);
+}
+
+async function cmd_souls(_argv: string[]): Promise<void> {
+  const souls = listSouls();
+  console.log(souls.length ? souls.join('\n') : '(尚无 soul，请在 workspaces/ 下创建)');
+}
+
+async function cmd_ask(argv: string[]): Promise<void> {
+  const soul = argv[1];
+  const message = argv.slice(2).join(' ');
+  if (!soul || !soulExists(soul) || !message) {
+    log.error('用法: agent ask <soul> <消息...>');
+    process.exit(1);
+  }
+  process.env.AGENT_SOUL = soul; // names the DB file (.agent/<soul>.db)
+  const agent = new Agent(soul, { journal: false });
+  const reply = agent.respond({ message });
+  process.stdout.write(reply + '\n');
+}
+
+async function cmd_run(argv: string[]): Promise<void> {
+  const soul = argv[1];
+  if (!soul || !soulExists(soul)) {
+    log.error(`找不到 soul【${soul ?? ''}】。可用：${listSouls().join(', ') || '(无)'}`);
+    process.exit(1);
+  }
+  const channelName = getFlag(argv, 'channel') || 'cli';
+  if (channelName !== 'cli') {
+    log.error('run 仅支持 --channel cli（飞书请用 agent serve）');
+    process.exit(1);
+  }
+  process.env.AGENT_SOUL = soul; // names the DB file (.agent/<soul>.db)
+  const agent = new Agent(soul);
+  const channel: Channel = new CliChannel();
+  await channel.run(agent);
+}
+
+async function cmd_report(argv: string[]): Promise<void> {
+  const period = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+  if (period !== 'daily' && period !== 'monthly') {
+    log.error('用法: agent report daily|monthly [--date YYYY-MM-DD] [--lark-user <open_id>] [--lark-chat <chat_id>]');
+    process.exit(1);
+  }
+  const dateArg = getFlag(argv, 'date');
+  const ref = dateArg ? new Date(dateArg) : new Date();
+  if (isNaN(ref.getTime())) {
+    log.error(`无效日期【${dateArg}】，请使用 YYYY-MM-DD 格式。`);
+    process.exit(1);
+  }
+  // Optional Feishu delivery: --lark-user <open_id> for a P2P preview, --lark-chat <chat_id> for a group.
+  const targets = {
+    larkUser: getFlag(argv, 'lark-user'),
+    larkChat: getFlag(argv, 'lark-chat'),
+  };
+  // Mirror logs to Telegram so this one-shot CLI's activity appears in the log channel.
+  enableLogSink();
+  process.on('exit', () => { try { flushTelegramSync(); } catch { /* best-effort */ } });
+  try {
+    if (period === 'daily') {
+      await generateAndSendDailyReport(ref, targets);
+    } else {
+      await generateAndSendMonthlyReport(ref, targets);
+    }
+    console.log('运营报告已生成并发送。');
+  } catch (e) {
+    log.error('运营报告失败：', (e as Error).message);
+    process.exit(1);
+  }
+}
+
+async function cmd_tg_test(argv: string[]): Promise<void> {
+  if (!isTelegramConfigured()) {
+    log.error('未配置 Telegram：请在 .env 设置 TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID 后重试。');
+    process.exit(1);
+  }
+  const msg = argv.slice(1).join(' ') || '城邦土地神 Telegram 日志通道测试：连接正常。';
+  try {
+    await sendTelegramMessage(msg);
+    console.log('已发送测试消息到 Telegram。');
+  } catch (e) {
+    log.error('发送失败：', (e as Error).message);
+    process.exit(1);
+  }
+}
+
+// ── memory management CLI ─────────────────────────────────────
+
+async function cmd_memory(argv: string[]): Promise<void> {
+  const sub = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+  if (!sub || sub === 'help') {
+    log.error([
+      '用法:',
+      '  agent memory list [--namespace <ns>] [--user <openId>] [--chat <chatId>] [--limit N]',
+      '  agent memory inspect <id>',
+      '  agent memory add --namespace <ns> --content <text> [--key k] [--visibility v] [--sensitivity s] [--expires <unixsec>]',
+      '  agent memory set --namespace <ns> --key <k> --content <text> [--visibility v] [--sensitivity s] [--expires <unixsec>]',
+      '  agent memory rm <id>',
+      '  agent memory clear --namespace <ns>',
+      '  agent memory preview --chat <chatId> --user <openId> [--admin]',
+      '  agent memory summarize --chat <chatId> --user <openId> [--soul <soul>]',
+      '  agent memory aggregate [--chat <chatId>]',
+      '  agent memory purge',
+    ].join('\n'));
+    process.exit(1);
+  }
+
+  const {
+    listMemories,
+    getMemoryById,
+    insertMemory,
+    upsertMemory,
+    deleteMemory,
+    deleteNamespace,
+    getFilteredMemories,
+    purgeExpiredMemories,
+    listKnownChatIds,
+  } = await import('../core/store/memory.js');
+
+  if (sub === 'list') {
+    const ns = getFlag(argv, 'namespace');
+    const user = getFlag(argv, 'user');
+    const chat = getFlag(argv, 'chat');
+    const limitStr = getFlag(argv, 'limit');
+    const limit = limitStr ? Number(limitStr) : 50;
+    const items = listMemories({ namespace: ns, userOpenId: user, chatId: chat, limit });
+    if (items.length === 0) { console.log('（无记录）'); return; }
+    for (const m of items) {
+      const expiry = m.expiresAt ? ` expires=${m.expiresAt}` : '';
+      console.log(`[${m.id}] ns=${m.namespace} key=${m.key ?? '—'} vis=${m.visibility} src=${m.source}${expiry}`);
+      console.log(`       ${m.content.slice(0, 120)}${m.content.length > 120 ? '…' : ''}`);
+    }
+    console.log(`共 ${items.length} 条记录。`);
+    return;
+  }
+
+  if (sub === 'inspect') {
+    const idStr = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
+    if (!idStr) { log.error('用法: agent memory inspect <id>'); process.exit(1); }
+    const m = getMemoryById(Number(idStr));
+    if (!m) { log.error(`找不到记录：id=${idStr}`); process.exit(1); }
+    console.log(JSON.stringify(m, null, 2));
+    return;
+  }
+
+  if (sub === 'add') {
+    const ns = getFlag(argv, 'namespace');
+    const content = getFlag(argv, 'content');
+    if (!ns || !content) { log.error('--namespace 和 --content 为必填项'); process.exit(1); }
+    const key = getFlag(argv, 'key');
+    const visibility = getFlag(argv, 'visibility') as import('../core/store/memory.js').MemoryVisibility | undefined;
+    const sensitivity = getFlag(argv, 'sensitivity') as import('../core/store/memory.js').MemorySensitivity | undefined;
+    const expiresStr = getFlag(argv, 'expires');
+    const id = insertMemory({
+      namespace: ns, content, key, visibility, sensitivity,
+      expiresAt: expiresStr ? Number(expiresStr) : undefined,
+      source: 'manual',
+    });
+    console.log(`已写入：id=${id}`);
+    return;
+  }
+
+  if (sub === 'set') {
+    const ns = getFlag(argv, 'namespace');
+    const key = getFlag(argv, 'key');
+    const content = getFlag(argv, 'content');
+    if (!ns || !key || !content) { log.error('--namespace、--key 和 --content 为必填项'); process.exit(1); }
+    const visibility = getFlag(argv, 'visibility') as import('../core/store/memory.js').MemoryVisibility | undefined;
+    const sensitivity = getFlag(argv, 'sensitivity') as import('../core/store/memory.js').MemorySensitivity | undefined;
+    const expiresStr = getFlag(argv, 'expires');
+    const id = upsertMemory({
+      namespace: ns, key, content, visibility, sensitivity,
+      expiresAt: expiresStr ? Number(expiresStr) : undefined,
+      source: 'manual',
+    });
+    console.log(`已写入（upsert）：id=${id}`);
+    return;
+  }
+
+  if (sub === 'rm') {
+    const idStr = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
+    if (!idStr) { log.error('用法: agent memory rm <id>'); process.exit(1); }
+    const ok = deleteMemory(Number(idStr));
+    console.log(ok ? `已删除：id=${idStr}` : `找不到记录：id=${idStr}`);
+    return;
+  }
+
+  if (sub === 'clear') {
+    const ns = getFlag(argv, 'namespace');
+    if (!ns) { log.error('--namespace 为必填项'); process.exit(1); }
+    const n = deleteNamespace(ns);
+    console.log(`已清除命名空间 ${ns}：共删除 ${n} 条记录。`);
+    return;
+  }
+
+  // Show the exact memory block a given (chat, user) would receive, after the policy filter.
+  // Mirrors prepare()'s caller context and per-scope budgets so the output equals what is injected
+  // into the prompt at reply time — the authoritative way to confirm cross-user isolation.
+  if (sub === 'preview') {
+    const chat = getFlag(argv, 'chat');
+    const user = getFlag(argv, 'user');
+    if (!chat || !user) {
+      log.error('用法: agent memory preview --chat <chatId> --user <openId> [--admin]');
+      process.exit(1);
+    }
+    const { allowedNamespaces } = await import('../core/memory-policy.js');
+    const { isAdmin, getChatTier } = await import('../core/configs.js');
+    const admin = hasFlag(argv, 'admin') || isAdmin(user);
+    const ctx = { chatId: chat, userOpenId: user, isAdmin: admin };
+    const namespaces = allowedNamespaces(ctx);
+    const memories = getFilteredMemories(ctx, { namespaces, groupCharLimit: 500, userCharLimit: 300 });
+    const tier = getChatTier(chat);
+    console.log(`视角：chat=${chat} user=${user} admin=${admin}`);
+    console.log(`群层级：${tier}`);
+    console.log(`可读命名空间：${namespaces.join('、')}`);
+    if (memories.length === 0) { console.log('注入记忆：（无）'); return; }
+    console.log('注入记忆（即实际进入 prompt 的【背景记忆】区块）：');
+    for (const m of memories) {
+      console.log(`  - [ns=${m.namespace} vis=${m.visibility}] ${m.content}`);
+    }
+    return;
+  }
+
+  // Manually trigger the rolling per-user memory summary for one (chat, user) without waiting for
+  // the reply-count threshold. Invokes the same code path the bot uses on a live conversation.
+  if (sub === 'summarize') {
+    const chat = getFlag(argv, 'chat');
+    const user = getFlag(argv, 'user');
+    if (!chat || !user) {
+      log.error('用法: agent memory summarize --chat <chatId> --user <openId> [--soul <soul>]');
+      process.exit(1);
+    }
+    const soul = getFlag(argv, 'soul') ?? DEFAULT_SOUL;
+    if (!soulExists(soul)) { log.error(`找不到 soul：${soul}`); process.exit(1); }
+    const agent = new Agent(soul, { journal: false });
+    await agent.summarizeUserMemory(chat, user);
+    console.log(`已触发记忆摘要：soul=${soul} chat=${chat} user=${user}（结果用 memory preview / list 查看）`);
+    return;
+  }
+
+  // Manually run group topic aggregation without waiting for the daily maintenance schedule.
+  // With no --chat, aggregates every chat that has recorded messages.
+  if (sub === 'aggregate') {
+    const { aggregateGroupTopics } = await import('../core/group-intel.js');
+    const chat = getFlag(argv, 'chat');
+    const chats = chat ? [chat] : listKnownChatIds();
+    if (chats.length === 0) { console.log('（无已知群组）'); return; }
+    for (const c of chats) {
+      const summary = aggregateGroupTopics(c);
+      console.log(summary ? `[${c}] ${summary}` : `[${c}]（消息不足，未生成）`);
+    }
+    return;
+  }
+
+  // Manually run the TTL sweep that removes expired memory rows.
+  if (sub === 'purge') {
+    const n = purgeExpiredMemories();
+    console.log(`已清理过期记忆：共删除 ${n} 条。`);
+    return;
+  }
+
+  log.error(`未知子指令：${sub}`);
+  process.exit(1);
+}
+
+// ── command registry + dispatch ───────────────────────────────
+
+type CommandHandler = (argv: string[]) => void | Promise<void>;
+
+interface CliCommand {
+  /** Command name plus any aliases. */
+  names: string[];
+  run: CommandHandler;
+}
+
+const COMMANDS: CliCommand[] = [
+  { names: ['agents'], run: cmd_agents },
+  { names: ['backfill'], run: cmd_backfill },
+  { names: ['backfill-members'], run: cmd_backfill_members },
+  { names: ['calendar-events'], run: cmd_calendar_events },
+  { names: ['doc-views'], run: cmd_doc_views },
+  { names: ['token-check'], run: cmd_token_check },
+  { names: ['doctor'], run: cmd_doctor },
+  { names: ['events'], run: cmd_events },
+  { names: ['event', 'event-fire'], run: cmd_event },
+  { names: ['unsend'], run: cmd_unsend },
+  { names: ['badge'], run: cmd_badge },
+  { names: ['memory'], run: cmd_memory },
+  { names: ['daily-reset'], run: cmd_daily_reset },
+  { names: ['reset-all-pt'], run: cmd_reset_all_pt },
+  { names: ['serve'], run: cmd_serve },
+  { names: ['update'], run: cmd_update },
+  { names: ['cli'], run: cmd_cli },
+  { names: ['souls'], run: cmd_souls },
+  { names: ['ask'], run: cmd_ask },
+  { names: ['run'], run: cmd_run },
+  { names: ['report'], run: cmd_report },
+  { names: ['tg-test'], run: cmd_tg_test },
+];
+
+const COMMAND_INDEX = new Map<string, CliCommand>();
+for (const c of COMMANDS) for (const n of c.names) COMMAND_INDEX.set(n, c);
+
+async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+  const cmd = argv[0];
+
+  if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
+    usage();
+    return;
+  }
+
+  const command = COMMAND_INDEX.get(cmd);
+  if (!command) {
+    log.error(`未知命令【${cmd}】`);
+    usage();
+    process.exit(1);
+  }
+
+  await command.run(argv);
+}
+
+main().catch((e) => {
+  log.error((e as Error).message);
+  process.exit(1);
+});
