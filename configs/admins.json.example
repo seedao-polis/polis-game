@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "admins": [
+    "ou_example_operator",
+    "ou_example_admin"
+  ]
+}

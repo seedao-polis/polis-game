@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "defaults": {
+    "kimi": "default",
+    "pollIntervalMs": 4000,
+    "contextSize": 6,
+    "reactionEmoji": "Status_PrivateMessage",
+    "queuedReactionEmoji": "OnIt"
+  },
+  "agents": {
+    "tudigong-user": {
+      "enabled": false,
+      "collectOnly": true,
+      "soul": "tudigong",
+      "workspace": "tudigong",
+      "identity": "user",
+      "listen": "all",
+      "exclude": [],
+      "capture": true,
+      "trigger": "mention",
+      "triggerPrefix": "",
+      "replyPrefix": "🏯 城邦土地神："
+    },
+    "tudigong-bot": {
+      "enabled": true,
+      "soul": "tudigong",
+      "workspace": "tudigong",
+      "identity": "bot",
+      "listen": "all",
+      "capture": true,
+      "trigger": "mention",
+      "replyPrefix": ""
+    }
+  }
+}
