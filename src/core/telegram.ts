@@ -1,6 +1,12 @@
 import { execFileSync } from 'node:child_process';
+import dns from 'node:dns';
 import fs from 'node:fs';
 import path from 'node:path';
+
+// Prefer IPv4 for outbound Telegram calls. undici can throw a bare `fetch failed` when an IPv6 route to
+// api.telegram.org stalls before falling back; pinning resolution order makes these calls deterministic.
+// Process-global, but here only Telegram uses Node's fetch (Lark/Kimi run as subprocesses).
+dns.setDefaultResultOrder('ipv4first');
 
 // ── Telegram one-way push (agent → Telegram) ───────────────────
 // A thin wrapper over the Telegram Bot API used to MIRROR serve logs to a Telegram chat (and, later,
@@ -120,9 +126,36 @@ function* chunkLines(lines: string[], maxChars: number): Generator<string> {
   if (cur) yield cur;
 }
 
+// ── outbound transport: per-attempt timeout + retry ────────────
+const TG_TIMEOUT_MS = 10_000;
+const TG_RETRIES = 2; // total attempts = TG_RETRIES + 1
+
+/** Surface undici's underlying cause (ECONNRESET / ETIMEDOUT / EAI_AGAIN…) instead of a bare "fetch failed". */
+function describeFetchError(e: unknown): string {
+  const err = e as { message?: string; cause?: { code?: string; message?: string } };
+  const detail = err?.cause?.code || err?.cause?.message;
+  return detail && err?.message ? `${err.message}（${detail}）` : err?.message || String(e);
+}
+
+/** fetch with a per-attempt timeout and a few retries on transport blips; HTTP responses (incl. 4xx/5xx) return as-is. */
+async function tgFetch(url: string, init: RequestInit): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= TG_RETRIES; attempt++) {
+    if (attempt > 0) await sleep(500 * attempt); // backoff: 500ms, then 1000ms
+    try {
+      return await fetch(url, { ...init, signal: AbortSignal.timeout(TG_TIMEOUT_MS) });
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  const err = new Error(`${describeFetchError(lastErr)}（已重试 ${TG_RETRIES + 1} 次）`);
+  (err as { cause?: unknown }).cause = lastErr;
+  throw err;
+}
+
 /** POST one plain-text message (no parse_mode, so arbitrary log content can't break formatting). */
 async function postMessage(text: string): Promise<void> {
-  const res = await fetch(`${TG_API}/bot${token()}/sendMessage`, {
+  const res = await tgFetch(`${TG_API}/bot${token()}/sendMessage`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId(), text, disable_web_page_preview: true }),
@@ -147,7 +180,7 @@ async function flushAsync(): Promise<void> {
       await postMessage(chunk);
     }
   } catch (e) {
-    process.stderr.write(`[telegram] 推送失败（已丢弃本批，完整见本地日志）：${(e as Error).message}\n`);
+    process.stderr.write(`[telegram] 推送失败（已丢弃本批，完整见本地日志）：${describeFetchError(e)}\n`);
   } finally {
     sending = false;
   }
@@ -167,7 +200,7 @@ export function flushTelegramSync(): void {
       const payload = JSON.stringify({ chat_id: chatId(), text: chunk, disable_web_page_preview: true });
       execFileSync(
         'curl',
-        ['-s', '-m', '5', '-X', 'POST', `${TG_API}/bot${token()}/sendMessage`, '-H', 'content-type: application/json', '--data-binary', payload],
+        ['-s', '--ipv4', '--retry', '1', '-m', '6', '-X', 'POST', `${TG_API}/bot${token()}/sendMessage`, '-H', 'content-type: application/json', '--data-binary', payload],
         { stdio: 'ignore' }
       );
     }
@@ -195,7 +228,7 @@ export async function sendTelegramAlert(text: string): Promise<boolean> {
   const chat = alertChatId();
   if (!tk || !chat) return false;
   try {
-    const res = await fetch(`${TG_API}/bot${tk}/sendMessage`, {
+    const res = await tgFetch(`${TG_API}/bot${tk}/sendMessage`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ chat_id: chat, text: text.slice(0, 4096), disable_web_page_preview: true }),
@@ -226,7 +259,7 @@ export async function sendTelegramPhoto(image: Buffer | string, caption?: string
     new Uint8Array(ab).set(buf);
     form.set('photo', new Blob([ab]), name);
   }
-  const res = await fetch(`${TG_API}/bot${token()}/sendPhoto`, { method: 'POST', body: form });
+  const res = await tgFetch(`${TG_API}/bot${token()}/sendPhoto`, { method: 'POST', body: form });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(`HTTP ${res.status} ${body.slice(0, 200)}`);
