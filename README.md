@@ -60,6 +60,28 @@ agent unsend <message_id> [--as bot|user]    撤回一条已发送的消息
 agent tg-test [消息...]                       发一条测试消息到 Telegram
 ```
 
+## 启动模式：bot 还是本人
+
+跑哪些 agent 由 `configs/agents.json` 里每个 agent 的 `enabled` 决定——`enabled:false` 的**永远不会跑**；`--only <agentId>` 也必须那个 agent `enabled:true` 才生效。默认配置：`tudigong-bot`（机器人身份）启用、`tudigong-user`（操作者本人身份，且 `collectOnly` 只采集不回复）停用。
+
+- **只跑 bot（默认 · 推荐）**
+
+  ```bash
+  pnpm agent serve tudigong --sup
+  ```
+
+  本人身份已停用 → 对外只有 bot 回复；`--sup` 会额外起一个 user 身份的【采集器】，只采集群成员 / 文档访问数据、**绝不回复**。要纯裸 bot（连采集与定时事件 / LP 补底都不要）：`pnpm agent serve --only tudigong-bot`。
+
+- **绝不让 bot 与本人同时回复**
+
+  不要把两个 agent 同时设 `enabled:true`。最保险是显式限定单个：`pnpm agent serve --only tudigong-bot`。
+
+- **只跑本人（user 身份）**
+
+  先在 `configs/agents.json` 把 `tudigong-user` 设 `enabled:true`、`tudigong-bot` 设 `enabled:false`，再 `pnpm agent serve tudigong`。若要本人身份**真的开口回复**（而不只是采集），还要删掉 `tudigong-user` 的 `"collectOnly": true`，并且**不要加 `--sup`**（`--sup` 会强制把 user 压成只采集）。
+
+> **bot 与本人的区别**：`identity:"bot"` 以机器人身份发言（群里需先把 bot 拉进群，只收到【被 @】的消息）；`identity:"user"` 以操作者本人身份（impersonation）发言 / 采集，能看到本人可见的所有群，但以本人身份在外部群发消息会被飞书拦截，所以本人身份默认 `collectOnly`（只采集、不回复）。
+
 ## 多 bot 与 Lark profile
 
 每个 soul / bot 可以挂自己的一组 Lark 凭证（`configs/lark.json` 的 `profiles`），于是同一套代码能同时跑好几个不同的 bot。`agent serve <soul>` 启动时，为每个 agent 解析 Lark profile 的顺序是：
