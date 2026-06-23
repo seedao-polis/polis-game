@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { assembleSoul, soulExists } from './soul.js';
 import { runKimi, runKimiAsync, KimiError } from './kimi.js';
-import { resolveSessionDir, validateSession, quarantineSession, healSessionFor } from './kimi-session.js';
+import { resolveSessionDir, validateSession, quarantineSession, quarantineCorruptSessionsFor, healSessionFor } from './kimi-session.js';
 import { skillsDirsForSoul } from './skills.js';
 import { appendJournal } from './memory.js';
 import { getProfile, recordError } from './store.js';
@@ -411,8 +411,9 @@ export class Agent {
   private healSession(err: KimiError, workDir: string): boolean {
     try {
       if (err.kind === 'corrupt-session') {
-        const sdir = resolveSessionDir(workDir);
-        return sdir ? quarantineSession(sdir) : false;
+        // Quarantine every corrupt session bound to this chat — including an unindexed one left by an
+        // interrupted turn, which resolveSessionDir (index-only) would miss.
+        return quarantineCorruptSessionsFor(workDir) > 0;
       }
       if (err.kind === 'timeout') {
         const sdir = resolveSessionDir(workDir);

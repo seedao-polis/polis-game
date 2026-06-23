@@ -184,15 +184,55 @@ export function quarantineSession(sessionDir: string): boolean {
 }
 
 /**
- * Validate the session bound to a workDir and quarantine it if corrupt.
- * Returns the orphan count if it healed something, otherwise 0.
+ * Every session directory that shares a workDir's wd_<hash> dir — including ones that never got their
+ * own index line. An interrupted turn can write a session's wire (with an orphan tool.call) but die
+ * before writing its index entry, leaving a corrupt session that index-only lookups miss while
+ * `--continue` can still pick it up. The dir-name hash isn't reversible, so we find the wd_<hash> dir
+ * via an indexed sibling, then list all of its sessions.
+ */
+function siblingSessionDirs(workDir: string): string[] {
+  const want = normPath(workDir);
+  const wdDirs = new Set<string>();
+  for (const ref of readIndex()) {
+    if (normPath(ref.workDir) === want) wdDirs.add(path.dirname(ref.sessionDir));
+  }
+  const out: string[] = [];
+  for (const wd of wdDirs) {
+    let sessions: string[];
+    try {
+      sessions = fs.readdirSync(wd).filter((s) => s.startsWith('session_'));
+    } catch {
+      continue;
+    }
+    for (const s of sessions) out.push(path.join(wd, s));
+  }
+  return out;
+}
+
+/**
+ * Quarantine every corrupt session bound to a chat's workDir — including unindexed siblings that
+ * resolveSessionDir would miss. The reliable reset for a corrupt-session failure: it clears the chat's
+ * whole poisoned slate, not just the index's newest entry. Returns how many were quarantined.
+ */
+export function quarantineCorruptSessionsFor(workDir: string): number {
+  let n = 0;
+  for (const sd of siblingSessionDirs(workDir)) {
+    if (!validateSession(sd).ok && quarantineSession(sd)) n++;
+  }
+  return n;
+}
+
+/**
+ * Validate the sessions bound to a workDir and quarantine any that are corrupt (incl. unindexed
+ * siblings). Returns the total orphan count healed, otherwise 0.
  */
 export function healSessionFor(workDir: string): number {
-  const sdir = resolveSessionDir(workDir);
-  if (!sdir) return 0;
-  const v = validateSession(sdir);
-  if (v.ok) return 0;
-  return quarantineSession(sdir) ? v.orphans.length : 0;
+  let healed = 0;
+  for (const sd of siblingSessionDirs(workDir)) {
+    const v = validateSession(sd);
+    if (!v.ok && quarantineSession(sd)) healed += v.orphans.length;
+  }
+  return healed;
 }
 
 export interface CorruptSession {
@@ -215,9 +255,14 @@ export function scanCorruptSessions(onlyOurs = true): CorruptSession[] {
   } catch {
     return out;
   }
-  // Map sessionDir -> workDir via the index (the dir name's hash is not reversible).
+  // Resolve each session's workDir via the index — keyed by both the exact sessionDir AND its parent
+  // wd_<hash> dir, so a session that never got its own index line still resolves via an indexed sibling.
   const indexByDir = new Map<string, string>();
-  for (const ref of readIndex()) indexByDir.set(normPath(ref.sessionDir), ref.workDir);
+  const indexByWdDir = new Map<string, string>();
+  for (const ref of readIndex()) {
+    indexByDir.set(normPath(ref.sessionDir), ref.workDir);
+    indexByWdDir.set(normPath(path.dirname(ref.sessionDir)), ref.workDir);
+  }
 
   for (const wd of wdDirs) {
     const wdPath = path.join(SESSIONS_DIR, wd);
@@ -229,7 +274,7 @@ export function scanCorruptSessions(onlyOurs = true): CorruptSession[] {
     }
     for (const s of sessions) {
       const sessionDir = path.join(wdPath, s);
-      const workDir = indexByDir.get(normPath(sessionDir)) ?? '';
+      const workDir = indexByDir.get(normPath(sessionDir)) || indexByWdDir.get(normPath(wdPath)) || '';
       if (onlyOurs) {
         const wdn = workDir ? normPath(workDir) : '';
         if (!wdn || !(wdn === ours || wdn.startsWith(ours + path.sep))) continue;
@@ -255,9 +300,14 @@ export function listSoulSessionDirs(soul: string): string[] {
   } catch {
     return out;
   }
-  // The dir name's hash is not reversible, so map sessionDir -> workDir via the index.
+  // The dir name's hash is not reversible, so map sessionDir -> workDir via the index, keyed by both
+  // the exact sessionDir and its parent wd_<hash> dir (so unindexed siblings still resolve).
   const indexByDir = new Map<string, string>();
-  for (const ref of readIndex()) indexByDir.set(normPath(ref.sessionDir), ref.workDir);
+  const indexByWdDir = new Map<string, string>();
+  for (const ref of readIndex()) {
+    indexByDir.set(normPath(ref.sessionDir), ref.workDir);
+    indexByWdDir.set(normPath(path.dirname(ref.sessionDir)), ref.workDir);
+  }
 
   for (const wd of wdDirs) {
     const wdPath = path.join(SESSIONS_DIR, wd);
@@ -269,7 +319,7 @@ export function listSoulSessionDirs(soul: string): string[] {
     }
     for (const s of sessions) {
       const sessionDir = path.join(wdPath, s);
-      const workDir = indexByDir.get(normPath(sessionDir));
+      const workDir = indexByDir.get(normPath(sessionDir)) || indexByWdDir.get(normPath(wdPath));
       if (!workDir) continue;
       const wdn = normPath(workDir);
       if (wdn === soulRoot || wdn.startsWith(soulRoot + path.sep)) out.push(sessionDir);
