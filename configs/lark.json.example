@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "larkRun": null,
+  "profiles": {
+    "default": {
+      "larkProfile": "default",
+      "appId": "cli_example_app_id",
+      "tenantKey": "example_tenant_key",
+      "userOpenId": "ou_example_operator",
+      "botOpenId": "ou_example_bot",
+      "botName": "城邦土地神"
+    }
+  },
+  "knownInternalChats": {
+    "工作群": "oc_example_work_group",
+    "工作人员": "oc_example_staff_group",
+    "AgentTasks": "oc_example_agent_tasks",
+    "AgentNotify": "oc_example_agent_notify"
+  },
+  "notifyChat": "AgentNotify",
+  "discovery": { "mode": "all-internal", "refreshMinutes": 5 },
+  "event": { "key": "im.message.receive_v1" }
+}

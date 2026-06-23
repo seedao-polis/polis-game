@@ -1,0 +1,468 @@
+import { getDb, tx } from '../db.js';
+import { localDate } from '../time.js';
+
+const FIRST_CONTACT_PT = 120;
+
+const DAILY_CHECKIN_PT = 3;
+
+export function getProfile(
+  openId: string
+): { openId: string; name: string; ptBalance: number; level: number; firstSeen: number; lastSeen: number } | null {
+  const db = getDb();
+  const row = db.prepare('SELECT * FROM profiles WHERE open_id = ?').get(openId) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return {
+    openId: row['open_id'] as string,
+    name: (row['name'] as string) ?? '',
+    ptBalance: (row['pt_balance'] as number) ?? 0,
+    level: (row['level'] as number) ?? 1,
+    firstSeen: (row['first_seen'] as number) ?? 0,
+    lastSeen: (row['last_seen'] as number) ?? 0,
+  };
+}
+
+/**
+ * Upsert a user profile without an enclosing transaction.
+ * Preserves the existing name when the supplied name is empty.
+ */
+export function upsertProfileRaw(openId: string, name?: string): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO profiles(open_id, name) VALUES (?, ?)
+    ON CONFLICT(open_id) DO UPDATE SET
+      name      = CASE WHEN excluded.name <> '' THEN excluded.name ELSE profiles.name END,
+      last_seen = unixepoch()
+  `).run(openId, name ?? '');
+}
+
+/**
+ * Append one row to the activities log without an enclosing transaction.
+ * Payload objects are serialised to JSON; null is stored as SQL NULL.
+ */
+export function recordActivityRaw(
+  type: string,
+  actorOpenId: string | null,
+  chatId: string | null,
+  refMessageId: string | null,
+  payload?: object | null,
+): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO activities(type, actor_open_id, chat_id, ref_message_id, payload)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(type, actorOpenId ?? null, chatId ?? null, refMessageId ?? null, payload != null ? JSON.stringify(payload) : null);
+}
+
+export function recordActivity(
+  type: string,
+  actorOpenId: string | null,
+  chatId: string | null,
+  refMessageId: string | null,
+  payload?: object | null,
+): void {
+  tx(() => recordActivityRaw(type, actorOpenId, chatId, refMessageId, payload));
+}
+
+/**
+ * Append one LP ledger entry and apply its delta to the balance, without an enclosing transaction
+ * or a read-back. Shared by every LP mutation (grant/spend/check-in/floor-reset/first-contact) so
+ * the ledger-and-balance pair stays consistent in one place.
+ */
+function ledgerRaw(
+  db: ReturnType<typeof getDb>,
+  openId: string,
+  delta: number,
+  reason: string,
+  refMessageId?: string | null,
+): void {
+  db.prepare(`
+    INSERT INTO pt_ledger(user_open_id, delta, reason, ref_message_id)
+    VALUES (?, ?, ?, ?)
+  `).run(openId, delta, reason, refMessageId ?? null);
+  db.prepare('UPDATE profiles SET pt_balance = pt_balance + ? WHERE open_id = ?').run(delta, openId);
+}
+
+function balanceRaw(db: ReturnType<typeof getDb>, openId: string): number {
+  const row = db.prepare('SELECT pt_balance FROM profiles WHERE open_id = ?').get(openId) as
+    | { pt_balance: number }
+    | undefined;
+  return row?.pt_balance ?? 0;
+}
+
+/**
+ * Credit or debit LP points for a user.
+ * Ensures the profile row exists, appends a ledger entry, and updates the balance atomically.
+ * Returns the new balance.
+ */
+export function grantPt(openId: string, delta: number, reason: string, refMessageId?: string): number {
+  return tx(() => {
+    const db = getDb();
+    upsertProfileRaw(openId);
+    ledgerRaw(db, openId, delta, reason, refMessageId);
+    return balanceRaw(db, openId);
+  });
+}
+
+/**
+ * Award a badge to a user.
+ * Returns true when newly granted; false when the user already holds the badge.
+ */
+export function awardBadge(openId: string, badgeId: string, ref?: string): boolean {
+  return tx(() => {
+    const db = getDb();
+    upsertProfileRaw(openId);
+    const result = db.prepare(`
+      INSERT OR IGNORE INTO user_badges(user_open_id, badge_id, ref) VALUES (?, ?, ?)
+    `).run(openId, badgeId, ref ?? null);
+    return (result.changes as number) > 0;
+  });
+}
+
+export function upsertBadge(b: {
+  badgeId: string;
+  name: string;
+  description?: string;
+  emoji?: string;
+  headline?: string;
+  file?: string;
+  title?: string;
+  type?: string;
+  role?: string;
+  endorser?: string;
+  duration?: string;
+  category?: string;
+  event?: string;
+}): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO badges(badge_id, name, description, emoji, headline, file, title, type, role, endorser, duration, category, event)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(badge_id) DO UPDATE SET
+      name        = excluded.name,
+      description = excluded.description,
+      emoji       = excluded.emoji,
+      headline    = excluded.headline,
+      file        = excluded.file,
+      title       = excluded.title,
+      type        = excluded.type,
+      role        = excluded.role,
+      endorser    = excluded.endorser,
+      duration    = excluded.duration,
+      category    = excluded.category,
+      event       = excluded.event
+  `).run(
+    b.badgeId,
+    b.name,
+    b.description ?? '',
+    b.emoji ?? '',
+    b.headline ?? '',
+    b.file ?? '',
+    b.title ?? '',
+    b.type ?? '',
+    b.role ?? '',
+    b.endorser ?? '',
+    b.duration ?? '',
+    b.category ?? '',
+    b.event ?? '',
+  );
+}
+
+/**
+ * List badges.
+ * With openId: returns that user's earned badges (joined from user_badges).
+ * Without: returns the full badge catalogue.
+ */
+export function listBadges(
+  openId?: string
+): Array<{ badgeId: string; name: string; description: string; emoji: string; headline: string; type: string; file: string; awardedAt?: number }> {
+  const db = getDb();
+  if (openId) {
+    const rows = db.prepare(`
+      SELECT b.badge_id, b.name, b.description, b.emoji, b.headline, b.type, b.file, ub.awarded_at
+      FROM user_badges ub
+      JOIN badges b ON b.badge_id = ub.badge_id
+      WHERE ub.user_open_id = ?
+      ORDER BY ub.awarded_at DESC
+    `).all(openId) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      badgeId: r['badge_id'] as string,
+      name: r['name'] as string,
+      description: (r['description'] as string) ?? '',
+      emoji: (r['emoji'] as string) ?? '',
+      headline: (r['headline'] as string) ?? '',
+      type: (r['type'] as string) ?? '',
+      file: (r['file'] as string) ?? '',
+      awardedAt: r['awarded_at'] as number,
+    }));
+  }
+  const rows = db.prepare('SELECT badge_id, name, description, emoji, headline, type, file FROM badges ORDER BY created_at').all() as Record<string, unknown>[];
+  return rows.map((r) => ({
+    badgeId: r['badge_id'] as string,
+    name: r['name'] as string,
+    description: (r['description'] as string) ?? '',
+    emoji: (r['emoji'] as string) ?? '',
+    headline: (r['headline'] as string) ?? '',
+    type: (r['type'] as string) ?? '',
+    file: (r['file'] as string) ?? '',
+  }));
+}
+
+/**
+ * Reverse-lookup open_ids by display name from the chat_members directory.
+ * Exact match first; if no results, retries with trimmed input.
+ * Returns distinct open_ids ordered by most-recently-seen, with the matched name.
+ */
+export function findOpenIdsByName(name: string): Array<{ openId: string; name: string }> {
+  const db = getDb();
+  const query = `
+    SELECT DISTINCT open_id, name FROM chat_members
+    WHERE name = ? AND present = 1
+    ORDER BY last_seen DESC
+  `;
+  let rows = db.prepare(query).all(name) as Array<{ open_id: string; name: string }>;
+  if (rows.length === 0) {
+    const trimmed = name.trim();
+    if (trimmed !== name) {
+      rows = db.prepare(query).all(trimmed) as Array<{ open_id: string; name: string }>;
+    }
+  }
+  return rows.map((r) => ({ openId: r.open_id, name: r.name }));
+}
+
+/**
+ * Retrieve a badge definition by badge_id or name (badge_name). Returns the full row including
+ * all v17 fields, or undefined if no match is found.
+ */
+export function getBadge(ref: string): {
+  badgeId: string; name: string; description: string; emoji: string;
+  headline: string; file: string; title: string; type: string; role: string;
+  endorser: string; duration: string; category: string; event: string;
+} | undefined {
+  const db = getDb();
+  const row = db.prepare(`
+    SELECT badge_id, name, description, emoji, headline, file, title, type, role, endorser, duration, category, event
+    FROM badges WHERE badge_id = ? OR name = ? LIMIT 1
+  `).get(ref, ref) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  return {
+    badgeId: row['badge_id'] as string,
+    name: row['name'] as string,
+    description: (row['description'] as string) ?? '',
+    emoji: (row['emoji'] as string) ?? '',
+    headline: (row['headline'] as string) ?? '',
+    file: (row['file'] as string) ?? '',
+    title: (row['title'] as string) ?? '',
+    type: (row['type'] as string) ?? '',
+    role: (row['role'] as string) ?? '',
+    endorser: (row['endorser'] as string) ?? '',
+    duration: (row['duration'] as string) ?? '',
+    category: (row['category'] as string) ?? '',
+    event: (row['event'] as string) ?? '',
+  };
+}
+
+export function leaderboard(limit = 10): Array<{ openId: string; name: string; ptBalance: number }> {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT open_id, name, pt_balance FROM profiles
+    ORDER BY pt_balance DESC
+    LIMIT ?
+  `).all(limit) as Record<string, unknown>[];
+  return rows.map((r) => ({
+    openId: r['open_id'] as string,
+    name: (r['name'] as string) ?? '',
+    ptBalance: (r['pt_balance'] as number) ?? 0,
+  }));
+}
+
+/**
+ * Deduct LP from a user's balance for a paid action.
+ * Ensures the profile exists first; returns false without writing any data when the
+ * balance is insufficient. On success writes one ledger debit and updates the balance.
+ */
+export function spendPt(openId: string, cost: number, reason: string, refMessageId?: string): boolean {
+  return tx(() => {
+    const db = getDb();
+    ensureProfileRaw(openId);
+    if (balanceRaw(db, openId) < cost) return false;
+    ledgerRaw(db, openId, -cost, reason, refMessageId);
+    return true;
+  });
+}
+
+/**
+ * Bring all users whose LP balance is below the daily floor up to that floor.
+ * Writes one ledger credit per affected user and returns the count of users updated.
+ */
+export function resetDailyPtFloor(floor = 10): { affected: number } {
+  return tx(() => {
+    const db = getDb();
+    const rows = db.prepare('SELECT open_id, pt_balance FROM profiles WHERE pt_balance < ?').all(floor) as Array<{ open_id: string; pt_balance: number }>;
+    for (const r of rows) {
+      // delta brings the balance up to the floor; ledgerRaw applies it (balance + delta == floor).
+      ledgerRaw(db, r.open_id, floor - r.pt_balance, 'daily_floor_reset');
+    }
+    return { affected: rows.length };
+  });
+}
+
+/**
+ * Set every user's LP balance to an exact target value (default: the first-contact grant).
+ * Unlike the daily floor reset, this both lifts and lowers balances so the whole community lands
+ * on the same number. Writes one ledger entry per user whose balance actually changes (delta != 0)
+ * so the ledger stays the source of truth; never writes a raw UPDATE outside the ledger path.
+ * Returns the target applied and the count of users whose balance moved.
+ */
+export function resetAllPtTo(target = FIRST_CONTACT_PT, reason = 'manual_reset'): { affected: number; target: number } {
+  return tx(() => {
+    const db = getDb();
+    const rows = db.prepare('SELECT open_id, pt_balance FROM profiles').all() as Array<{ open_id: string; pt_balance: number }>;
+    let affected = 0;
+    for (const r of rows) {
+      const delta = target - r.pt_balance;
+      if (delta === 0) continue; // already at target; no ledger entry needed
+      ledgerRaw(db, r.open_id, delta, reason);
+      affected++;
+    }
+    return { affected, target };
+  });
+}
+
+/**
+ * Grant LP to a user as a task completion reward.
+ * Delegates to grantPt with a task-prefixed reason tag; returns the new balance.
+ * Reserved as an interface for the task system.
+ */
+export function rewardTask(openId: string, taskId: string, amount: number): number {
+  return grantPt(openId, amount, `task:${taskId}`);
+}
+
+/**
+ * Build a short LP status footer for appending to agent replies.
+ * Shows the balance transition for the action just performed as "before → after (delta)",
+ * where delta is the signed LP change (negative for a cost, positive for a gain). Returns a
+ * pre-formatted two-line string (leading blank line included) ready for direct concatenation;
+ * a missing profile is initialized first so the balance is always real.
+ */
+export function buildStatusFooter(openId: string, delta: number): string {
+  const profile = getProfile(openId) ?? ensureProfile(openId);
+  const after = profile.ptBalance;
+  const tag = profile.name ? `[${profile.name}] ` : ''; // 有 name 才加前缀，避免出现空的 []
+  const fmt = (n: number) => n.toFixed(1); // LP is fractional (per-reply cost 0.1); show one decimal place
+  if (delta === 0) return `\n\n${tag}🌱 LP : ${fmt(after)}`;
+  const before = after - delta;
+  const sign = delta >= 0 ? '+' : '';
+  return `\n\n${tag}🌱 LP : ${fmt(before)} → ${fmt(after)} (${sign}${fmt(delta)})`;
+}
+
+/**
+ * Strip any LP/AP status footer the model echoed into its own reply, so the framework-appended footer
+ * is the only one. Matches whole lines like "[name] 🌱 LP : 120.0 → 119.9 (-0.1)" (also the legacy
+ * "🍎 AP" form, since older replies in the conversation context still carry it). Collapses the blank
+ * lines left behind and trims trailing whitespace.
+ */
+export function stripStatusFooter(text: string): string {
+  return text
+    .replace(/^[ \t]*(?:\[[^\]\n]*\][ \t]*)?(?:🌱[ \t]*LP|🍎[ \t]*AP)[ \t]*[:：][^\n]*$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\s+$/, '');
+}
+
+/**
+ * Split a reply into its body and the single trailing status footer this framework appended (if any),
+ * so the two can be logged on separate lines (the body is the model's actual answer). Anchored at the
+ * end of the string, so it is robust to whatever whitespace the body contains. Returns footer:'' when
+ * there is no trailing footer (gating / error replies, or no-charge paths).
+ */
+export function splitStatusFooter(text: string): { body: string; footer: string } {
+  const m = text.match(/\n*[ \t]*(?:\[[^\]\n]*\][ \t]*)?(?:🌱[ \t]*LP|🍎[ \t]*AP)[ \t]*[:：][^\n]*$/);
+  if (!m || m.index === undefined) return { body: text, footer: '' };
+  return { body: text.slice(0, m.index).replace(/\s+$/, ''), footer: m[0].trim() };
+}
+
+/**
+ * Daily check-in for a user, keyed by the local calendar date and unique per day.
+ * The first check-in of the day awards LP (recorded in the ledger); later attempts on the same day
+ * leave the balance unchanged. Ensures the profile exists first. Returns whether this was the first
+ * check-in today, the LP awarded, the date key, and the resulting balance.
+ */
+export function checkIn(openId: string): { firstToday: boolean; awarded: number; date: string; balance: number } {
+  const date = localDate(new Date());
+  return tx(() => {
+    const db = getDb();
+    ensureProfileRaw(openId);
+    const res = db.prepare(
+      'INSERT OR IGNORE INTO checkins(user_open_id, checkin_date, pt_awarded) VALUES (?, ?, ?)'
+    ).run(openId, date, DAILY_CHECKIN_PT);
+    const firstToday = (res.changes as number) > 0;
+    if (firstToday) ledgerRaw(db, openId, DAILY_CHECKIN_PT, 'daily_checkin');
+    return { firstToday, awarded: firstToday ? DAILY_CHECKIN_PT : 0, date, balance: balanceRaw(db, openId) };
+  });
+}
+
+/**
+ * Ensure a profile row exists without an enclosing transaction. A brand-new profile is seeded with
+ * the first-contact LP grant (recorded in the ledger) and the first-contact badge; an existing
+ * profile keeps its balance and only has its display name refreshed when a non-empty one is given.
+ * Returns true when the profile was created by this call.
+ */
+function ensureProfileRaw(openId: string, name?: string, refMessageId?: string): boolean {
+  const db = getDb();
+  const isNew = getProfile(openId) === null;
+  upsertProfileRaw(openId, name);
+  if (isNew) {
+    ledgerRaw(db, openId, FIRST_CONTACT_PT, 'first_contact', refMessageId);
+    db.prepare('INSERT OR IGNORE INTO user_badges(user_open_id, badge_id) VALUES (?, ?)').run(openId, 'first_contact');
+  }
+  return isNew;
+}
+
+/**
+ * Ensure a profile exists, initializing a brand-new one with the first-contact grant and badge.
+ * Returns the profile, which is never null.
+ */
+export function ensureProfile(
+  openId: string,
+  name?: string,
+): { openId: string; name: string; ptBalance: number; firstSeen: number; lastSeen: number } {
+  return tx(() => {
+    ensureProfileRaw(openId, name);
+    return getProfile(openId)!;
+  });
+}
+
+/**
+ * Record a user interaction: ensure the profile exists (seeding a new one with the first-contact
+ * grant and badge) and log the activity. All writes share a single transaction.
+ * Returns { isNew:false, ptGranted:0 } immediately when openId is falsy.
+ */
+export function recordInteraction(
+  openId: string,
+  name: string,
+  chatId: string,
+  messageId: string,
+): { isNew: boolean; ptGranted: number } {
+  if (!openId) return { isNew: false, ptGranted: 0 };
+  return tx(() => {
+    const isNew = ensureProfileRaw(openId, name, messageId);
+    recordActivityRaw('mention', openId, chatId, messageId);
+    return { isNew, ptGranted: isNew ? FIRST_CONTACT_PT : 0 };
+  });
+}
+
+/**
+ * Whether a user has a first-contact record — i.e. has ever interacted with the agent (which seeds
+ * the profile + the 'first_contact' badge in {@link ensureProfile}). Used to gate event rewards on
+ * "曾经 @ 过机器人". Returns false for members we only ever saw lurking in group captures.
+ */
+export function hasFirstContact(openId: string): boolean {
+  if (!openId) return false;
+  try {
+    const row = getDb()
+      .prepare("SELECT 1 FROM user_badges WHERE user_open_id = ? AND badge_id = 'first_contact' LIMIT 1")
+      .get(openId);
+    return !!row;
+  } catch {
+    return false;
+  }
+}

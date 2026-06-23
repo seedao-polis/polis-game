@@ -1,0 +1,546 @@
+import { spawn } from 'node:child_process';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { log } from './log.js';
+import {
+  sendTelegramPhoto,
+  sendTelegramMessage,
+  isTelegramConfigured,
+} from './telegram.js';
+import {
+  memberSyncRoundsBetween,
+  calendarEventRsvpHistory,
+  wikiSpacesBetween,
+  docViewersBetween,
+  chatMemberOpenIds,
+  upcomingTrackedEventIds,
+} from './store.js';
+import {
+  listWikiNodesDeep,
+  listChatMembers,
+  uploadImage,
+  sendPost,
+  type WikiNode,
+  type PostElement,
+} from './lark.js';
+import {
+  LOGICAL_DAY_START_HOUR,
+  logicalDayStart,
+  logicalMonthStart,
+  localDateFromEpochSec,
+  localDateTimeFromEpochSec,
+} from './time.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PROJECT_ROOT = join(__dirname, '..', '..');
+
+// Prefer the dedicated venv; fall back to system python3 if not yet set up.
+const VENV_PY = join(PROJECT_ROOT, 'scripts', '.venv', 'bin', 'python3');
+const PY_BIN = existsSync(VENV_PY) ? VENV_PY : 'python3';
+const RENDER_PY = join(PROJECT_ROOT, 'scripts', 'render_report.py');
+
+// Event titles containing any of these keywords are internal meetings, excluded from signup stats.
+const EXCLUDED_EVENT_KEYWORDS = ['市政厅每周二'];
+
+// Wiki node titles ending with any of these extensions are concrete file attachments, excluded from the tree.
+const EXCLUDED_FILE_EXTENSIONS = ['.png', '.gif', '.jpg', '.jpeg', '.pdf', '.md'];
+
+// Members of these chats count as SeeDAO staff; the wiki tree colors each node by its non-staff reader share.
+const STAFF_CHAT_IDS = [
+  'oc_example_work_group_old', // 市政厅工作群
+  'oc_example_ops_group', // 运营小天地
+];
+
+/** True when a wiki node title is a concrete file attachment that should not appear as a tree node. */
+function isExcludedFileTitle(title: string): boolean {
+  const t = title.trim().toLowerCase();
+  return EXCLUDED_FILE_EXTENSIONS.some((ext) => t.endsWith(ext));
+}
+
+/**
+ * Drop transient single-point dips from a member-count series. A read glitch appears as one point
+ * far below both neighbors that immediately recovers; legitimate membership changes do not.
+ */
+function dropMemberDips<T extends { presentExternal: number }>(rounds: T[]): T[] {
+  if (rounds.length < 3) return rounds;
+  return rounds.filter((r, i) => {
+    const prev = rounds[i - 1]?.presentExternal;
+    const next = rounds[i + 1]?.presentExternal;
+    if (prev === undefined || next === undefined) return true;
+    return !(r.presentExternal < prev * 0.85 && r.presentExternal < next * 0.85);
+  });
+}
+
+type Period = 'daily' | 'monthly';
+
+interface ChartPoint {
+  t: number;
+  y: number;
+}
+
+interface LineSeries {
+  name: string;
+  points: ChartPoint[];
+}
+
+interface TreeNode {
+  token: string;
+  parent: string | null;
+  title: string;
+  // Total distinct readers of this document.
+  readers: number;
+  // Distinct readers who are not SeeDAO staff; drives node color and the "(nonstaff) total" label.
+  nonstaff: number;
+}
+
+interface ChartSpec {
+  type: 'line' | 'tree';
+  key: string;
+  title: string;
+  subtitle?: string;
+  y_label?: string;
+  x_format?: string;
+  lines?: LineSeries[];
+  nodes?: TreeNode[];
+}
+
+interface ReportSpec {
+  period: Period;
+  range: { from: number; to: number };
+  width: number;
+  height: number;
+  dpi: number;
+  charts: ChartSpec[];
+  out_dir: string;
+}
+
+/**
+ * Resolve the [from, to) time range in unix seconds for a report period.
+ * Time is logical-day based: a day spans 05:00 local to 05:00 the next day.
+ *
+ * daily:   from = logical-day start (05:00); to = next logical-day start (05:00), capped at now
+ * monthly: from = logical-month start (1st 05:00); to = next logical-month start (1st 05:00), capped at now
+ */
+function resolveRange(period: Period, ref: Date): { from: number; to: number } {
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  if (period === 'daily') {
+    const start = logicalDayStart(ref);
+    const end = new Date(start);
+    end.setDate(end.getDate() + 1);
+    return {
+      from: Math.floor(start.getTime() / 1000),
+      to: Math.min(Math.floor(end.getTime() / 1000), nowSec),
+    };
+  }
+
+  // monthly
+  const start = logicalMonthStart(ref);
+  const end = new Date(start.getFullYear(), start.getMonth() + 1, 1, LOGICAL_DAY_START_HOUR, 0, 0, 0);
+  return {
+    from: Math.floor(start.getTime() / 1000),
+    to: Math.min(Math.floor(end.getTime() / 1000), nowSec),
+  };
+}
+
+/**
+ * Resolve the set of SeeDAO staff open_ids by fetching the staff chats' members live, so the
+ * classification is refreshed each time a report is generated. Falls back to the locally-synced
+ * member directory when the live fetch yields nothing.
+ */
+function resolveStaffOpenIds(): Set<string> {
+  const set = new Set<string>();
+  for (const chatId of STAFF_CHAT_IDS) {
+    try {
+      for (const openId of listChatMembers(chatId).keys()) set.add(openId);
+    } catch {
+      // skip this chat on failure and rely on the remaining chats or the fallback
+    }
+  }
+  if (set.size === 0) {
+    for (const id of chatMemberOpenIds(STAFF_CHAT_IDS)) set.add(id);
+  }
+  return set;
+}
+
+/**
+ * Build the member-count line series from member_sync_rounds as raw 5-minute points across the
+ * whole range (daily and monthly alike).
+ */
+function buildMemberLine(range: { from: number; to: number }): LineSeries {
+  const rounds = dropMemberDips(memberSyncRoundsBetween(range.from, range.to));
+  return {
+    name: 'SeeDAO 2.0 围观群',
+    points: rounds.map((r) => ({ t: r.syncedAt, y: r.presentExternal })),
+  };
+}
+
+/**
+ * Build per-event signup line series for events not yet started as of the current moment, as raw
+ * 5-minute points across the whole range. Internal-meeting titles are excluded.
+ */
+function buildSignupLines(range: { from: number; to: number }): LineSeries[] {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const events = upcomingTrackedEventIds(nowSec).filter(
+    (ev) => !EXCLUDED_EVENT_KEYWORDS.some((kw) => ev.title.includes(kw)),
+  );
+  const lines: LineSeries[] = [];
+
+  for (const ev of events) {
+    const rounds = calendarEventRsvpHistory(ev.eventId, range.from, range.to);
+    if (rounds.length === 0) continue;
+    lines.push({
+      name: ev.title,
+      points: rounds.map((r) => ({ t: r.syncedAt, y: r.accepted })),
+    });
+  }
+
+  return lines;
+}
+
+/**
+ * Build wiki tree nodes by fetching live wiki structure and joining with doc_view_events.
+ *
+ * Discovers which spaces had activity in the range, fetches their node trees, joins with
+ * unique-reader counts, then prunes to nodes with readers>0 and their ancestor paths.
+ * Returns an empty array when no readers were found (caller skips the tree chart).
+ */
+async function buildWikiTreeNodes(range: { from: number; to: number }): Promise<TreeNode[]> {
+  const spaceIds = wikiSpacesBetween(range.from, range.to);
+  if (spaceIds.length === 0) return [];
+
+  const viewersByToken = docViewersBetween(range.from, range.to);
+  const staffSet = resolveStaffOpenIds();
+
+  // Collect all wiki nodes across all active spaces.
+  const allNodes: WikiNode[] = [];
+  for (const spaceId of spaceIds) {
+    const nodes = listWikiNodesDeep(spaceId);
+    allNodes.push(...nodes);
+  }
+
+  if (allNodes.length === 0) return [];
+
+  // Build a lookup from nodeToken -> node for ancestor path traversal.
+  const byToken = new Map<string, WikiNode>();
+  for (const n of allNodes) {
+    byToken.set(n.nodeToken, n);
+  }
+
+  // The doc_view_events key is file_token = objToken; readers are that document's distinct viewers.
+  const viewersOf = (n: WikiNode): string[] => viewersByToken.get(n.objToken) ?? [];
+
+  // Identify nodes with at least one reader, excluding concrete file attachments by title.
+  const hasReaders = new Set<string>(
+    allNodes
+      .filter((n) => viewersOf(n).length > 0 && !isExcludedFileTitle(n.title))
+      .map((n) => n.nodeToken),
+  );
+
+  if (hasReaders.size === 0) return [];
+
+  // Walk each reader-node up to its root, collecting ancestor tokens.
+  const keepSet = new Set<string>(hasReaders);
+  for (const token of hasReaders) {
+    let cur = byToken.get(token);
+    while (cur && cur.parentNodeToken) {
+      if (keepSet.has(cur.parentNodeToken)) break; // already included
+      keepSet.add(cur.parentNodeToken);
+      cur = byToken.get(cur.parentNodeToken);
+    }
+  }
+
+  // Return only pruned nodes; each node carries its reader count and non-staff reader share.
+  return allNodes
+    .filter((n) => keepSet.has(n.nodeToken))
+    .map((n) => {
+      const viewers = viewersOf(n);
+      const total = viewers.length;
+      const nonStaff = viewers.filter((v) => !staffSet.has(v)).length;
+      return {
+        token: n.nodeToken,
+        parent: n.parentNodeToken || null,
+        title: n.title,
+        readers: total,
+        nonstaff: nonStaff,
+      };
+    });
+}
+
+/**
+ * Build a Simplified Chinese text summary from the assembled spec data.
+ * Computes member net change, signup totals, and top wiki documents.
+ */
+function buildTextSummary(
+  period: Period,
+  range: { from: number; to: number },
+  memberLine: LineSeries,
+  signupLines: LineSeries[],
+  wikiNodes: TreeNode[],
+): string {
+  const label = period === 'daily' ? '每日' : '每月';
+  const fromDate = localDateFromEpochSec(range.from);
+  const toDate = localDateFromEpochSec(range.to - 1);
+  const dateRange = period === 'daily' ? fromDate : `${fromDate} ~ ${toDate}`;
+
+  const lines: string[] = [`【${label}运营数据】${dateRange}`];
+
+  // Member net change.
+  const periodWord = period === 'daily' ? '本日' : '本月';
+  const pts = memberLine.points;
+  if (pts.length >= 2) {
+    const first = pts[0]!.y;
+    const last = pts[pts.length - 1]!.y;
+    const delta = last - first;
+    const sign = delta >= 0 ? '+' : '';
+    lines.push(`· 围观群人数：${last}（${periodWord}${sign}${delta}）`);
+  } else if (pts.length === 1) {
+    lines.push(`· 围观群人数：${pts[0]!.y}`);
+  } else {
+    lines.push('· 围观群人数：暂无数据');
+  }
+
+  // Signup totals.
+  if (signupLines.length === 0) {
+    lines.push('· 活动报名：无进行中追踪活动');
+  } else {
+    let totalSignups = 0;
+    for (const s of signupLines) {
+      const last = s.points.at(-1);
+      if (last) totalSignups += last.y;
+    }
+    lines.push(`· 活动报名：追踪 ${signupLines.length} 场活动，累计报名 ${totalSignups} 人`);
+  }
+
+  // Wiki readers and top docs.
+  const readerDocs = wikiNodes.filter((n) => n.readers > 0);
+  if (readerDocs.length === 0) {
+    lines.push('· 知识库浏览：暂无浏览数据');
+  } else {
+    const totalReaders = readerDocs.reduce((sum, n) => sum + n.readers, 0);
+    lines.push(`· 知识库浏览：${totalReaders} 位读者，覆盖 ${readerDocs.length} 份知识库文档`);
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Invoke the Python renderer as a subprocess. Returns a map of chart key -> absolute PNG path.
+ * Collects stderr and logs as warnings. Parses the last stdout line as JSON.
+ */
+function renderViaPython(specPath: string): Promise<Record<string, string>> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(PY_BIN, [RENDER_PY, specPath], {
+      cwd: join(PROJECT_ROOT, 'scripts'),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 90_000,
+    });
+
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+    child.stderr.on('data', (d: Buffer) => { err += d.toString(); });
+
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (err.trim()) {
+        log.warn('Python渲染警告：' + err.trim().replace(/\n/g, ' '));
+      }
+      if (code !== 0) {
+        return reject(new Error(`render_report.py 退出码 ${code}`));
+      }
+      const lines = out.trim().split('\n');
+      const last = lines.pop() ?? '';
+      try {
+        resolve(JSON.parse(last) as Record<string, string>);
+      } catch (e) {
+        reject(new Error(`解析Python输出JSON失败：${last}`));
+      }
+    });
+  });
+}
+
+/**
+ * Deliver the report to Feishu as a single rich-text post: the text summary followed by the chart
+ * images. Targets a group chat or a P2P user (open_id). Images upload under the bot identity, and
+ * must live under the process cwd for lark-cli's file sandbox.
+ */
+function sendReportToLark(
+  target: { chatId?: string; userId?: string },
+  title: string,
+  textSummary: string,
+  pngPaths: string[],
+): void {
+  const content: PostElement[][] = [];
+  for (const line of textSummary.split('\n')) {
+    content.push([{ tag: 'text', text: line }]);
+  }
+  // A blank line before each image separates the summary from the charts and the charts from
+  // one another, so the images are not cramped together.
+  for (const png of pngPaths) {
+    const key = uploadImage(png);
+    if (!key) continue;
+    content.push([{ tag: 'text', text: '' }]);
+    content.push([{ tag: 'img', image_key: key }]);
+  }
+  sendPost(target, { title, content }, { as: 'bot' });
+}
+
+/** Format the report date label in local time: YYYY-MM-DD for daily, YYYY-MM for monthly. */
+function formatRangeLabel(period: Period, fromSec: number): string {
+  const full = localDateFromEpochSec(fromSec);
+  return period === 'daily' ? full : full.slice(0, 7);
+}
+
+interface ReportTargets {
+  // Feishu group chat id to post the report to.
+  larkChat?: string;
+  // Feishu user open_id to post the report to (P2P preview).
+  larkUser?: string;
+}
+
+/** Core report pipeline: gather data, spawn Python renderer, deliver to Telegram and/or Feishu. */
+async function generateAndSendReport(period: Period, ref: Date, targets: ReportTargets = {}): Promise<void> {
+  const range = resolveRange(period, ref);
+  const xFmt = period === 'daily' ? '%H:%M' : '%m-%d';
+  const label = period === 'daily' ? '每日' : '每月';
+  const dateLabel = formatRangeLabel(period, range.from);
+  const dateSlash = dateLabel.replace(/-/g, '/');
+  const dayWord = period === 'daily' ? '当日' : '当月';
+
+  log.info(`运营报告生成开始（period=${period}，date=${dateLabel}）`);
+
+  const memberLine = buildMemberLine(range);
+  const signupLines = buildSignupLines(range);
+  const wikiNodes = await buildWikiTreeNodes(range);
+
+  // Output under the repo so lark-cli's cwd-relative file sandbox can upload the images.
+  const out_dir = await mkdtemp(join(PROJECT_ROOT, '.ops-report-'));
+  try {
+    await renderAndDeliver();
+  } finally {
+    await rm(out_dir, { recursive: true, force: true });
+  }
+
+  async function renderAndDeliver(): Promise<void> {
+
+  const charts: ChartSpec[] = [
+    {
+      type: 'line',
+      key: 'member',
+      title: `${dateSlash} ${dayWord}围观群人数趋势`,
+      y_label: '群成员人数',
+      x_format: xFmt,
+      lines: [memberLine],
+    },
+  ];
+
+  if (signupLines.length > 0) {
+    charts.push({
+      type: 'line',
+      key: 'signup',
+      title: `${dateSlash} 活动报名人数趋势`,
+      y_label: '报名人数',
+      x_format: xFmt,
+      lines: signupLines,
+    });
+  }
+
+  const hasWikiData = wikiNodes.length > 0;
+  if (hasWikiData) {
+    charts.push({
+      type: 'tree',
+      key: 'wiki',
+      title: '知识库浏览热点',
+      subtitle: `统计时间 ${localDateTimeFromEpochSec(range.from)} ~ ${localDateTimeFromEpochSec(range.to)}　偏红=非工作人员浏览越多　次数格式: (非工作人员浏览) 总浏览次数`,
+      nodes: wikiNodes,
+    });
+  }
+
+  const spec: ReportSpec = {
+    period,
+    range,
+    width: 1920,
+    height: 1080,
+    dpi: 200,
+    charts,
+    out_dir,
+  };
+
+  const specPath = join(out_dir, 'spec.json');
+  await writeFile(specPath, JSON.stringify(spec, null, 2), 'utf-8');
+
+  let pngs: Record<string, string> = {};
+  try {
+    pngs = await renderViaPython(specPath);
+    log.info(`运营报告渲染完成：${Object.keys(pngs).join(', ')}`);
+  } catch (e) {
+    log.error('运营报告Python渲染失败：', (e as Error).message);
+  }
+
+  const textSummary = buildTextSummary(period, range, memberLine, signupLines, wikiNodes);
+  const orderedKeys = ['member', 'signup', 'wiki'];
+
+  // Optional Feishu delivery (group chat or P2P preview), independent of Telegram.
+  if (targets.larkChat || targets.larkUser) {
+    try {
+      sendReportToLark(
+        { chatId: targets.larkChat, userId: targets.larkUser },
+        `SeeDAO ${label}运营数据 · ${dateLabel}`,
+        textSummary,
+        orderedKeys.map((k) => pngs[k]).filter((p): p is string => Boolean(p)),
+      );
+      log.info('运营报告已发送到飞书');
+    } catch (e) {
+      log.error('运营报告发送飞书失败：', (e as Error).message);
+    }
+  }
+
+  if (!isTelegramConfigured()) {
+    log.warn('Telegram未配置，跳过Telegram发送（已完成渲染）');
+    return;
+  }
+
+  // Send each chart separately (three independent messages per spec decision).
+  const captions: Record<string, string> = {
+    member: `【${label}运营报告 ${dateLabel}】围观群人数`,
+    signup: `【${label}运营报告 ${dateLabel}】活动报名人数`,
+    wiki: `【${label}运营报告 ${dateLabel}】知识库浏览热点`,
+  };
+
+  for (const key of orderedKeys) {
+    if (pngs[key]) {
+      try {
+        await sendTelegramPhoto(pngs[key]!, captions[key]);
+      } catch (e) {
+        log.error(`发送图表失败（${key}）：`, (e as Error).message);
+      }
+    }
+  }
+
+  try {
+    await sendTelegramMessage(textSummary);
+  } catch (e) {
+    log.error('发送文字摘要失败：', (e as Error).message);
+  }
+
+  log.info('运营报告发送完成');
+  }
+}
+
+/**
+ * Generate and send the daily ops report. ref defaults to today (pass yesterday for scheduled runs).
+ */
+export async function generateAndSendDailyReport(ref = new Date(), targets: ReportTargets = {}): Promise<void> {
+  await generateAndSendReport('daily', ref, targets);
+}
+
+/**
+ * Generate and send the monthly ops report. ref defaults to current month (pass last month for scheduled runs).
+ */
+export async function generateAndSendMonthlyReport(ref = new Date(), targets: ReportTargets = {}): Promise<void> {
+  await generateAndSendReport('monthly', ref, targets);
+}

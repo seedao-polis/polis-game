@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "profiles": {
+    "default": {
+      "kimiBin": null,
+      "timeoutMs": 600000,
+      "sessionScope": "per-chat",
+      "extraArgs": [],
+      "maxRetries": 1
+    }
+  }
+}

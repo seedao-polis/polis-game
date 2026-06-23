@@ -1,0 +1,6 @@
+matplotlib>=3.8
+networkx>=3.2
+# pygraphviz is optional: enables graphviz dot layout for the tree chart.
+# If absent or installation fails (e.g. Python 3.14 / missing system graphviz),
+# tree_chart.py falls back to a pure-Python hierarchical layout automatically.
+# pygraphviz>=1.12 ; platform_system != "Windows"

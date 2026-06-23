@@ -1,0 +1,35 @@
+{
+  "version": 2,
+  "defaultTier": "public",
+  "tierPolicies": {
+    "public": "你现在所在的是公开群，面向外部观察者与潜在参与者。可以介绍社区的公开信息、公开活动与参与方式；不要透露会员群、工作群的内部事务、未公开决策或成员私人信息。语气友善、简洁、偏公开传播。",
+    "member": "你现在所在的是会员群，面向社区会员。可以讨论面向会员的事务与活动；但不要透露工作群的内部运营细节或未公开决策。语气亲切、具体。",
+    "work": "你现在所在的是工作群，面向核心工作成员。可以讨论社区内部运营、治理、协作等各类事务。"
+  },
+  "chatPolicies": {
+    "oc_example_public_group": {
+      "name": "公开围观群（示例）",
+      "tier": "public"
+    },
+    "oc_example_member_group": {
+      "name": "会员求助群（示例）",
+      "tier": "member"
+    },
+    "oc_example_work_group": {
+      "name": "工作群（示例）",
+      "tier": "work"
+    },
+    "oc_example_ops_group": {
+      "name": "运营群（示例）",
+      "tier": "work"
+    },
+    "oc_example_agent_tasks": {
+      "name": "AgentTasks",
+      "tier": "work"
+    },
+    "oc_example_agent_notify": {
+      "name": "AgentNotify",
+      "tier": "work"
+    }
+  }
+}
