@@ -19,6 +19,7 @@ workspaces/profile-writer-yihan/
 │   ├── memories.md      记忆 L0 入口（顶部有速查表）
 │   ├── *-playbook.md    各主题操作手册（按需读取）
 │   └── journal/         按日记录的工作日志（YYYY-MM-DD.md）
+├── examples/            历史 SeeDAO 人物志范文（写初稿 / 定文风时参考；非自动注入）
 └── skills/              本角色专属技能（可 /skill: 触发）
     └── <skill>/         文件夹式：SKILL.md + scripts/ + references/
 ```
@@ -42,8 +43,10 @@ workspaces/profile-writer-yihan/
 
 | 文件 | 涵盖 |
 |------|------|
-| `interview-methodology-playbook.md` | 人物志理论、采访姿态、八阶段提问框架、追问技巧、话题边界与婉拒话术 |
+| `interview-methodology-playbook.md` | 人物志理论、采访姿态、提问框架（以人为主）、追问技巧、进度告知、范文文风与提问取向、话题边界与婉拒 |
 | `profile-deliverables-playbook.md` | 人物志产出清单、人物素材卡格式、人物志初稿写作要求与结构 |
+
+`examples/`（工作区根目录、与 `memory/` 同级）存了 8 篇历史 SeeDAO 人物志范文，写初稿 / 定文风前可参考；黄金模板与提问取向见 `interview-methodology-playbook.md` 第七节。
 
 `journal/` 按日存工作日志（`YYYY-MM-DD.md`），记录当天访谈了谁、整理了什么、留了哪些待确认。
 
