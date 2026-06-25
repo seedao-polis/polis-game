@@ -146,6 +146,16 @@ export class Agent {
       ? `以下是最近的对话上下文（旧→新）：\n${input.context}\n\n用户最新消息：\n${input.message}`
       : input.message;
 
+    // Conversation scene: distinguish a live serve conversation (Feishu p2p / group @) from a CLI
+    // session driven by the operator. The CLI / `agent ask` paths carry no source, so anything other
+    // than the two Feishu channels is treated as an operator-driven CLI turn. Souls that interview or
+    // otherwise serve external members rely on this signal to decide whether the current party is the
+    // operator or an outside interlocutor — it is neutral for souls that don't.
+    const isServe = input.source === 'feishu-bot' || input.source === 'feishu-user';
+    const scene = isServe
+      ? '【对话场景】serve 模式（飞书）：你正在和【当前对话者】一对一或群内对话；对方是外部对话者，不是 CLI 操作者本人。\n\n'
+      : '【对话场景】CLI 模式：当前对话者就是操作者本人。\n\n';
+
     // Identity context: tell the agent whom it is replying to so it can call profile / badge tools with
     // the correct open_id instead of guessing one. The LP balance is deliberately NOT injected here — the
     // framework appends the 🌱 LP status footer to the reply itself, and feeding the number in only tempted
@@ -186,7 +196,7 @@ export class Agent {
       }
     }
 
-    const prompt = `${identity}${memBlock}${body}\n\n${langRule}`;
+    const prompt = `${scene}${identity}${memBlock}${body}\n\n${langRule}`;
     return {
       prompt,
       workDir,
