@@ -592,10 +592,14 @@ export interface TriggerContext {
   isFirstInteraction: boolean;
   /** lark profile to send with */
   larkProfile?: string;
+  /** soul (workspace) this interaction belongs to; gates soul-scoped triggers */
+  soul: string;
 }
 
 interface TriggerRule {
   name: string;
+  /** Souls this trigger applies to; skipped for any other soul (welcome events are soul-specific). */
+  souls: string[];
   shouldFire(ctx: TriggerContext): boolean;
   fire(ctx: TriggerContext): Promise<unknown>;
 }
@@ -603,6 +607,9 @@ interface TriggerRule {
 const TRIGGERS: TriggerRule[] = [
   {
     name: 'first_interaction_welcome',
+    // The welcome-party event and its assets are tudigong-specific; other souls do not fire it.
+    // A new soul opts in by adding its own name here (and providing its own event).
+    souls: ['tudigong'],
     // Welcome on the user's first interaction WITH THE BOT, exactly once. We gate on "never
     // welcomed" rather than global profile-newness, because the user channel may have already
     // created the profile from a prior group message (so isFirstInteraction would be racy). The
@@ -624,6 +631,7 @@ const TRIGGERS: TriggerRule[] = [
  */
 export async function checkAndFireTriggers(ctx: TriggerContext): Promise<void> {
   for (const rule of TRIGGERS) {
+    if (!rule.souls.includes(ctx.soul)) continue;
     let fire = false;
     try {
       fire = rule.shouldFire(ctx);

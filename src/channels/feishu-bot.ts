@@ -42,6 +42,8 @@ interface BotJob {
   pendingId: number;
   /** True only on the sender's very first interaction (drives first-time event triggers). */
   isFirstInteraction: boolean;
+  /** True when the message came from a 1:1 p2p chat (direct reply); false in groups (in-thread reply). */
+  isP2p: boolean;
 }
 
 // A reply interrupted by restart is re-run at most this many times before we give up and ask the
@@ -145,12 +147,15 @@ export class FeishuBotChannel implements Channel {
       job.reaction = null;
     };
 
-    const send = (messageId: string | undefined, chatId: string, reply: string): void => {
+    const send = (messageId: string | undefined, chatId: string, reply: string, isP2p: boolean): void => {
       if (!reply) return;
       if (quiet) { log.info(`quiet 模式：不发送回复（${preview(reply)}）`); return; }
       try {
-        // Reply within the original message's thread; fall back to sending to the chat when there is no message_id.
-        if (messageId) replyText(messageId, cfg.replyPrefix + reply, { as: 'bot', profile, inThread: true });
+        // p2p (1:1 DM): reply as a plain direct message — no thread, no quote.
+        // group: reply within the original message's thread to stay in the topic; fall back to a plain
+        // send when there is no message_id.
+        if (isP2p) sendText({ chatId }, cfg.replyPrefix + reply, { as: 'bot', profile });
+        else if (messageId) replyText(messageId, cfg.replyPrefix + reply, { as: 'bot', profile, inThread: true });
         else sendText({ chatId }, cfg.replyPrefix + reply, { as: 'bot', profile });
         const { body, footer } = store.splitStatusFooter(reply);
         log.info(`已回复：${preview(body)}`);
@@ -170,6 +175,7 @@ export class FeishuBotChannel implements Channel {
             chatId: job.chatId,
             isFirstInteraction: job.isFirstInteraction,
             larkProfile: profile,
+            soul: cfg.soul,
           });
         } catch (e) {
           log.error('事件触发检查失败：', (e as Error).message);
@@ -219,7 +225,7 @@ export class FeishuBotChannel implements Channel {
           reply = '（抱歉，我这边出错了，请稍后再试。）';
         }
       }
-      send(job.messageId, job.chatId, reply);
+      send(job.messageId, job.chatId, reply, job.isP2p);
     };
 
     const pump = async (): Promise<void> => {
@@ -262,6 +268,8 @@ export class FeishuBotChannel implements Channel {
       // surfaces the real shape on the first topic message).
       const threadId: string = ev.thread_id ?? ev.message?.thread_id ?? ev.thread?.thread_id ?? '';
       log.debug(`事件字段：thread_id=${ev.thread_id ?? '∅'} chat_type=${ev.chat_type ?? '∅'}`);
+      // p2p (1:1 DM) vs group: a p2p reply goes out as a plain direct message; a group reply stays in the thread.
+      const isP2p: boolean = ev.chat_type === 'p2p';
 
       // Chat whitelist: when listenAll is set, do not filter chats (reply to any @-mention); otherwise only serve chats in the whitelist.
       if (!cfg.listenAll && internalChatIds.size > 0 && !internalChatIds.has(chatId)) {
@@ -341,7 +349,7 @@ export class FeishuBotChannel implements Channel {
         try {
           store.recordActivity('command', senderOpenId || null, chatId, messageId ?? null, { command: dr.command, args: dr.args ?? [] });
         } catch { /* best-effort */ }
-        send(messageId, chatId, dr.reply ?? '');
+        send(messageId, chatId, dr.reply ?? '', isP2p);
         return;
       }
 
@@ -368,7 +376,7 @@ export class FeishuBotChannel implements Channel {
 
       // LLM path → enqueue for the serial worker. React immediately so the sender knows they were
       // seen: "coffee" if they must wait behind another reply, "thinking" if they're up next.
-      const job: BotJob = { messageId, chatId, text, senderOpenId, threadId: threadId || undefined, context, sessionKey, reaction: null, reactionId: null, pendingId: 0, isFirstInteraction };
+      const job: BotJob = { messageId, chatId, text, senderOpenId, threadId: threadId || undefined, context, sessionKey, reaction: null, reactionId: null, pendingId: 0, isFirstInteraction, isP2p };
       // Persist BEFORE reacting/answering, so a crash at any point is recoverable on restart.
       job.pendingId = store.addPendingReply({
         agentId: cfg.id,
@@ -442,6 +450,7 @@ export class FeishuBotChannel implements Channel {
           reactionId: null,
           pendingId: p.id,
           isFirstInteraction: false, // recovered replies never re-fire first-time triggers
+          isP2p: false, // chat_type isn't persisted; recovered replies keep the original in-thread send
         };
         const mustWait = processing || queue.length > 0;
         setReaction(job, mustWait ? 'coffee' : 'thinking');
