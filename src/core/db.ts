@@ -26,6 +26,7 @@ function loadSqlite(): typeof import('node:sqlite') {
 }
 
 let _db: Db | null = null;
+let _lpDb: Db | null = null;
 
 /**
  * Name of the active soul, used to name its DB file. Each agent gets its own database:
@@ -58,15 +59,54 @@ export function getDb(): Db {
   return db;
 }
 
-/** Close the shared handle and drop the singleton so the next getDb() reopens. Mainly for tests. */
+/** Close the open handles and drop the singletons so the next getDb()/getLpDb() reopens. Mainly for tests. */
 export function closeDb(): void {
-  if (!_db) return;
-  try {
-    _db.close();
-  } catch {
-    /* ignore close errors */
+  for (const h of [_db, _lpDb]) {
+    if (!h) continue;
+    try { h.close(); } catch { /* ignore close errors */ }
   }
   _db = null;
+  _lpDb = null;
+}
+
+// All agents share ONE gamification/LP economy (points, ledger, check-ins, badges) kept in a single
+// database, so a member's LP and badges are global rather than per-agent. Per-person conversational
+// memory and messages stay in each agent's own <soul>.db. AGENT_LP_DB_PATH overrides the file.
+function lpDbPath(): string {
+  if (process.env.AGENT_DB_PATH) return process.env.AGENT_DB_PATH; // tests pin everything to one file
+  return process.env.AGENT_LP_DB_PATH || path.join(RUNTIME_DIR, 'shared.db');
+}
+
+/** Open (once) and return the shared LP database handle. Reuses the per-agent handle when they are the same file. */
+export function getLpDb(): Db {
+  if (lpDbPath() === dbPath()) return getDb(); // same file → one handle (tests / AGENT_SOUL pinned to the LP file)
+  if (_lpDb) return _lpDb;
+  const { DatabaseSync } = loadSqlite();
+  const file = lpDbPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const db = new DatabaseSync(file);
+  db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA foreign_keys = ON');
+  db.exec('PRAGMA synchronous = NORMAL');
+  db.exec('PRAGMA busy_timeout = 5000'); // several agent processes may write LP to this one file concurrently
+  runMigrations(db);
+  _lpDb = db;
+  return db;
+}
+
+/** Run a function inside a single atomic transaction on the shared LP database. */
+export function lpTx<T>(fn: () => T): T {
+  if (lpDbPath() === dbPath()) return tx(fn); // same file → reuse the per-agent transaction
+  const db = getLpDb();
+  db.exec('BEGIN');
+  try {
+    const r = fn();
+    db.exec('COMMIT');
+    return r;
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* ignore secondary rollback failure */ }
+    throw e;
+  }
 }
 
 /** Run a function inside a single atomic transaction; rolls back on any error. */
@@ -537,6 +577,18 @@ function migrateLpRename(db: Db): void {
   }
 }
 
+// Identity links: alias multiple per-app open_ids of the same human to one canonical LP identity, so a
+// member's points/badges follow them across agents (each Feishu app gives a person a different open_id).
+// Lives in the shared LP database; the LP layer resolves open_id → canonical_id before every read/write.
+const SCHEMA_V20 = `
+CREATE TABLE IF NOT EXISTS identity_links (
+  open_id      TEXT PRIMARY KEY,
+  canonical_id TEXT NOT NULL,
+  created_at   INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_identity_links_canonical ON identity_links(canonical_id);
+`;
+
 /** Apply ordered, idempotent schema migrations tracked in schema_migrations. */
 function runMigrations(db: Db): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -567,6 +619,7 @@ function runMigrations(db: Db): void {
     { version: 17, description: 'badge rich metadata + award provenance', sql: SCHEMA_V17 },
     { version: 18, description: 'long-term memory store (memory_items, namespace/visibility/sensitivity)', sql: SCHEMA_V18 },
     { version: 19, description: 'rename gamification points AP->LP (ap_* tables/columns -> pt_*)', run: migrateLpRename },
+    { version: 20, description: 'identity links (alias per-app open_ids to one canonical LP identity)', sql: SCHEMA_V20 },
   ];
   for (const m of migrations) {
     if (applied.has(m.version)) continue;

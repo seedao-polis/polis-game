@@ -1,15 +1,35 @@
-import { getDb, tx } from '../db.js';
+import { getDb, tx, getLpDb, lpTx } from '../db.js';
 import { localDate } from '../time.js';
 
 const FIRST_CONTACT_PT = 120;
 
 const DAILY_CHECKIN_PT = 3;
 
+// Resolve an open_id to its canonical LP identity (set up via `agent link`), so a person's points and
+// badges follow them across agents even though each Feishu app assigns them a different open_id. Returns
+// the input unchanged when it has no alias. Reads the link table from the shared LP database.
+function cid(openId: string): string {
+  if (!openId) return openId;
+  try {
+    const row = getLpDb()
+      .prepare('SELECT canonical_id FROM identity_links WHERE open_id = ?')
+      .get(openId) as { canonical_id?: string } | undefined;
+    return row?.canonical_id || openId;
+  } catch {
+    return openId;
+  }
+}
+
+/** Public resolver: the canonical LP identity for an open_id (its alias target via `agent link`, or itself). */
+export function canonicalId(openId: string): string {
+  return cid(openId);
+}
+
 export function getProfile(
   openId: string
 ): { openId: string; name: string; ptBalance: number; level: number; firstSeen: number; lastSeen: number } | null {
-  const db = getDb();
-  const row = db.prepare('SELECT * FROM profiles WHERE open_id = ?').get(openId) as Record<string, unknown> | undefined;
+  const db = getLpDb();
+  const row = db.prepare('SELECT * FROM profiles WHERE open_id = ?').get(cid(openId)) as Record<string, unknown> | undefined;
   if (!row) return null;
   return {
     openId: row['open_id'] as string,
@@ -26,13 +46,13 @@ export function getProfile(
  * Preserves the existing name when the supplied name is empty.
  */
 export function upsertProfileRaw(openId: string, name?: string): void {
-  const db = getDb();
+  const db = getLpDb();
   db.prepare(`
     INSERT INTO profiles(open_id, name) VALUES (?, ?)
     ON CONFLICT(open_id) DO UPDATE SET
       name      = CASE WHEN excluded.name <> '' THEN excluded.name ELSE profiles.name END,
       last_seen = unixepoch()
-  `).run(openId, name ?? '');
+  `).run(cid(openId), name ?? '');
 }
 
 /**
@@ -95,11 +115,12 @@ function balanceRaw(db: ReturnType<typeof getDb>, openId: string): number {
  * Returns the new balance.
  */
 export function grantPt(openId: string, delta: number, reason: string, refMessageId?: string): number {
-  return tx(() => {
-    const db = getDb();
-    upsertProfileRaw(openId);
-    ledgerRaw(db, openId, delta, reason, refMessageId);
-    return balanceRaw(db, openId);
+  const id = cid(openId);
+  return lpTx(() => {
+    const db = getLpDb();
+    upsertProfileRaw(id);
+    ledgerRaw(db, id, delta, reason, refMessageId);
+    return balanceRaw(db, id);
   });
 }
 
@@ -108,12 +129,13 @@ export function grantPt(openId: string, delta: number, reason: string, refMessag
  * Returns true when newly granted; false when the user already holds the badge.
  */
 export function awardBadge(openId: string, badgeId: string, ref?: string): boolean {
-  return tx(() => {
-    const db = getDb();
-    upsertProfileRaw(openId);
+  const id = cid(openId);
+  return lpTx(() => {
+    const db = getLpDb();
+    upsertProfileRaw(id);
     const result = db.prepare(`
       INSERT OR IGNORE INTO user_badges(user_open_id, badge_id, ref) VALUES (?, ?, ?)
-    `).run(openId, badgeId, ref ?? null);
+    `).run(id, badgeId, ref ?? null);
     return (result.changes as number) > 0;
   });
 }
@@ -133,7 +155,7 @@ export function upsertBadge(b: {
   category?: string;
   event?: string;
 }): void {
-  const db = getDb();
+  const db = getLpDb();
   db.prepare(`
     INSERT INTO badges(badge_id, name, description, emoji, headline, file, title, type, role, endorser, duration, category, event)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -175,7 +197,7 @@ export function upsertBadge(b: {
 export function listBadges(
   openId?: string
 ): Array<{ badgeId: string; name: string; description: string; emoji: string; headline: string; type: string; file: string; awardedAt?: number }> {
-  const db = getDb();
+  const db = getLpDb();
   if (openId) {
     const rows = db.prepare(`
       SELECT b.badge_id, b.name, b.description, b.emoji, b.headline, b.type, b.file, ub.awarded_at
@@ -183,7 +205,7 @@ export function listBadges(
       JOIN badges b ON b.badge_id = ub.badge_id
       WHERE ub.user_open_id = ?
       ORDER BY ub.awarded_at DESC
-    `).all(openId) as Record<string, unknown>[];
+    `).all(cid(openId)) as Record<string, unknown>[];
     return rows.map((r) => ({
       badgeId: r['badge_id'] as string,
       name: r['name'] as string,
@@ -238,7 +260,7 @@ export function getBadge(ref: string): {
   headline: string; file: string; title: string; type: string; role: string;
   endorser: string; duration: string; category: string; event: string;
 } | undefined {
-  const db = getDb();
+  const db = getLpDb();
   const row = db.prepare(`
     SELECT badge_id, name, description, emoji, headline, file, title, type, role, endorser, duration, category, event
     FROM badges WHERE badge_id = ? OR name = ? LIMIT 1
@@ -262,7 +284,7 @@ export function getBadge(ref: string): {
 }
 
 export function leaderboard(limit = 10): Array<{ openId: string; name: string; ptBalance: number }> {
-  const db = getDb();
+  const db = getLpDb();
   const rows = db.prepare(`
     SELECT open_id, name, pt_balance FROM profiles
     ORDER BY pt_balance DESC
@@ -281,11 +303,12 @@ export function leaderboard(limit = 10): Array<{ openId: string; name: string; p
  * balance is insufficient. On success writes one ledger debit and updates the balance.
  */
 export function spendPt(openId: string, cost: number, reason: string, refMessageId?: string): boolean {
-  return tx(() => {
-    const db = getDb();
-    ensureProfileRaw(openId);
-    if (balanceRaw(db, openId) < cost) return false;
-    ledgerRaw(db, openId, -cost, reason, refMessageId);
+  const id = cid(openId);
+  return lpTx(() => {
+    const db = getLpDb();
+    ensureProfileRaw(id);
+    if (balanceRaw(db, id) < cost) return false;
+    ledgerRaw(db, id, -cost, reason, refMessageId);
     return true;
   });
 }
@@ -295,8 +318,8 @@ export function spendPt(openId: string, cost: number, reason: string, refMessage
  * Writes one ledger credit per affected user and returns the count of users updated.
  */
 export function resetDailyPtFloor(floor = 10): { affected: number } {
-  return tx(() => {
-    const db = getDb();
+  return lpTx(() => {
+    const db = getLpDb();
     const rows = db.prepare('SELECT open_id, pt_balance FROM profiles WHERE pt_balance < ?').all(floor) as Array<{ open_id: string; pt_balance: number }>;
     for (const r of rows) {
       // delta brings the balance up to the floor; ledgerRaw applies it (balance + delta == floor).
@@ -314,8 +337,8 @@ export function resetDailyPtFloor(floor = 10): { affected: number } {
  * Returns the target applied and the count of users whose balance moved.
  */
 export function resetAllPtTo(target = FIRST_CONTACT_PT, reason = 'manual_reset'): { affected: number; target: number } {
-  return tx(() => {
-    const db = getDb();
+  return lpTx(() => {
+    const db = getLpDb();
     const rows = db.prepare('SELECT open_id, pt_balance FROM profiles').all() as Array<{ open_id: string; pt_balance: number }>;
     let affected = 0;
     for (const r of rows) {
@@ -388,15 +411,16 @@ export function splitStatusFooter(text: string): { body: string; footer: string 
  */
 export function checkIn(openId: string): { firstToday: boolean; awarded: number; date: string; balance: number } {
   const date = localDate(new Date());
-  return tx(() => {
-    const db = getDb();
-    ensureProfileRaw(openId);
+  const id = cid(openId);
+  return lpTx(() => {
+    const db = getLpDb();
+    ensureProfileRaw(id);
     const res = db.prepare(
       'INSERT OR IGNORE INTO checkins(user_open_id, checkin_date, pt_awarded) VALUES (?, ?, ?)'
-    ).run(openId, date, DAILY_CHECKIN_PT);
+    ).run(id, date, DAILY_CHECKIN_PT);
     const firstToday = (res.changes as number) > 0;
-    if (firstToday) ledgerRaw(db, openId, DAILY_CHECKIN_PT, 'daily_checkin');
-    return { firstToday, awarded: firstToday ? DAILY_CHECKIN_PT : 0, date, balance: balanceRaw(db, openId) };
+    if (firstToday) ledgerRaw(db, id, DAILY_CHECKIN_PT, 'daily_checkin');
+    return { firstToday, awarded: firstToday ? DAILY_CHECKIN_PT : 0, date, balance: balanceRaw(db, id) };
   });
 }
 
@@ -407,12 +431,13 @@ export function checkIn(openId: string): { firstToday: boolean; awarded: number;
  * Returns true when the profile was created by this call.
  */
 function ensureProfileRaw(openId: string, name?: string, refMessageId?: string): boolean {
-  const db = getDb();
-  const isNew = getProfile(openId) === null;
-  upsertProfileRaw(openId, name);
+  const db = getLpDb();
+  const id = cid(openId);
+  const isNew = getProfile(id) === null;
+  upsertProfileRaw(id, name);
   if (isNew) {
-    ledgerRaw(db, openId, FIRST_CONTACT_PT, 'first_contact', refMessageId);
-    db.prepare('INSERT OR IGNORE INTO user_badges(user_open_id, badge_id) VALUES (?, ?)').run(openId, 'first_contact');
+    ledgerRaw(db, id, FIRST_CONTACT_PT, 'first_contact', refMessageId);
+    db.prepare('INSERT OR IGNORE INTO user_badges(user_open_id, badge_id) VALUES (?, ?)').run(id, 'first_contact');
   }
   return isNew;
 }
@@ -425,7 +450,7 @@ export function ensureProfile(
   openId: string,
   name?: string,
 ): { openId: string; name: string; ptBalance: number; firstSeen: number; lastSeen: number } {
-  return tx(() => {
+  return lpTx(() => {
     ensureProfileRaw(openId, name);
     return getProfile(openId)!;
   });
@@ -443,11 +468,11 @@ export function recordInteraction(
   messageId: string,
 ): { isNew: boolean; ptGranted: number } {
   if (!openId) return { isNew: false, ptGranted: 0 };
-  return tx(() => {
-    const isNew = ensureProfileRaw(openId, name, messageId);
-    recordActivityRaw('mention', openId, chatId, messageId);
-    return { isNew, ptGranted: isNew ? FIRST_CONTACT_PT : 0 };
-  });
+  // LP cluster (shared db) and the activity log (per-agent db) are different databases, so they can't
+  // share one transaction; each gets its own.
+  const isNew = lpTx(() => ensureProfileRaw(openId, name, messageId));
+  tx(() => recordActivityRaw('mention', openId, chatId, messageId));
+  return { isNew, ptGranted: isNew ? FIRST_CONTACT_PT : 0 };
 }
 
 /**
@@ -458,9 +483,9 @@ export function recordInteraction(
 export function hasFirstContact(openId: string): boolean {
   if (!openId) return false;
   try {
-    const row = getDb()
+    const row = getLpDb()
       .prepare("SELECT 1 FROM user_badges WHERE user_open_id = ? AND badge_id = 'first_contact' LIMIT 1")
-      .get(openId);
+      .get(cid(openId));
     return !!row;
   } catch {
     return false;

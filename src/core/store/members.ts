@@ -1,4 +1,5 @@
-import { getDb, tx } from '../db.js';
+import { getDb, tx, getLpDb } from '../db.js';
+import { canonicalId } from './gamification.js';
 
 export interface SilentMember {
   openId: string;
@@ -139,7 +140,8 @@ export function syncChatMembers(
     `);
     // Keep an existing interactor's profile name fresh on rename. UPDATE-only (no INSERT) so we never
     // add a non-participant to profiles (the daily LP floor reset would otherwise grant them LP).
-    const freshenProfile = db.prepare('UPDATE profiles SET name = ? WHERE open_id = ? AND name <> ?');
+    // Names live in the shared LP database (profiles); refresh the canonical identity's name on rename.
+    const freshenProfile = getLpDb().prepare('UPDATE profiles SET name = ? WHERE open_id = ? AND name <> ?');
     // Collect the (open_id, name) of each joiner/renamer so the periodic round can be persisted with
     // its full detail. A joiner's name is the current one; a renamer's name is the NEW one.
     const joinedMembers: MemberRef[] = [];
@@ -151,7 +153,7 @@ export function syncChatMembers(
       } else if (name && oldName.get(openId) && oldName.get(openId) !== name) {
         renamedMembers.push({ openId, name });
       }
-      if (name) freshenProfile.run(name, openId, name);
+      if (name) freshenProfile.run(name, canonicalId(openId), name);
     }
     // A leaver was present before but is absent from the current roster; record their last-known name.
     const leftMembers: MemberRef[] = [];
