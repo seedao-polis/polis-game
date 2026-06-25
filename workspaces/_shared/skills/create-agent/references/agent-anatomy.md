@@ -5,6 +5,7 @@
 4. SKILLS_GUIDE 与 WORKSPACE_GUIDE 的特殊地位
 5. memory/ 目录的用途与惯例
 6. skills/ 目录与双层 skill 机制
+7. LP_STRATEGY.json（LP 评分策略，框架读取）
 </table_of_contents>
 
 # Agent Anatomy — workspace 结构参考
@@ -24,6 +25,8 @@ workspaces/<soul-name>/
 ├── HEARTBEAT.md         后台定时职责与心跳完成标准
 ├── SKILLS_GUIDE.md      技能用法与撰写规范（仅供人读，不被自动注入）
 ├── WORKSPACE_GUIDE.md   目录结构总览（仅供人读，不被自动注入）
+├── LP_STRATEGY.json     per-soul LP 评分策略（框架读取，不注入 prompt；默认停用）
+├── examples/            （可选）参考样例 / 范文，供 agent 写作时按需读取（见下文「工作区目录注入」）
 ├── memory/
 │   ├── memories.md      记忆 L0 入口（速查表 + 重点记忆，自动注入）
 │   ├── *-playbook.md    各主题操作手册（按需读取）
@@ -60,7 +63,15 @@ IDENTITY.md → SOUL.md → AGENTS.md → TOOLS.md → USER.md → BOOT.md → H
 - `memory/memories.md`（重点记忆）
 - `memory/journal/YYYY-MM-DD.md`（当天工作日志，若存在）
 
-此外，框架在**每条 prompt**（不是 system prompt）开头还会注入一行【对话场景】，标明本轮是 **serve 模式（飞书 p2p / 群 @）** 还是 **CLI 模式**——由 `src/core/agent.ts` 的 `prepare()` 按 `input.source` 判断（`feishu-bot`/`feishu-user` → serve；其余 → CLI）。所有 agent 据此区分对面是【外部对话者】还是【操作者本人】，详见样板各文件的 serve/CLI 段落与 `workspaces/tudigong/memory/serve-cli-identity-playbook.md`。
+此外，框架在**每条 prompt**（不是 system prompt）开头还会注入一行【对话场景】，标明本轮是 **serve 模式（飞书 p2p / 群 @）** 还是 **CLI 模式**——由 `src/core/agent.ts` 的 `prepare()` 按 `input.source` 判断（`feishu-bot`/`feishu-user` → serve；其余 → CLI）。所有 agent 据此区分对面是【外部对话者】还是【操作者本人】，详见样板各文件的 serve/CLI 段落与对应 playbook。
+
+### 工作区目录注入（agent 读自己的源文件）
+
+框架在**每条 prompt** 开头还会注入一行【你的工作区目录】+ 该 soul 工作区的**绝对路径**。
+
+- **为什么需要**：agent 运行时的工作目录是 per-session 的会话目录，**不是** workspace 本身。所以人格文件里写「examples/」「memory/xx.md」这类相对路径，单独写并不会解析到工作区。框架注入绝对路径后，agent 才能用文件读取工具按这个路径打开自己工作区下的源文件。
+- **可读什么**：`examples/`（参考样例 / 范文）、`memory/*.md`（各 playbook）等。`memory/memories.md` 与当天 journal 仍是自动注入；其余按需用文件工具读。
+- **怎么用**：凡是希望 agent 能现读的参考资料 / 范例，放进它 workspace 目录下（如 `examples/`）即可；在人格文件里引用时说明放在工作区下，agent 会按注入的绝对路径找到。
 
 ## 4. SKILLS_GUIDE 与 WORKSPACE_GUIDE 的特殊地位
 
@@ -91,3 +102,11 @@ IDENTITY.md → SOUL.md → AGENTS.md → TOOLS.md → USER.md → BOOT.md → H
 装载顺序：共用层先注入，专属层后注入。
 
 skill 在**会话创建时**定格——修改 skill 后只对新会话生效。框架在服务重启或热更新时按内容指纹检测变化，自动重置受影响会话。
+
+## 7. LP_STRATEGY.json（LP 评分策略，框架读取）
+
+`workspaces/<soul>/LP_STRATEGY.json` 描述该 soul 的 LP 计费策略：每条回复扣多少（`cost`），以及要不要让 agent 按交流内容给 LP 评分 / 加分（`judgeEnabled` + `categories`）。
+
+- **不注入 prompt**：它由框架读取（不像人格文件那样拼进 system prompt）；只有 `judgeEnabled:true` 时，框架才把各类别的判定标准注入提示、要求大模型在回复尾行输出分类标记。
+- **默认停用**：样板带的是 `judgeEnabled:false`（每条固定扣 `cost`、不评分）；缺文件也按此回退。
+- 字段、运作机制与停用 / 启用两个范例见 `references/lp-strategy.md`。

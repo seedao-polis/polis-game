@@ -15,6 +15,7 @@ workspaces/{{AGENT_NAME}}/
 ├── TOOLS.md             工具类别与常用命令速查
 ├── WORKSPACE_GUIDE.md   本文件
 ├── SKILLS_GUIDE.md      技能（skill）的使用与撰写指南
+├── LP_STRATEGY.json     per-soul LP 评分策略（框架读取，默认停用 == 固定扣分）
 ├── memory/              长期记忆与各主题操作手册
 │   ├── memories.md      记忆 L0 入口（顶部有速查表）
 │   ├── *-playbook.md    各主题操作手册（按需读取）
@@ -54,4 +55,5 @@ workspaces/{{AGENT_NAME}}/
 - **启动顺序**：IDENTITY → SOUL → AGENTS → USER → HEARTBEAT → `memory/memories.md`（也是人读的推荐顺序）。
 - **遇到问题**：先看 `memory/memories.md` 速查表 → 打开对应 playbook。
 - **沉淀新知识**：背景知识、踩坑经验写进 `memory/`（对应 playbook 或 journal）；可被 `/skill:` 触发的程序性能力做成 `skills/` 下的 skill。
+- **agent 能读自己工作区的源文件**：框架每条 prompt 会注入【你的工作区目录】的绝对路径，agent 可据此用文件工具读本目录下的源文件（`memory/*.md` 各 playbook，以及可选的 `examples/` 范文 / 样例）。要给 agent 现读的参考资料就放在本工作区目录下。
 - **保持新鲜**：playbook 是活文档，发现旧记录与现状不符就就地更新。

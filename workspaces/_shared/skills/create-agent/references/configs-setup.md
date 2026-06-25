@@ -25,6 +25,7 @@
 | `workspace` | string | 否 | 决定数据库文件路径 `.agent/<workspace>.db`；**省略时默认等于 soul** |
 | `enabled` | boolean | 否 | 旧字段。**`serve` 选哪个身份现在靠 `--bot` / `--user` / `--both`，不再看 `enabled`**；留 false 即可 |
 | `lark` | string | 否 | 指定使用 `configs/lark.json` 中哪个 profile（省略时按解析顺序回退） |
+| `replyPrefix` | string | 否 | 回复前缀。**只在 user 频道生效**——user 模式下消息显示在操作者本人账号下，需要前缀来区分这是 agent 在说话。**bot 频道不加任何前缀**（bot 在客户端本来就显示自己的名字，前缀多余）。省略 / 留空即可 |
 
 ### soul 与 workspace 的区别
 

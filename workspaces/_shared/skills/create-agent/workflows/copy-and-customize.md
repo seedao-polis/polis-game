@@ -22,7 +22,7 @@
 cp -r workspaces/_template workspaces/<new-agent-name>
 ```
 
-复制后验证目录结构（应包含 9 个 .md 文件 + memory/ + skills/）：
+复制后验证目录结构（应包含 9 个 .md 文件 + `LP_STRATEGY.json` + memory/ + skills/）：
 
 ```bash
 ls workspaces/<new-agent-name>/
@@ -51,6 +51,8 @@ ls workspaces/<new-agent-name>/
 9. **WORKSPACE_GUIDE.md** — 替换：`{{AGENT_NAME}}`（所有路径与标题中的出现）
 
 10. **memory/memories.md** — 替换：`{{AGENT_NAME}}`、`{{MEMORY_TOPIC_1..2}}`、`{{PLAYBOOK_1..2}}`、`{{DB_VERSION}}`、`{{ACTIVE_STATE_NOTE}}`、`{{SERVE_PARTY_ROLE}}`、`{{SOUL_SUMMARY_1..3}}`
+
+11. **LP_STRATEGY.json** — 无占位符，默认随样板带「停用评分」版（每条固定扣 `cost`、不评分，等于老行为），一般不动。只有需要「按每次交流的内容给 LP 评分 / 加分」的 agent（如访谈类）才改 `judgeEnabled:true` 并定义 `categories`（含 `criteria` 判定标准）。字段与范例见 `references/lp-strategy.md`。
 
 ## 步骤 4：确认无残留占位符
 

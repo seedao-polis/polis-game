@@ -30,6 +30,10 @@ Runtime 的启动守卫会拒绝以 `_` 开头的 soul 名称——新 agent 名
 - **CLI 模式**：对面才是**操作者本人**，这时才接受运营、配置、方向设定等内部对话。
 
 样板的 SOUL / IDENTITY / USER / AGENTS / BOOT / memories.md 已写死这套 serve/CLI 段落，新 agent 只需把 `{{SERVE_PARTY_ROLE}}` 填成本 agent 对 serve 对话者的称呼。机制细节见 `workspaces/tudigong/memory/serve-cli-identity-playbook.md`。
+
+### 5. LP 评分策略默认停用，需要才开
+
+每个 agent 带一份 `LP_STRATEGY.json`（per-soul LP 评分策略）。样板默认 `judgeEnabled:false`——每条回复固定扣 `cost`、不评分，等于老行为。只有需要「按每次交流的内容给 LP 评分 / 加分」的 agent（如访谈类）才改成 `judgeEnabled:true` 并定义类别（含判定标准）。字段与范例见 `references/lp-strategy.md`。
 </essential_principles>
 
 <intake>
@@ -61,6 +65,7 @@ Runtime 的启动守卫会拒绝以 `_` 开头的 soul 名称——新 agent 名
 - **placeholders.md** — 全部占位符清单：每个 `{{...}}` 的含义、范例值、填写注意事项。
 - **configs-setup.md** — configs 配置：`agents.json` 字段说明、`lark.json` profile 配置、`AGENT_SOUL` 环境变量。
 - **runtime-constraints.md** — Runtime 约束：`listSouls()` 行为、启动守卫、soul vs workspace 的区别、skill 生效时机。
+- **lp-strategy.md** — LP 评分策略 `LP_STRATEGY.json`：字段、运作机制、停用 / 启用两个范例。
 </reference_index>
 
 <workflows_index>
