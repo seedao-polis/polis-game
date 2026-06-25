@@ -1,14 +1,15 @@
-# 智能体执行器 Skill 系统适配手册（城邦土地神工作区记忆）
+# 智能体执行器 Skill + 人格档 会话重置手册（城邦土地神工作区记忆）
 
-> 给每个 soul（角色）配自己的 Agent Skills，并在改 skill 后自动让会话生效。改 skill 相关代码、放新 skill、或排查“skill 没生效”前，先读这份。
-> 执行器实测行为确立。命令 / 参数 / 字段保留原文。与 `agent-executor-playbook.md`（执行器）、`self-heal-playbook.md`（会话隔离 / 重置）配套。
+> 给每个 soul 配自己的 Agent Skills，并在改 skill **或大写人格档**后自动让会话生效。改 skill / 人格档相关代码、放新 skill、或排查"改了没生效"前，先读这份。
+> 执行器实测行为确立。命令 / 参数 / 字段保留原文。与 `agent-executor-playbook.md`（执行器）、`self-heal-playbook.md`（会话隔离 / 重置）、`serve-cli-identity-playbook.md`（每轮 prompt 注入的信号）配套。
 
 ## 0. 最容易踩的坑（一句话版）
 
 1. **改了 skill，老聊天看不到**：执行器在**会话创建那一刻**就把 skill 集合 + 内容定死，`--continue` 续接**不重扫、不重读**（和 AGENTS.md 缓存同理，见 `agent-executor-playbook.md §3`）。改 / 加 / 删 skill 只对**新会话**生效。
-2. **已自动兜底**：每次 worker（重）启动——`agent serve` 重启 + `agent update` 的 SIGHUP 热重启——都会跑 `reloadSkillsIfChanged(soul)`，skill 文件有变就隔离该 soul 的全部会话，相关群下一句话自动重建会话载入新 skill。**首次启动只记录指纹、不动会话**（避免一上线就清空所有人短期记忆）。
-3. **`--skills-dir` 是“取代”不是“叠加”**：传了它，执行器就**不再**自动探索用户级 / 项目级 skill 目录；要同时有共用 + 专属，必须把两个目录都用 `--skills-dir` 列出来（可重复）。
-4. **skills 目录根别放散落的 `.md`**：执行器会把 skills 目录下任意 `.md` 当成一个 skill（名字 = 去后缀文件名）。说明性文档要塞进子文件夹、或别叫 `.md`。
+2. **改大写人格档（SOUL/AGENTS/IDENTITY…）同理**：执行器把会话创建当下组装好的 AGENTS.md（=人格）也定格、`--continue` 不重读，人格档改动也只对**新会话**生效。
+3. **已自动兜底**：每次 worker（重）启动——`agent serve` 重启 + `agent update` 的 SIGHUP 热重启——都会跑 `reloadSoulIfChanged(soul)`，**skill 或大写人格档有变**就隔离该 soul 全部会话，下一句话自动重建、载入新内容。**首跑只记指纹不动会话**；**光重启、内容没变不会重置健康会话**（要强制重置个别会话用 `agent doctor --fix` 或手动 `quarantineSession`，见 §5）。
+4. **`--skills-dir` 是"取代"不是"叠加"**：传了它，执行器就**不再**自动探索用户级 / 项目级 skill 目录；要同时有共用 + 专属，必须把两个目录都用 `--skills-dir` 列出来（可重复）。
+5. **skills 目录根别放散落的 `.md`**：执行器会把 skills 目录下任意 `.md` 当成一个 skill（名字 = 去后缀文件名）。说明性文档要塞进子文件夹、或别叫 `.md`。
 
 ## 1. 执行器原生 skill 格式（已验证）
 
@@ -63,16 +64,18 @@
 
 结论：skill 注册表 + 内容在**会话创建当下**定格，`--continue` 沿用快照。和 `agent-executor-playbook.md §3` 说的 AGENTS.md 缓存是同一回事。
 
-## 5. 自动重置机制（让改 skill 生效）
+## 5. 自动重置机制（改 skill 或人格档自动生效，2026-06-25 扩展）
 
-`src/core/skills.ts` 的 `reloadSkillsIfChanged(soul)`：
+`src/core/skills.ts` 的 `reloadSoulIfChanged(soul)`（原 `reloadSkillsIfChanged`，已扩展并改名）：
 
-- **指纹**：`fingerprintSkills(dirs)` 对两层目录下所有文件做【相对路径 + 内容 SHA-1】汇总再 SHA-1。**用内容哈希不用 mtime**——所以 `git pull` 只改时间戳不会误触发，只有新增 / 删除 / 改内容才变。
-- **基准保存**：每个 soul 一个 `.agent/skill-state/<soul>.txt`（runtime 目录、gitignore）。
+- **指纹范围（三块合一）**：`fingerprintSoul(soul)` 把这三块的文件内容合并成一个 SHA-1——① 共用 skill（`workspaces/_shared/skills/`）② 该 soul 专属 skill（`workspaces/<soul>/skills/`）③ 该 soul 的**大写人格档**（`src/core/soul.ts` 的 `personaFilesForSoul`：IDENTITY/SOUL/AGENTS/TOOLS/USER/BOOT/HEARTBEAT.md）。**任一改动指纹就变。**
+- **故意排除 `memory/`**（memories.md、各 playbook、journal）：journal 每天变、纳入会天天误重置；playbook 是按需现读的、不进会话缓存。所以**改 playbook 不会、也不需要重置会话**。
+- **用内容哈希不用 mtime**——`git pull` 只改时间戳不误触发，只有新增 / 删除 / 改内容才变。
+- **基准保存**：每个 soul 一个 `.agent/soul-state/<soul>.txt`（原 `skill-state/`、已改名；runtime 目录、gitignore）。改名也让本次升级第一次重启只记新基准、不会把现有会话全清。
 - **首跑保护**：没有旧基准时只记录指纹、**不重置**任何会话；之后指纹不同才重置。
-- **重置范围**：`src/core/kimi-session.ts` 的 `listSoulSessionDirs(soul)` 列出 workDir 落在 `.agent/<soul>/` 下的所有会话，逐一 `quarantineSession()`（移出 `~/.kimi-code/sessions/`、可逆、只丢短期记忆；长期记忆 `workspaces/<soul>/memory` 不动）。
-- **触发时机**：挂在 `src/bin/agent.ts` 的 `runWorker` 启动流程（pin `AGENT_SOUL` 之后、channel 启动之前）。`agent update` 发 SIGHUP → 监督者杀掉旧 worker → 退出时重新 `spawn` 新 worker → 重跑 `runWorker`，所以 **serve 重启和 update 都覆盖**，且在任何消息处理前完成，不和进行中的 `respond()` 抢。
-- 看 log：变更时打印【skill 有变更：已重置 N 个会话】；首跑打印【skill 基线已记录】。
+- **重置范围**：`src/core/kimi-session.ts` 的 `listSoulSessionDirs(soul)` 列出 workDir 落在 `.agent/<soul>/` 下的所有会话，逐一 `quarantineSession()`（移出 `~/.kimi-code/sessions/`、可逆、只丢短期记忆；长期记忆 `workspaces/<soul>/memory` 不动）。**手动重置某 soul 全部会话**（serve 运行时也安全，纯文件操作、不碰 DB）：`node --input-type=module -e "import {listSoulSessionDirs,quarantineSession} from './dist/core/kimi-session.js'; for (const d of listSoulSessionDirs('<soul>')) quarantineSession(d)"`。
+- **触发时机**：挂在 `src/bin/agent.ts` 的 `runWorker` 启动流程（pin `AGENT_SOUL` 之后、channel 启动之前）。`agent update` 发 SIGHUP → 监督者杀旧 worker → 重新 spawn → 重跑 `runWorker`，**serve 重启和 update 都覆盖**、在任何消息处理前完成、不和进行中的 `respond()` 抢。**坑**：裸 `serve <soul> --bot`（没带 `--sup`）的 worker 不归监督者管，`agent update` 不会重启它，要手动停了重起才会重跑这套。
+- 看 log：变更时打印【skill / 人格档有变更：已重置 N 个会话】；首跑打印【soul 基线已记录…改动 skill 或大写人格档…会自动重置】。
 
 ## 6. 新增 / 修改一个 skill 的流程
 
@@ -85,7 +88,8 @@
 
 ## 关键文件
 
-- `src/core/skills.ts`：`skillsDirsForSoul` / `fingerprintSkills` / `reloadSkillsIfChanged`（含指纹读写、首跑保护）。
+- `src/core/skills.ts`：`skillsDirsForSoul` / `fingerprintSkills` / `fingerprintSoul` / `reloadSoulIfChanged`（含指纹读写、首跑保护）。
+- `src/core/soul.ts`：`personaFilesForSoul`（列出存在的大写人格档绝对路径，供指纹用）。
 - `src/core/kimi-session.ts`：`listSoulSessionDirs`（+ 原有 `quarantineSession` / `scanCorruptSessions`）。
 - `src/core/agent.ts`：`resolveSkillsDirs()` 委派 skills.ts。
 - `src/core/kimi.ts`：`buildArgs()` 拼重复 `--skills-dir`、`KimiRunOptions.skillsDirs`。

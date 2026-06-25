@@ -90,3 +90,20 @@
 - **谁要 link**：只有**跨多个 bot**的少数人（每接一个新 app 的 bot，回头客就多一个 open_id）。多数成员只用一个 bot，不用 link。
 - **旧数据**：各 agent 单独库（`seealpha.db`/`profile-writer-yihan.db`）里的旧 LP **作废、以 shared.db 为准**（操作者拍板）。
 - 详见共用 skill `onboard-lark-bot/references/shared-lp-and-link.md`。
+
+## 10. LP 评分机制：按交流内容动态判定 + per-soul 策略（2026-06-25 大改）
+
+**背景**：一涵（profile-writer-yihan）在 serve 里访谈居民，希望每条回复的 LP 变动**由 agent 按这轮交流内容判定**，而非固定扣 0.1；做成**框架级通用机制**，tudigong 也纳入同一套抽象（停用分类、维持固定扣分）。研究 / 决策定案：`thoughts/shared/research/2026-06-25-lp-judgement-generic-mechanism.md`；施工总结：`thoughts/shared/coding/2026-06-25-lp-judgement-generic-mechanism-implementation.md`。
+
+- **机制一句话**：每条回复**先 `spendPt(cost)`**（成本线、gating 照旧）→ 大模型在回复尾行输出一行分类标记 `LP_JUDGE: <类别>` → 框架 `judgeReply` 解析类别 →（`grant>0`）`grantPt(grant, reason)` → 状态行 footer 显示「本回合净值 = `grant - cost`」+ 分类标签。`grant=0` 不调 `grantPt`，只留一笔成本线。
+- **per-soul 策略文件 `workspaces/<soul>/LP_STRATEGY.json`**（soul 级配置，**不放 `configs/`**）。字段：`judgeEnabled`(是否要求分类) / `marker`(标记行前缀，`LP_JUDGE`) / `cost`(每条先扣的点数，浮动旋钮) / `categories[]`：`name`(模型输出 token) `grant`(加分) `reason`(入账理由码) `footerLabel`(状态行括号里的标签，**空串=不显示**) `isDefault`(兜底类别，**恰好一个**) `criteria`(注入给大模型的判定标准)。
+- **一涵三类**（净变动）：**访谈中**（cost 0.1 + grant 0.1 = 0，两笔相抵、`(访谈中)`；**这是默认 / 兜底类别**，正常善意的访谈交流都归这里）、**画重点**（cost 0.1 + grant 0.4 = +0.3、`(画重点, +0.3)`，奖励**特别有价值/标志性的人物志素材**——动人故事、关键转折、深刻洞察、独特价值观；**已去掉"提到 SeeDAO 就 +0.3"的旧标准**，避免 prompt 每轮把 SeeDAO 标成高价值话题、诱导 agent 一直往 SeeDAO 引）、**无关/恶意**（只扣 cost = -0.1、无标签，仅明显跑题/恶意才给）。**tudigong**：`judgeEnabled:false`、单一 default、净 -0.1，与改动前完全一致。
+- **判定标准（操作者拍板，2026-06-25 调优）**：**默认类别 = 访谈中（净 0、不扣）**——『正常善意的访谈交流』全归这里（打招呼、回顾上次、回答、追问、铺垫闲聊都算），`无关（-0.1）` 只在**明显跑题 / 灌水 / 恶意**时由模型显式标出；**fallback（没输出标记 / token 不认得 / 拿不准）也归访谈中、不扣**（早期曾设 fallback→无关，实测把善意开场也扣了 -0.1，故改成默认不扣，把 `isDefault` 从无关挪到访谈中）。分类**只看【当前对话者】这一轮发言**（群里多人不张冠李戴）；恶意对话就 -0.1、不额外处置；画重点走**两笔账本**——成本线浮动 + 奖励线固定，便于日后大模型价格变动只改 `cost`、奖励不动（净值由 footer「前→后」自动算）。
+- **入账理由码**：访谈中 `judge_interview`、画重点 `judge_highlight`、无关沿用 `llm_reply`（成本那笔）。
+- **代码落点**：
+  - `src/core/lp-strategy.ts`（新）：`loadLpStrategy(soul)`（按 soul 读 + `Map` 缓存；**缺文件回退最简策略**=只扣 cost、不评分，等同改动前）、`judgeReply(reply, strategy)`（容错正则取最后一行标记、剥除所有标记行、**未命中回退 default**）、`buildJudgeInstruction(strategy)`、`defaultCategory(strategy)`。
+  - `store/gamification.ts` 的 `buildStatusFooter(openId, delta, label?)` 加可选 `label`；三分支：delta=0 无标签→只显余额；delta=0 有标签→`120.0 (访谈中)`（无箭头）；delta≠0→`前 → 后 (…)`。`strip/splitStatusFooter` 正则**不用改**（`[^\n]*` 吃整行）；`commands.ts` 签到因 `label` 可选**不受影响**。
+  - 两个 channel（`feishu-bot.ts` / `feishu-user.ts`）：`cost` 改读 `strategy.cost`；回复后 `judgeReply`→（`grant>0`）`grantPt`→footer 传净 delta + `category.footerLabel || undefined`。`refund_on_error` 用 `cost`；bot 的 `refund_interrupted` 仍用常数 0.1（边缘路径）。
+  - `agent.ts prepare()`：**仅 serve 模式 + `judgeEnabled`** 才把 `buildJudgeInstruction` 接到 prompt 末尾（langRule 之后）；CLI 与 tudigong 得空串、prompt 不变。
+- **生效方式**：改 `agent.ts` / channel 要**重新编译 + 重启 serve worker**（`pnpm agent update` 需带 `--sup`，否则手动重启）。分类指令是**每条 prompt 即时注入**、不写进 `.kimi-code/AGENTS.md`，**不受 `--continue` 缓存影响**，重启后下条对话即套用、无需隔离会话。`LP_STRATEGY.json` 由 `loadLpStrategy` 行程级缓存，**改文件要重启 serve** 才重读。
+- **新建 agent**：`_template/LP_STRATEGY.json` 默认带停用版（行为 == 固定扣分）；要做「按交流评分 / 加分」的 agent，把它改成 `judgeEnabled:true` + 定义 categories（含 criteria）。`create-agent` skill 已能配置这块（见该 skill 的 references）。

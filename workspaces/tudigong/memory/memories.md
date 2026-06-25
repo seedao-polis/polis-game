@@ -16,7 +16,7 @@
 | 本地数据库选型、飞书消息字段真相 | `local-db-playbook.md` |
 | 事件系统、推播、迎新、定时 + 随机触发 | `event-system-playbook.md` |
 | 新建一个事件（填模板） | `event-creation-prompt-template.md` |
-| LP 点数经济、每日签到 / 补底 | `pt-gamification-playbook.md` |
+| LP 点数经济、评分机制（按交流判定）、每日签到 / 补底 | `pt-gamification-playbook.md` |
 | 徽章导入 / 发放 / 查询 | `badge-system-playbook.md` |
 | 社区推播里程碑事件（人数 / 报名 / 徽章公告） | `community-notify-events-playbook.md` |
 | 运营数据日报 / 月报（深色图表） | `ops-report-playbook.md` |
@@ -27,7 +27,7 @@
 
 - **默认 soul**：tudigong（城邦土地神）。
 - **数据库 schema**：已到 **v20**（启动自动迁移；各版本含义见对应 playbook）。
-- **LP 经济**：初始 120、每条对话回复扣 0.1、每日 05:00 补底到 10。**LP 现在是全局共享库 `.agent/shared.db`、跨 agent 共用（2026-06-25）**，详见 `pt-gamification-playbook.md §9`。
+- **LP 经济**：初始 120、每条对话回复扣 0.1、每日 05:00 补底到 10。**LP 现在是全局共享库 `.agent/shared.db`、跨 agent 共用（2026-06-25）**，详见 `pt-gamification-playbook.md §9`。**LP 变动可按交流内容动态判定（per-soul `LP_STRATEGY.json`：一涵分访谈中/画重点/无关，tudigong 停用、维持固定扣分），详见 `pt-gamification-playbook.md §10`。**
 - **serve 启动模式**：`pnpm agent serve <soul> --bot/--user/--both`（默认 --bot、不看 enabled、移除 --only）；新建 / 上线 agent 见 `agent-onboarding-playbook.md`。
 - **采集回圈**：成员同步 / 活动报名每 5 分钟、文档访问每 1 小时。
 - 工作区目录与各文件职责总览见 `../WORKSPACE_GUIDE.md`；工具速查见 `../TOOLS.md`；skill 用法见 `../SKILLS_GUIDE.md`。
@@ -68,7 +68,10 @@
 
 - 我的大脑现在是**智能体执行器**（框架调用的本地推理 CLI）。改 `runKimi`、调执行器、排查"回复失败"前，先读 `memory/agent-executor-playbook.md`（旧版参数 `--quiet` / `--agent-file` 等已废弃；人格/工具改用项目本地 `.kimi-code/AGENTS.md` + `mcp.json`）。
 - **会话中毒 / 自愈 / 串行回复 + 表情 / 错误日志**：先读 `memory/self-heal-playbook.md`。核心坑：一轮被打断会留下"孤儿工具调用"，`--continue` 之后**永久 400**（连"1+1"都答不出）；隔离损坏会话只能把文件夹**移出 `~/.kimi-code/sessions/`**（`--continue` 是扫目录认会话，就地改名会变 `Session not found`）。出问题先 `node dist/bin/agent.js doctor`。timeout 已调到 10 分钟；排队表情 `OnIt`、思考中 `Status_PrivateMessage`。
-- **Skill 系统（每个 soul 配 Agent Skills + 改 skill 自动生效）**：先读 `memory/agent-skill-playbook.md`。核心坑：执行器在**会话创建当下**就把 skill 集合 + 内容定死，`--continue` 续接**不重扫不重读**（和 AGENTS.md 缓存同理），改 / 加 / 删 skill 只对**新会话**生效；已兜底——每次 worker（重）启动（`agent serve` 重启 + `agent update`）跑 `reloadSkillsIfChanged(soul)`，按**内容指纹**判断 skill 有没有变、变了就隔离该 soul 全部会话让下次对话重建（**首跑只记基准不动会话**、`git pull` 只改 mtime 不误触发）。skill 是文件夹式 `SKILL.md` + scripts/references/assets；两层放法 `workspaces/_shared/skills/`（共用）+ `workspaces/<soul>/skills/`（专属），启动用**重复 `--skills-dir`** 注入（“取代”非“叠加”，两个目录都要列）。
+- **Skill + 人格档 自动重置会话（每 soul 配 Agent Skills；改 skill 或大写人格档自动生效，2026-06-25 扩展）**：先读 `memory/agent-skill-playbook.md`。核心坑：执行器在**会话创建当下**就把 skill 集合 + 组装好的 AGENTS.md（人格）定死，`--continue` 续接**不重扫不重读**，改 skill / 人格档只对**新会话**生效；已兜底——每次 worker（重）启动（`agent serve` 重启 + `agent update`）跑 `reloadSoulIfChanged(soul)`（原 `reloadSkillsIfChanged`、已改名），按**内容指纹**判断【共用 skill + 专属 skill + 大写人格档(IDENTITY/SOUL/AGENTS/TOOLS/USER/BOOT/HEARTBEAT)】有没有变、变了就隔离该 soul 全部会话让下次对话重建（**首跑只记基准不动会话**、state 存 `.agent/soul-state/`、`git pull` 只改 mtime 不误触发）。**`memory/` 故意排除**（playbook 按需现读、journal 每天变，不该触发重置）。**光重启、内容没变不会重置健康会话**；手动重置某 soul 全部会话用 `listSoulSessionDirs+quarantineSession`（见 playbook §5）。skill 两层放法 `workspaces/_shared/skills/`（共用）+ `workspaces/<soul>/skills/`（专属），启动用**重复 `--skills-dir`** 注入（"取代"非"叠加"，两个目录都要列）。
+- **每轮 prompt 注入信号 + agent 读自己 workspace（2026-06-25）**：`prepare()`（`src/core/agent.ts`）每轮注入中性信号——`【对话场景】`serve/CLI、`【对话轮次】第 N 轮`（仅 serve、让 agent 掐节奏如访谈每几轮播报进度）、`【你的工作区目录】<绝对路径>`（让 agent 用文件工具读自己 workspace 的 `examples/`/`memory/` 等——agent 运行时 cwd 是 `.agent/<soul>/chats/<session>` 不是 workspace，相对路径解析不到才注入绝对路径）、`【当前对话者】`。详见 `serve-cli-identity-playbook.md §二`。
+- **bot 回复不加 `replyPrefix` 前缀（2026-06-25）**：bot 在飞书本就显示自己名字、前缀多余；`replyPrefix`（`configs/agents.json` 字段）**只在 user 频道生效**（user 模式消息挂操作者账号下、需前缀区分）。改的是 `feishu-bot.ts` 发送链路。**注意土地公 bot 也因此不再加 `🏯 城邦土地神：`**（要保留得单独开例外）。
+- **抓微信公众号文章（2026-06-25）**：WebFetch 服务会被微信"环境异常"墙挡；本机 `curl -A '<MicroMessenger UA>' <url>` 直取可成功（正文在 `id="js_content"` div、标题在 `og:title` meta）。一涵的历史人物志范文就是这么抓进 `workspaces/profile-writer-yihan/examples/` 的。
 - **创作共用 skill（写 SKILL.md 的房规 + 中立化 + 验收）**：先读 `memory/skill-authoring-playbook.md`（与 agent-skill-playbook 分工：那份讲装载/生效，这份讲怎么写得规范中立可验收）。一句话要点：结构对齐 `create-badge`（文件夹式、纯 XML 骨架、路由型 essential_principles+intake+routing / 指南型 objective+quick_start+success_criteria、references>100 行配 TOC）；**中立化**=去厂商与大模型名 + 去外部产品代号 + 自包含（知识写进 skill 自己的 references、别叫读者翻 memory）+ 去项目史叙述 + 简体大陆用语，真实代码标识（如 `LLM_PT_COST`/`llm_reply`）可保留但旁注【与模型无关】；脚本放 `scripts/`、相对正斜杠路径、跑完清 `__pycache__`、浮点预算别用 `//`（用 `/+1e-9`）；`{{pt}}` 不是 `{{ap}}`、LP 标签别叫【积分】。现有共用 skill：`create-agent-skills`（元技能）、`create-badge`、**`create-event`**（事件设计→注册→配图→验收，对照 event-system 但自包含）、**`lp-usage-design`**（LP 经济设计指南，含 `scripts/lp_runway.py` 续航模拟器，对照 ap-gamification）、**`create-agent`**（从 `_template` 建新 workspace）、**`onboard-lark-bot`**（把 agent 接上飞书当 bot）。
 - **新建并上线一个 agent（2026-06-25）**：从 `_template` + `create-agent` skill 建 workspace、`onboard-lark-bot` skill 上飞书、`serve <soul> --bot` 起，先读 `memory/agent-onboarding-playbook.md`。一句话要点：soul 名不能 `_` 开头（启动守卫 `isToolingWorkspace`）；飞书 `configs/lark.json` profile 的 **key=soul 名**否则回退 default（用错 bot 身份）；后台权限/事件要**发布**否则 `activate_status=2`；serve 选身份靠 `--bot/--user/--both`、**不看 enabled**、移除了 `--only`；p2p 直接回 / 群留话题（按 `chat_type` 自动）；互动事件（`welcome-party`）按 `events.ts` 的 `souls` 白名单隔离，**新 agent 不触发土地公的**；**LP 全局共享 `.agent/shared.db` + 跨 app 同一人 `pnpm agent link` 归并身份**（union_id 取不到才用别名表 `identity_links`，见 `pt-gamification-playbook.md §9`）。
 - 本地数据库方案（选 `node:sqlite`）+ 飞书消息字段真相（话题用 `thread_id` 不是 root_id/parent_id；发送者 open_id 在 `sender.id`，且现有取值有 BUG）先读 `memory/local-db-playbook.md`；完整研究在 `thoughts/shared/research/2026-06-15-local-db-game-backend-selection.md`。
@@ -79,7 +82,7 @@
   - **定时+随机+时段**：5 种周期（每 N 分钟 / 每 X 天 / 每周礼拜 K / 每月几号 / 每年某月日，+时段+概率），逻辑日 05:00 锚点；调度器在 supervisor，改它要完整重启 serve。
   - **成员名册** `chat_members`（5 分钟同步所有监听群、含从没发言的人、改名会更新、离开保留），和 profiles 分开存。
   - 老坑：发图 `--file` 要 cwd 相对路径；图按真实像素算百分比（事件图默认缩到 128px 高）；迎新闸门用 `hasSuccessfulDispatch`；`messages.create_time` 是毫秒。
-- 玩家档案 / LP 点数经济（**LP = Life Point / 生命点**，旧称 AP，2026-06-22 更名为 LP / 🌱、初始 100→120、每条回复扣 0.1、footer 显示一位小数；标签只写【LP】不写【LP 积分】，积分另有它用）/ 每日签到 / 徽章 先读 `memory/pt-gamification-playbook.md`（LP 规则、状态列 footer `🌱 LP : 前→后 (delta)` 都 toFixed(1)（delta=0 只显示余额、不带括号）、签到、`ensureProfile` 安全网；两个曾经致命的 BUG：bot 事件发送者 open_id 在 `ev.sender_id`、agent 要把当前对话者 open_id 注入 prompt）。研究 / 施工：`thoughts/shared/research/2026-06-16-...md`、`thoughts/shared/coding/2026-06-16-...md`。
+- 玩家档案 / LP 点数经济（**LP = Life Point / 生命点**，旧称 AP，2026-06-22 更名为 LP / 🌱、初始 100→120、每条回复扣 0.1、footer 显示一位小数；标签只写【LP】不写【LP 积分】，积分另有它用）/ 每日签到 / 徽章 先读 `memory/pt-gamification-playbook.md`（LP 规则、状态列 footer `🌱 LP : 前→后 (delta)` 都 toFixed(1)（delta=0 只显示余额、不带括号）、签到、`ensureProfile` 安全网；两个曾经致命的 BUG：bot 事件发送者 open_id 在 `ev.sender_id`、agent 要把当前对话者 open_id 注入 prompt）。研究 / 施工：`thoughts/shared/research/2026-06-16-...md`、`thoughts/shared/coding/2026-06-16-...md`。**LP 评分机制（每条先扣 `cost`、大模型回复尾行输出 `LP_JUDGE:<类别>`、框架按 per-soul `LP_STRATEGY.json` 判定加分 / 标签，2026-06-25）见 `pt-gamification-playbook.md §10`；代码在 `src/core/lp-strategy.ts`。**
 - **运营数据时序表 `member_sync_rounds`（2026-06-18，详见 local-db-playbook §7）**：每 5 分钟一轮存在群人数 / 增加 / 离开 / 改名（含 ou_id+名字明细）+ 去重人数（当前 / 内部 / 外部）+ 名册累计。**四种"人数"别混**：在群合计（相加含重复）≠ 当前去重 ≠ 内/外去重 ≠ 名册累计（曾经去重含已离开）。历史可 `pnpm agent backfill-members` 从日志补（去重数走假设模型）。
 - **`pnpm agent serve --quiet` 静默 / 观察模式（2026-06-18）**：经 `AGENT_QUIET` 环境变量透传给 worker。照常采集对话、同步成员、记录数据、跑定时事件，但**不回复任何飞书 p2p / 群 / @**（LLM 与命令回复都不发、不调用 LLM、不扣 AP、不加表情、不重发被打断回复）；CLI 是独立进程不受影响。是**启动参数**，热重载不改它 → 要**重启 serve** 才生效。
 - **群停服状态（2026-06-18，详见 local-db-playbook §8）**：`chats.dissolved_at` + `inactive_reason`（dissolved / inaccessible）；`store.markChatInactive/clearChatInactive/isChatInactive/listInactiveChats`；`agent doctor` 末尾列出已停服群。

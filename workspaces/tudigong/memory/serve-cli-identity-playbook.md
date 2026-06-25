@@ -13,6 +13,10 @@
 - `src/core/agent.ts` 的 `prepare()` 在**每条 prompt**（不是 system prompt）最前面注入一行【对话场景】：
   - `input.source === 'feishu-bot' || 'feishu-user'` → `【对话场景】serve 模式（飞书）：…对方是外部对话者，不是 CLI 操作者本人。`
   - 其余（CLI REPL `channels/cli.ts`、一次性 `agent ask` 都**不带 source**）→ `【对话场景】CLI 模式：当前对话者就是操作者本人。`
+- **`prepare()` 每轮还会注入其它中性信号（2026-06-25 起；由各 soul 人格自行解读，不解读的无副作用）**：
+  - `【对话轮次】这是第 N 轮`（仅 serve）：来自 channel 的 per-session 计数器，让 agent 自己掐节奏（如访谈每 3–4 轮主动播报进度）；内存计数、重启归零。
+  - `【你的工作区目录】<绝对路径>`：让 agent 用文件工具读自己 workspace 下的 `examples/`、`memory/` 等源文件——**因为 agent 运行时 cwd 是 per-session 的 `.agent/<soul>/chats/<session>`、不是 workspace，相对路径（如 `examples/`）单独写解析不到，故注入绝对路径**。
+  - `【当前对话者】姓名 / open_id`：让 agent 用对的 open_id 查 profile / LP / 徽章。
 - 判定**只看 `source`，不看 open_id 是否等于操作者**。所以哪怕飞书来的是操作者本人，也归 serve、也当外部对话者——这正是"一视同仁"想要的。
 - 信号是中立的：只说 serve/CLI + 对面是不是操作者，**不规定**该把对面当什么角色。"当成什么角色"由各 agent 的人格档自己解读，所以对不解读这条的旧 soul 完全无副作用。
 - 代码改动落在 `dist/core/agent.js`（`pnpm build` 后）。**改 `agent.ts` 要重新构建并重启 serve worker 才生效**（运行中的 worker 跑的是旧编译代码）。

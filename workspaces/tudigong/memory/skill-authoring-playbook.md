@@ -80,6 +80,6 @@ rm -rf scripts/__pycache__          # 清掉编译产物
 ## 6. 怎么验证一个新 skill 能用
 
 1. **脚本立即可跑**（不必重启）：`python3 workspaces/_shared/skills/<skill>/scripts/<x>.py …`，核对输出数值。
-2. **装载生效**：`pnpm agent update`（触发 `reloadSkillsIfChanged` 隔离旧会话）→ **开新会话**提一个对应需求，看 agent 是否加载该 skill。`--continue` 旧会话不重读（见 `agent-skill-playbook.md §4`）。
+2. **装载生效**：`pnpm agent update`（触发 `reloadSoulIfChanged` 隔离旧会话）→ **开新会话**提一个对应需求，看 agent 是否加载该 skill。`--continue` 旧会话不重读（见 `agent-skill-playbook.md §4`）。
 3. **单独探针**：`kimi --skills-dir <该目录> --output-format stream-json -p "/skill:<名字>"`。
 4. （可选）`/audit-skill` 或 skill-auditor 子代理静态审 SKILL.md。
