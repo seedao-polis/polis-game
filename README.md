@@ -102,6 +102,15 @@ agent tg-test [消息...]                       发一条测试消息到 Telegra
 
 详见 `workspaces/tudigong/memory/agent-onboarding-playbook.md`。
 
+## serve 与 CLI 是两种对话场景
+
+每个 agent 都区分两种对话场景，框架在每条 prompt 开头注入一行【对话场景】告诉它现在是哪种：
+
+- **serve 模式**（飞书 p2p 私聊 / 群里被 @）：对面是**外部对话者**——按 agent 本职去服务 / 对待（土地神→城邦居民、一涵→受访者）。**即使对面正好是操作者本人，也一视同仁、不当操作者**，不切到运营 / 配置这类内部对话。
+- **CLI 模式**（`agent cli` / `agent ask`）：对面才是**操作者本人**，这时才谈配置、运营、方向设定。
+
+判定只看消息来源 channel（`feishu-*` → serve，其余 → CLI），不看对方身份。样板与 `create-agent` skill 已内置这套约定，新 agent 只需填一个"serve 对话者角色"（`{{SERVE_PARTY_ROLE}}`）。机制与各 agent 特化详见 `workspaces/tudigong/memory/serve-cli-identity-playbook.md`。
+
 ## LP 是跨 agent 的共享经济
 
 积分（LP）、徽章、用户 profile 存在**共享库** `.agent/shared.db`，所有 agent 共用一套经济；对话记忆仍按 agent 隔离在各自 `.agent/<soul>.db`。
