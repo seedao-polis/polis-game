@@ -16,6 +16,7 @@ import { dispatchCommand } from '../core/commands.js';
 import * as store from '../core/store.js';
 import { append as appendTranscript } from '../core/transcript.js';
 import { checkAndFireTriggers } from '../core/events.js';
+import { loadLpStrategy, judgeReply } from '../core/lp-strategy.js';
 
 // After a restart, only respond to messages sent after the startup time; allow some slack for clock skew to avoid replying to historical messages on restart.
 const STARTUP_GRACE_MS = 5000;
@@ -154,9 +155,11 @@ export class FeishuBotChannel implements Channel {
         // p2p (1:1 DM): reply as a plain direct message — no thread, no quote.
         // group: reply within the original message's thread to stay in the topic; fall back to a plain
         // send when there is no message_id.
-        if (isP2p) sendText({ chatId }, cfg.replyPrefix + reply, { as: 'bot', profile });
-        else if (messageId) replyText(messageId, cfg.replyPrefix + reply, { as: 'bot', profile, inThread: true });
-        else sendText({ chatId }, cfg.replyPrefix + reply, { as: 'bot', profile });
+        // Bot identity already shows the agent's display name in Feishu, so a reply needs no name prefix
+        // (replyPrefix is for the user channel, where messages appear under the operator's own account).
+        if (isP2p) sendText({ chatId }, reply, { as: 'bot', profile });
+        else if (messageId) replyText(messageId, reply, { as: 'bot', profile, inThread: true });
+        else sendText({ chatId }, reply, { as: 'bot', profile });
         const { body, footer } = store.splitStatusFooter(reply);
         log.info(`已回复：${preview(body)}`);
         if (footer) log.info(`尾部状态：${footer}`);
@@ -185,13 +188,18 @@ export class FeishuBotChannel implements Channel {
       let reply = '';
       if (job.senderOpenId) {
         // LP gating: deduct before calling the LLM; refund on error; show balance in footer on success.
-        const spent = store.spendPt(job.senderOpenId, LLM_PT_COST, 'llm_reply', job.messageId ?? undefined);
+        const strategy = loadLpStrategy(cfg.soul);
+        const cost = strategy.cost;
+        const spent = store.spendPt(job.senderOpenId, cost, 'llm_reply', job.messageId ?? undefined);
         if (!spent) {
           reply = '你的 LP 不足，明天 05:00 会自动补到 10，或完成任务赚取。';
         } else {
           // Record the charge so a restart mid-reply can refund it before re-running.
           if (job.pendingId) store.updatePendingReply(job.pendingId, { ptSpent: true });
           try {
+            // Turn number for this reply (1-based, per session); injected into the prompt so the
+            // persona can pace turn-based behaviors (e.g. periodic interview-progress updates).
+            const turnNumber = (replyCounts.get(job.sessionKey) ?? 0) + 1;
             reply = await agent.respondAsync({
               message: job.text,
               context: job.context,
@@ -199,21 +207,27 @@ export class FeishuBotChannel implements Channel {
               userOpenId: job.senderOpenId,
               chatId: job.chatId,
               source: channelName,
+              turnNumber,
             });
-            reply = store.stripStatusFooter(reply) + store.buildStatusFooter(job.senderOpenId, -LLM_PT_COST);
+            // Classify the reply, grant bonus LP if applicable, then build the footer with the net delta.
+            const { category, reply: judged } = judgeReply(reply, strategy);
+            if (category.grant > 0) {
+              store.grantPt(job.senderOpenId, category.grant, category.reason, job.messageId ?? undefined);
+            }
+            const netDelta = category.grant - cost;
+            reply = store.stripStatusFooter(judged) + store.buildStatusFooter(job.senderOpenId, netDelta, category.footerLabel || undefined);
 
             // Fire-and-forget rolling user memory summary every SUMMARY_INTERVAL successful replies.
             // Never awaited — must not block the serial pump or delay the Feishu reply.
-            const count = (replyCounts.get(job.sessionKey) ?? 0) + 1;
-            replyCounts.set(job.sessionKey, count);
-            if (count % SUMMARY_INTERVAL === 0) {
+            replyCounts.set(job.sessionKey, turnNumber);
+            if (turnNumber % SUMMARY_INTERVAL === 0) {
               void agent.summarizeUserMemory(job.chatId, job.senderOpenId);
             }
           } catch (e) {
             // Detail (classification, postmortem, ledger) is already logged inside respondAsync(); here
             // we only refund LP and hand the user a short, internal-detail-free notice.
             log.error('agent 回复失败（已回退通用回复）：', (e as Error).message);
-            store.grantPt(job.senderOpenId, LLM_PT_COST, 'refund_on_error', job.messageId ?? undefined);
+            store.grantPt(job.senderOpenId, cost, 'refund_on_error', job.messageId ?? undefined);
             reply = '（抱歉，我这边出错了，请稍后再试。）';
           }
         }
@@ -431,7 +445,7 @@ export class FeishuBotChannel implements Channel {
           store.removePendingReply(p.id);
           if (p.messageId) {
             try {
-              replyText(p.messageId, cfg.replyPrefix + '（抱歉，刚刚的处理被打断了，请重新问我一次。）', { as: 'bot', profile, inThread: true });
+              replyText(p.messageId, '（抱歉，刚刚的处理被打断了，请重新问我一次。）', { as: 'bot', profile, inThread: true });
             } catch { /* best-effort */ }
           }
           continue;

@@ -10,9 +10,10 @@ import { getProfile, recordError } from './store.js';
 import { getFilteredMemories, upsertMemory, getRecentUserMessagesInChat } from './store/memory.js';
 import { allowedNamespaces, resolveWriteScope } from './memory-policy.js';
 import { log, newCorrId, writePostmortem } from './log.js';
-import { MCP_SERVER_JS, RUNTIME_DIR, resolveLarkRun } from './paths.js';
+import { MCP_SERVER_JS, RUNTIME_DIR, SOULS_DIR, resolveLarkRun } from './paths.js';
 import { isAdmin } from './configs.js';
 import type { KimiProfile } from './configs.js';
+import { loadLpStrategy, buildJudgeInstruction } from './lp-strategy.js';
 
 /** Block the current thread for ms milliseconds (respond() is synchronous end-to-end). */
 function sleepSync(ms: number): void {
@@ -49,6 +50,9 @@ export interface RespondInput {
   chatId?: string;
   /** Originating channel name (feishu-bot / feishu-user / cli), for the error ledger */
   source?: string;
+  /** 1-based ordinal of this reply within the session; injected into the prompt (serve only) so the
+   *  persona can self-pace turn-based behaviors (e.g. an interviewer reporting progress every few rounds). */
+  turnNumber?: number;
 }
 
 export interface AgentOptions {
@@ -196,7 +200,26 @@ export class Agent {
       }
     }
 
-    const prompt = `${scene}${identity}${memBlock}${body}\n\n${langRule}`;
+    // Classification instruction: injected only in serve mode for souls with judgeEnabled.
+    // CLI turns (non-serve) never receive this instruction, and tudigong (judgeEnabled:false) returns ''.
+    const judge = isServe ? buildJudgeInstruction(loadLpStrategy(this.name)) : '';
+
+    // Turn counter (serve only): a neutral signal the persona can use to pace turn-based behaviors
+    // (e.g. an interviewer reporting progress every few rounds). Personas that ignore it are unaffected.
+    const turnLine = isServe && input.turnNumber != null
+      ? `【对话轮次】这是你与当前对话者的第 ${input.turnNumber} 轮对话。\n\n`
+      : '';
+
+    // Workspace files: tell the agent the absolute path to its own workspace so it can read its source
+    // files (examples/, memory/*.md, ...) with the file tools. The agent's cwd is the per-session chats
+    // workDir, NOT the workspace, so relative references like "examples/" would not resolve on their own.
+    const workspaceDir = path.join(SOULS_DIR, this.name);
+    const filesLine =
+      `【你的工作区目录】${workspaceDir}/\n` +
+      `需要查阅本工作区的源文件时（例如 examples/ 历史范文、memory/ 各 *-playbook.md），` +
+      `用文件读取工具按上面的绝对路径打开（如 ${workspaceDir}/examples/）。\n\n`;
+
+    const prompt = `${scene}${turnLine}${filesLine}${identity}${memBlock}${body}\n\n${langRule}${judge ? '\n\n' + judge : ''}`;
     return {
       prompt,
       workDir,

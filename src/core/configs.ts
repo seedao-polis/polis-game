@@ -48,6 +48,9 @@ export interface RawAgentConfig {
   capture?: boolean;
   trigger?: TriggerMode;
   triggerPrefix?: string;
+  /** Prefix prepended to replies in the USER channel only (messages appear under the operator's own
+   *  account there, so a name prefix disambiguates the agent). The BOT channel adds no prefix — the bot
+   *  already has its own display name in Feishu. */
   replyPrefix?: string;
   pollIntervalMs?: number;
   contextSize?: number;
