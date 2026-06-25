@@ -362,20 +362,35 @@ export function rewardTask(openId: string, taskId: string, amount: number): numb
 
 /**
  * Build a short LP status footer for appending to agent replies.
- * Shows the balance transition for the action just performed as "before → after (delta)",
- * where delta is the signed LP change (negative for a cost, positive for a gain). Returns a
- * pre-formatted two-line string (leading blank line included) ready for direct concatenation;
- * a missing profile is initialized first so the balance is always real.
+ * Accepts an optional classification label (e.g. "访谈中", "画重点") to display alongside the
+ * balance. Three output forms depending on delta and label:
+ *   delta=0, no label  → "🌱 LP : 120.0"            (check-in no-op, no arrow, no parens)
+ *   delta=0, label     → "🌱 LP : 120.0 (访谈中)"    (net-zero interview, no arrow)
+ *   delta≠0            → "🌱 LP : 120.0 → 119.9 (-0.1)" or "… (画重点, +0.3)"
+ * Returns a pre-formatted two-line string (leading blank line included) ready for direct
+ * concatenation; a missing profile is initialized first so the balance is always real.
  */
-export function buildStatusFooter(openId: string, delta: number): string {
+export function buildStatusFooter(openId: string, delta: number, label?: string): string {
   const profile = getProfile(openId) ?? ensureProfile(openId);
   const after = profile.ptBalance;
-  const tag = profile.name ? `[${profile.name}] ` : ''; // 有 name 才加前缀，避免出现空的 []
-  const fmt = (n: number) => n.toFixed(1); // LP is fractional (per-reply cost 0.1); show one decimal place
-  if (delta === 0) return `\n\n${tag}🌱 LP : ${fmt(after)}`;
+  const tag = profile.name ? `[${profile.name}] ` : ''; // prefix only when name is set
+  const fmt = (n: number) => n.toFixed(1); // LP is fractional; always show one decimal place
+
+  const parts: string[] = [];
+  if (label) parts.push(label);
+  if (delta !== 0) parts.push(`${delta >= 0 ? '+' : ''}${fmt(delta)}`);
+
+  if (parts.length === 0) {
+    // delta=0 and no label: balance only (e.g. repeated check-in)
+    return `\n\n${tag}🌱 LP : ${fmt(after)}`;
+  }
+  if (delta === 0) {
+    // delta=0 but label present (e.g. 访谈中): no arrow, just balance + label
+    return `\n\n${tag}🌱 LP : ${fmt(after)} (${parts.join(', ')})`;
+  }
+  // delta≠0: show before → after with label and/or numeric delta in parens
   const before = after - delta;
-  const sign = delta >= 0 ? '+' : '';
-  return `\n\n${tag}🌱 LP : ${fmt(before)} → ${fmt(after)} (${sign}${fmt(delta)})`;
+  return `\n\n${tag}🌱 LP : ${fmt(before)} → ${fmt(after)} (${parts.join(', ')})`;
 }
 
 /**

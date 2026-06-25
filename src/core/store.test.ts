@@ -155,3 +155,54 @@ test('splitStatusFooter separates the model answer from the appended footer', ()
   assert.equal(noFooter.footer, '');
   assert.equal(noFooter.body, '你的 LP 不足，明天 05:00 会自动补到 10。');
 });
+
+// ── buildStatusFooter (new optional label parameter) ─────────────────────────
+
+test('buildStatusFooter: delta=0, no label → balance only, no arrow, no parens', () => {
+  const u = uid();
+  store.grantPt(u, 120, 'seed');
+  const footer = store.buildStatusFooter(u, 0);
+  assert.ok(footer.includes('🌱 LP : 120.0'), 'should show balance');
+  assert.ok(!footer.includes('→'), 'no arrow when delta=0');
+  assert.ok(!footer.includes('('), 'no parens when delta=0 and no label');
+});
+
+test('buildStatusFooter: delta=0, label="访谈中" → balance + (访谈中), no arrow', () => {
+  const u = uid();
+  store.grantPt(u, 120, 'seed');
+  const footer = store.buildStatusFooter(u, 0, '访谈中');
+  assert.ok(footer.includes('🌱 LP : 120.0'), 'should show balance');
+  assert.ok(footer.includes('(访谈中)'), 'should show label in parens');
+  assert.ok(!footer.includes('→'), 'no arrow when delta=0');
+});
+
+test('buildStatusFooter: delta=+0.3, label="画重点" → before→after (画重点, +0.3)', () => {
+  const u = uid();
+  store.grantPt(u, 120, 'seed');
+  // Simulate: spend 0.1 then grant 0.4 → balance is now 120.3; net delta passed = +0.3
+  store.spendPt(u, 0.1, 'llm_reply');
+  store.grantPt(u, 0.4, 'judge_seedao');
+  // balance is now 120.3; before = 120.3 - 0.3 = 120.0
+  const footer = store.buildStatusFooter(u, 0.3, '画重点');
+  assert.ok(footer.includes('→'), 'arrow present when delta≠0');
+  assert.ok(footer.includes('120.0 →'), 'before shown as 120.0');
+  assert.ok(footer.includes('→ 120.3'), 'after shown as 120.3');
+  assert.ok(footer.includes('画重点'), 'label present');
+  assert.ok(footer.includes('+0.3'), 'positive delta shown');
+  assert.ok(footer.includes('(画重点, +0.3)'), 'label and delta in correct order');
+});
+
+test('buildStatusFooter: delta=-0.1, no label → before→after (-0.1), no label', () => {
+  const u = uid();
+  store.grantPt(u, 120, 'seed');
+  store.spendPt(u, 0.1, 'llm_reply');
+  // balance is now 119.9; before = 119.9 - (-0.1) = 120.0
+  const footer = store.buildStatusFooter(u, -0.1);
+  assert.ok(footer.includes('→'), 'arrow present when delta≠0');
+  assert.ok(footer.includes('120.0 →'), 'before shown');
+  assert.ok(footer.includes('→ 119.9'), 'after shown');
+  assert.ok(footer.includes('(-0.1)'), 'negative delta in parens');
+  // No extra label content (label was not passed)
+  assert.ok(!footer.includes('访谈中'), 'no label text');
+  assert.ok(!footer.includes('画重点'), 'no label text');
+});

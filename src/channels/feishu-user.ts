@@ -32,6 +32,7 @@ import { flushTelegramSync } from '../core/telegram.js';
 import { checkUserTokenExpiry } from '../core/token-watch.js';
 import { dispatchCommand } from '../core/commands.js';
 import * as store from '../core/store.js';
+import { loadLpStrategy, judgeReply } from '../core/lp-strategy.js';
 
 // After a restart, only respond to messages sent after the startup time; allow some slack for clock skew. Capture (transcript) is not subject to this limit.
 const STARTUP_GRACE_MS = 5000;
@@ -611,8 +612,8 @@ export class FeishuUserChannel implements Channel {
         chatId,
         senderOpenId: msg.senderOpenId,
       });
-      // LP cost per LLM reply in this channel.
-      const LLM_PT_COST = 0.1;
+      // LP strategy for this soul (cost and optional classification).
+      const strategy = loadLpStrategy(cfg.soul);
       const senderOpenId = msg.senderOpenId;
 
       if (dr.handled) {
@@ -629,7 +630,8 @@ export class FeishuUserChannel implements Channel {
       } else {
         // LP gating: deduct before calling the LLM; refund on error; show balance in footer on success.
         if (senderOpenId) {
-          const spent = store.spendPt(senderOpenId, LLM_PT_COST, 'llm_reply', msg.messageId || undefined);
+          const cost = strategy.cost;
+          const spent = store.spendPt(senderOpenId, cost, 'llm_reply', msg.messageId || undefined);
           if (!spent) {
             reply = '你的 LP 不足，明天 05:00 会自动补到 10，或完成任务赚取。';
           } else {
@@ -642,10 +644,16 @@ export class FeishuUserChannel implements Channel {
                 chatId,
                 source: this.name,
               });
-              reply = store.stripStatusFooter(reply) + store.buildStatusFooter(senderOpenId, -LLM_PT_COST);
+              // Classify the reply, grant bonus LP if applicable, then build the footer with the net delta.
+              const { category, reply: judged } = judgeReply(reply, strategy);
+              if (category.grant > 0) {
+                store.grantPt(senderOpenId, category.grant, category.reason, msg.messageId || undefined);
+              }
+              const netDelta = category.grant - cost;
+              reply = store.stripStatusFooter(judged) + store.buildStatusFooter(senderOpenId, netDelta, category.footerLabel || undefined);
             } catch (e) {
               log.error('agent 回复失败（已回退通用回复）：', (e as Error).message);
-              store.grantPt(senderOpenId, LLM_PT_COST, 'refund_on_error', msg.messageId || undefined);
+              store.grantPt(senderOpenId, cost, 'refund_on_error', msg.messageId || undefined);
               reply = '（抱歉，我这边出错了，请稍后再试。）';
             }
           }

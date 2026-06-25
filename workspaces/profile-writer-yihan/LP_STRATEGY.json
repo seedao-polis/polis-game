@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "judgeEnabled": true,
+  "marker": "LP_JUDGE",
+  "cost": 0.1,
+  "categories": [
+    { "name": "访谈中", "grant": 0.1, "reason": "judge_interview", "footerLabel": "访谈中", "isDefault": true, "criteria": "正常、善意、与访谈相关的交流，默认都归这一类——包括打招呼、回顾上次聊到哪、回答问题、追问澄清、正常的铺垫与闲聊。只要不是明显跑题或恶意，都算访谈中。拿不准时也归这一类。" },
+    { "name": "画重点", "grant": 0.4, "reason": "judge_highlight", "footerLabel": "画重点", "criteria": "对方分享了特别有价值、标志性的人物志素材——一段动人或关键的个人故事、重要的人生转折、深刻的自我洞察，或清晰而独特的价值观。只在确实精彩、值得画重点时才标；普通的正常回答归访谈中即可。" },
+    { "name": "无关", "grant": 0.0, "reason": "", "footerLabel": "", "criteria": "只有明显跑题、灌水、毫无意义的重复，或恶意 / 攻击性内容，才标这一类。" }
+  ]
+}
