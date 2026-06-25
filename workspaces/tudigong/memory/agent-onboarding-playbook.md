@@ -35,6 +35,7 @@
 - **回复方式**：私聊（p2p）**直接回**一条普通消息；群里**留在原消息话题**里。`feishu-bot.ts` 的 `send()` 按 `ev.chat_type` 自动区分（崩溃恢复路径默认走群行为）。
 - **互动事件按 soul 隔离**：欢迎类等互动事件（`welcome-party`）只对 `src/core/events.ts` 里 `TriggerRule.souls` 白名单的 soul 触发，目前只 `['tudigong']`。**新 agent 默认不会触发 tudigong 专属事件**；要给新 agent 自己的欢迎事件，得把它 soul 加进对应 trigger 的 `souls`（并自带事件定义/素材）。
 - **LP 跨 agent 共享 + 身份 link**：见 `pt-gamification-playbook.md §9`（LP 在共享库 `.agent/shared.db`、跨 app 同一人用 `pnpm agent link` 归并）。
+- **对话场景信号 serve vs CLI（2026-06-25）**：`agent.ts` 的 `prepare()` 在每条 prompt 开头注入一行【对话场景】——`input.source` 是 `feishu-bot`/`feishu-user` → **serve（对面是外部对话者，不是操作者）**；其余（CLI、`agent ask` 不带 source）→ **CLI（对面就是操作者）**。判定靠 source、不靠 open_id。样板已写死 serve/CLI 段落，新 agent 只填 `{{SERVE_PARTY_ROLE}}`。**完整机制 + 各 agent 特化 + 改动注意事项见 `serve-cli-identity-playbook.md`。**
 
 ## 关键命令 / 文件速查
 

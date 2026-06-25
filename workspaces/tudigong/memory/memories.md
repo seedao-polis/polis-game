@@ -12,6 +12,7 @@
 | Skill 装载机制、改 skill 自动生效 | `agent-skill-playbook.md` |
 | 写 / 审一个共用 skill（房规 + 中立化 + 验收） | `skill-authoring-playbook.md` |
 | 新建并上线一个 agent（样板 + 飞书接入 + serve 模式） | `agent-onboarding-playbook.md` |
+| serve vs CLI 对话场景、对面是居民还是操作者、一视同仁 | `serve-cli-identity-playbook.md` |
 | 本地数据库选型、飞书消息字段真相 | `local-db-playbook.md` |
 | 事件系统、推播、迎新、定时 + 随机触发 | `event-system-playbook.md` |
 | 新建一个事件（填模板） | `event-creation-prompt-template.md` |
@@ -39,6 +40,7 @@
 
 - **【硬性 · 最高优先级】回复一律用简体中文 + 中国大陆用语；强调 / 书名统一用【】。**
 - 主要操作者要求一律用简体中文 + 大陆用语回复；偏好精简、直接、可操作。
+- **【硬性】serve（飞书 p2p / 群 @）里对面一律是城邦居民，哪怕是操作者本人也一视同仁、不当操作者；只有 CLI 里对面才是操作者，才谈配置 / 运营 / 内部指令。**每轮 prompt 开头有【对话场景】标 serve/CLI。机制与各 agent 特化见 `serve-cli-identity-playbook.md`。
 
 ## lark-cli / 飞书操作经验（简体）
 
