@@ -60,6 +60,8 @@ IDENTITY.md → SOUL.md → AGENTS.md → TOOLS.md → USER.md → BOOT.md → H
 - `memory/memories.md`（重点记忆）
 - `memory/journal/YYYY-MM-DD.md`（当天工作日志，若存在）
 
+此外，框架在**每条 prompt**（不是 system prompt）开头还会注入一行【对话场景】，标明本轮是 **serve 模式（飞书 p2p / 群 @）** 还是 **CLI 模式**——由 `src/core/agent.ts` 的 `prepare()` 按 `input.source` 判断（`feishu-bot`/`feishu-user` → serve；其余 → CLI）。所有 agent 据此区分对面是【外部对话者】还是【操作者本人】，详见样板各文件的 serve/CLI 段落与 `workspaces/tudigong/memory/serve-cli-identity-playbook.md`。
+
 ## 4. SKILLS_GUIDE 与 WORKSPACE_GUIDE 的特殊地位
 
 这两个文件**不在**固定装载数组（`SOUL_FILES`）中，因此不会被自动注入 system prompt。

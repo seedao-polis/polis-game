@@ -34,6 +34,7 @@
 | `{{COMMITMENT_EXECUTION}}` | 执行承诺 | `给得出的答案能直接用……` | 核心承诺表中「执行」面向的内容 |
 | `{{COMMITMENT_HONESTY}}` | 诚实承诺 | `不确定就说【不确定】，绝不编造……` | 核心承诺表中「诚实」面向的内容 |
 | `{{COMMITMENT_STYLE}}` | 风格承诺 | `简短、接地气、有温度……` | 核心承诺表中「风格」面向的内容 |
+| `{{SERVE_PARTY_ROLE}}` | serve 模式下对面的角色称呼 | `城邦居民` / `受访者（访谈对象）` / `求助者` | **多文件复用**，见第 9 节；agent 在飞书里把对话者当成的那个角色 |
 
 ---
 
@@ -159,4 +160,6 @@
 | `{{LANGUAGE_RULE}}` | IDENTITY.md、SOUL.md、AGENTS.md、USER.md、BOOT.md | 语言硬性要求，如「简体中文 + 中国大陆用语」 |
 | `{{EMPHASIS_STYLE}}` | IDENTITY.md、AGENTS.md、USER.md | 中文强调风格，如「中文强调 / 书名 / 标签统一用【】」 |
 | `{{AGENT_ORG}}` | IDENTITY.md、USER.md | 服务的组织名 |
+| `{{SERVE_PARTY_ROLE}}` | IDENTITY.md、SOUL.md、AGENTS.md、USER.md、BOOT.md、memories.md | serve 模式下飞书对话者的角色称呼。serve/CLI 段落是样板写死的固定文字，**只有这个角色词需要替换**；填本 agent 对外部对话者的称呼（如「城邦居民」「受访者」「求助者」） |
+| `{{USER_TITLE}}` | USER.md、SOUL.md（serve/CLI 段） | 操作者称呼，serve/CLI 段里也会引用 |
 | `{{TOOL_PLAYBOOK_1}}` | AGENTS.md、TOOLS.md | 第一个 playbook 的文件名 |

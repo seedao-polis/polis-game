@@ -21,6 +21,15 @@ Runtime 的启动守卫会拒绝以 `_` 开头的 soul 名称——新 agent 名
 - **上飞书当 bot**：在 `configs/agents.json` 加一个 `<soul>-bot` 条目，然后转共用 skill **`onboard-lark-bot`** 完成完整接入（建飞书 app、配权限与事件、发布、写 `configs/lark.json` profile、`serve` 起来）。
 
 常驻服务用 `pnpm agent serve <soul> --bot`（`--bot` / `--user` / `--both` 选身份，**不再看 `enabled` 字段**）。
+
+### 4. 每个 agent 都要分 serve 与 CLI 两种对话场景
+
+框架在每条 prompt 开头注入一行【对话场景】，标明本轮是 **serve（飞书 p2p / 群 @）** 还是 **CLI**。这是所有 agent 的通用约定，样板已内置：
+
+- **serve 模式**：对面是**外部对话者**，按 agent 本职去服务 / 对待（由占位符 `{{SERVE_PARTY_ROLE}}` 指定这个角色，如「受访者」「城邦居民」「求助者」）。**即使对面正好是操作者本人，也一视同仁、不当操作者。**
+- **CLI 模式**：对面才是**操作者本人**，这时才接受运营、配置、方向设定等内部对话。
+
+样板的 SOUL / IDENTITY / USER / AGENTS / BOOT / memories.md 已写死这套 serve/CLI 段落，新 agent 只需把 `{{SERVE_PARTY_ROLE}}` 填成本 agent 对 serve 对话者的称呼。机制细节见 `workspaces/tudigong/memory/serve-cli-identity-playbook.md`。
 </essential_principles>
 
 <intake>
