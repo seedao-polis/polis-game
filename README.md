@@ -117,7 +117,8 @@ agent tg-test [消息...]                       发一条测试消息到 Telegra
 
 - 每个飞书 app 给同一个人**不同的 open_id**，同一人跨多个 bot 时 LP 会分叉。用 `pnpm agent link <新open_id> <canonical open_id>` 归并身份（只用一个 bot 的成员不用做）。
 - 首次启用共享库已用 `pnpm agent lp-migrate` 把现有 LP 种进去。
-- 详见 `workspaces/tudigong/memory/pt-gamification-playbook.md` 第 9 节。
+- **LP 变动可按交流内容动态判定**：每个 soul 可配 `workspaces/<soul>/LP_STRATEGY.json`——每条回复先扣 `cost`，agent 在回复尾行输出一行分类标记，框架按策略决定本回合加分与状态行标签（如一涵的访谈中 / 画重点 / 无关）；不配或停用即固定扣分（tudigong 如此）。
+- 详见 `workspaces/tudigong/memory/pt-gamification-playbook.md` 第 9（共享库）、10（评分机制）节。
 
 ## 多 bot 与 Lark profile
 
@@ -170,7 +171,7 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt   # matplotlib + netwo
 
 - **两层目录**：共用 `workspaces/_shared/skills/`，soul 专属 `workspaces/<soul>/skills/`；启动时按当前 soul 用重复 `--skills-dir` 注入（共用在前、专属在后；`--skills-dir` 是“取代”自动探索，所以两个目录都要列）。
 - **文件夹式 skill**：每个 skill 一个文件夹，主文件 `SKILL.md`（YAML frontmatter：`name` 小写连字符、`description` 写清何时用），可带 `scripts/` `references/` `assets/`，正文用相对路径引用。
-- **改 skill 自动生效**：执行器在会话创建时把 skill 定死、`--continue` 不重读，所以每次 `agent serve` 重启或 `agent update` 都会按**内容指纹**检测 skill 变化，有变就重置该 soul 的会话（相关群下次对话重建、载入新 skill；首次启动只记基准、不动会话）。
+- **改 skill 或大写人格档自动生效**：执行器在会话创建时把 skill + 组装好的人格（AGENTS.md）定死、`--continue` 不重读，所以每次 `agent serve` 重启或 `agent update` 都会按**内容指纹**检测【skill + 大写人格档（SOUL/AGENTS/IDENTITY 等）】变化，有变就重置该 soul 的会话（相关群下次对话重建、载入新内容；首次启动只记基准、不动会话）。`memory/` 下的 playbook 是按需现读、不进会话缓存，所以改它们不触发重置。
 - **现有共用 skill**（`workspaces/_shared/skills/`）：`create-agent-skills`（写 SKILL.md 的元技能）、`create-badge`（徽章导入/发放/查询）、`create-event`（事件设计→注册→配图→验收）、`lp-usage-design`（LP 经济设计参考指南，含续航模拟脚本）。
 - 装载 / 生效机制见 `workspaces/tudigong/memory/agent-skill-playbook.md`；**创作共用 skill 的房规、中立化与验收清单**见 `workspaces/tudigong/memory/skill-authoring-playbook.md`。
 
@@ -186,4 +187,4 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt   # matplotlib + netwo
 
 ## 知识库 / 开发约定
 
-项目的操作经验与踩坑沉淀在 **`workspaces/tudigong/memory/`**（默认 soul）。先读 `memories.md` 索引，再按需打开对应 playbook：lark-cli、执行器（agent-executor）、本地库、事件系统、LP（ap-gamification）、Telegram、**徽章系统（badge-system）**、**社区推播事件（community-notify-events）**、**运营数据报告（ops-report）**、**多人多群组记忆管理 + 群组三级分类（memory-access）**、**技能系统装载（agent-skill）**、**共用 skill 创作房规（skill-authoring）**。**改动飞书 / 数据 / 大脑相关代码前先读它。** 约定：日志用简体中文 + 大陆用语、不带 emoji；代码注释用英文。
+项目的操作经验与踩坑沉淀在 **`workspaces/tudigong/memory/`**（默认 soul）。先读 `memories.md` 索引，再按需打开对应 playbook：lark-cli、执行器（agent-executor）、本地库、事件系统、LP（pt-gamification）、Telegram、**徽章系统（badge-system）**、**社区推播事件（community-notify-events）**、**运营数据报告（ops-report）**、**多人多群组记忆管理 + 群组三级分类（memory-access）**、**技能系统装载（agent-skill）**、**共用 skill 创作房规（skill-authoring）**。**改动飞书 / 数据 / 大脑相关代码前先读它。** 约定：日志用简体中文 + 大陆用语、不带 emoji；代码注释用英文。
