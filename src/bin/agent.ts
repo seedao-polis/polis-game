@@ -27,7 +27,7 @@ import { log } from '../core/log.js';
 import * as store from '../core/store.js';
 import { getLpDb } from '../core/db.js';
 import { scanCorruptSessions, quarantineSession } from '../core/kimi-session.js';
-import { reloadSkillsIfChanged } from '../core/skills.js';
+import { reloadSoulIfChanged } from '../core/skills.js';
 import { fireEvent, listEventConfigs, getEventByRef, getEventConfig, describeSchedule } from '../core/events.js';
 import { enableLogSink, flushTelegramSync, isTelegramConfigured, sendTelegramMessage, sendTelegramAlert } from '../core/telegram.js';
 import { checkUserTokenExpiry, describeTokenExpiry } from '../core/token-watch.js';
@@ -178,17 +178,17 @@ async function runWorker(target: WorkerTarget): Promise<void> {
 
   // Skill reload: kimi snapshots a session's skills at creation and never re-reads them on --continue.
   // On every worker (re)start — which includes `agent update`'s hot-reload — reconcile the served soul's
-  // skill files against the last fingerprint; when they changed, the soul's sessions are quarantined so
-  // each chat's next message rebuilds a session that loads the new skills.
+  // skills + uppercase persona files against the last fingerprint; when they changed, the soul's sessions
+  // are quarantined so each chat's next message rebuilds a session that loads the new skills + persona.
   try {
-    const skillReload = reloadSkillsIfChanged(resolved[0].workspace);
-    if (skillReload.firstRun) {
-      log.info(`skill 基线已记录（soul=${resolved[0].workspace}）；之后改动 skill 会在重启 / update 时自动重置会话套用。`);
-    } else if (skillReload.changed) {
-      log.info(`skill 有变更：已重置 ${skillReload.quarantined} 个会话，相关群下次对话将载入新 skill。`);
+    const soulReload = reloadSoulIfChanged(resolved[0].workspace);
+    if (soulReload.firstRun) {
+      log.info(`soul 基线已记录（soul=${resolved[0].workspace}）；之后改动 skill 或大写人格档（SOUL/AGENTS/IDENTITY 等）会在重启 / update 时自动重置会话套用。`);
+    } else if (soulReload.changed) {
+      log.info(`skill / 人格档有变更：已重置 ${soulReload.quarantined} 个会话，相关群下次对话将载入新内容。`);
     }
   } catch (e) {
-    log.warn('skill 重载检查失败：', (e as Error).message);
+    log.warn('soul 重载检查失败：', (e as Error).message);
   }
 
   // Login expiry check: check each lark profile in use once.

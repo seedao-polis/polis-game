@@ -48,6 +48,16 @@ export function isToolingWorkspace(name: string): boolean {
   return name.startsWith('_');
 }
 
+/**
+ * Absolute paths of the soul's uppercase persona markdown files that exist on disk — the same
+ * SOUL_FILES assembled into the system prompt (IDENTITY / SOUL / AGENTS / TOOLS / USER / BOOT /
+ * HEARTBEAT). Used to detect persona edits so a soul's kimi sessions can be reset on restart.
+ */
+export function personaFilesForSoul(name: string): string[] {
+  const dir = soulDir(name);
+  return SOUL_FILES.map((f) => path.join(dir, f)).filter((p) => fs.existsSync(p));
+}
+
 export interface AssembleSoulOptions {
   /**
    * Chat id of the active conversation. When provided, the per-chat policy's

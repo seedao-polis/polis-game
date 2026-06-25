@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fingerprintSkills, skillsDirsForSoul } from './skills.js';
+import { fingerprintSkills, fingerprintSoul, skillsDirsForSoul } from './skills.js';
 
 function mkTmp(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'skills-test-'));
@@ -64,4 +64,13 @@ test('skillsDirsForSoul returns existing roots with the shared layer first', () 
   const sharedIdx = dirs.findIndex((d) => d.includes(`${path.sep}_shared${path.sep}`));
   const soulIdx = dirs.findIndex((d) => d.includes(`${path.sep}tudigong${path.sep}`));
   if (sharedIdx !== -1 && soulIdx !== -1) assert.ok(sharedIdx < soulIdx);
+});
+
+test('fingerprintSoul is deterministic and folds in persona (differs from skills-only)', () => {
+  const fp1 = fingerprintSoul('tudigong');
+  assert.equal(typeof fp1, 'string');
+  assert.ok(fp1.length > 0);
+  assert.equal(fingerprintSoul('tudigong'), fp1); // deterministic for unchanged files
+  // Persona files are folded in, so the combined fingerprint differs from the skills-only one.
+  assert.notEqual(fp1, fingerprintSkills(skillsDirsForSoul('tudigong')));
 });
