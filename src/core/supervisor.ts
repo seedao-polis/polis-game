@@ -442,41 +442,24 @@ export function runSupervisor(opts: SupervisorOptions): Promise<void> {
   writePid();
 
   const scriptPath = process.argv[1]; // dist/bin/agent.js
-  const childArgs = ['serve'];
-  if (opts.target.only) childArgs.push('--only', opts.target.only);
-  else if (opts.target.soul) childArgs.push(opts.target.soul);
+  // Re-launch the worker for the same soul + startup mode. The mode flag round-trips the identity
+  // selection so the spawned worker rebuilds the same WorkerTarget.
+  const modeFlag =
+    opts.target.identities.length > 1
+      ? '--both'
+      : opts.target.identities[0] === 'user'
+        ? '--user'
+        : '--bot';
+  const childArgs = ['serve', opts.target.soul, modeFlag];
 
   // The supervisor owns the user-token data plane: tell the worker which soul's user-identity channel to
-  // run as a collect-only collector (roster sync / doc-view / message capture). Derived from the served
-  // target — the served soul directly, or the soul of the single --only agent.
-  const collectorSoul = ((): string | undefined => {
-    if (opts.target.soul) return opts.target.soul;
-    if (opts.target.only) {
-      try {
-        return loadConfigs().agents.agents[opts.target.only]?.soul;
-      } catch {
-        return undefined;
-      }
-    }
-    return undefined;
-  })();
+  // run as a collect-only collector (roster sync / doc-view / message capture).
+  const collectorSoul = opts.target.soul;
 
   // The supervisor itself touches the DB (daily LP floor reset, ops reports), so name the per-soul DB
   // file the same way the worker does (workspaces/<soul>/ ⇒ .agent/<soul>.db). The spawned worker
   // inherits this through process.env and re-pins it from its own resolved workspace.
-  const servedWorkspace = ((): string | undefined => {
-    try {
-      const cfg = loadConfigs();
-      if (opts.target.only) {
-        const raw = cfg.agents.agents[opts.target.only];
-        return raw?.workspace ?? raw?.soul;
-      }
-    } catch {
-      /* config unavailable */
-    }
-    return opts.target.soul; // workspace defaults to soul
-  })();
-  if (servedWorkspace) process.env.AGENT_SOUL = servedWorkspace;
+  process.env.AGENT_SOUL = opts.target.soul;
 
   let child: ChildProcess | null = null;
   let shuttingDown = false;

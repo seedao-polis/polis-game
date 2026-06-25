@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Agent } from '../core/agent.js';
-import { listSouls, soulExists } from '../core/soul.js';
+import { listSouls, soulExists, isToolingWorkspace } from '../core/soul.js';
 import { CliChannel } from '../channels/cli.js';
 import { channelForIdentity } from '../channels/index.js';
 import type { Channel } from '../channels/channel.js';
@@ -14,6 +14,7 @@ import {
   resolveAgent,
   type ResolvedAgent,
   type WorkerTarget,
+  type Identity,
 } from '../core/configs.js';
 
 /** Default workspace soul used when `serve` / `cli` is invoked without an explicit soul. */
@@ -24,6 +25,7 @@ import { runSupervisor, readServePid, isAlive } from '../core/supervisor.js';
 import { REPO_ROOT, RUNTIME_DIR } from '../core/paths.js';
 import { log } from '../core/log.js';
 import * as store from '../core/store.js';
+import { getLpDb } from '../core/db.js';
 import { scanCorruptSessions, quarantineSession } from '../core/kimi-session.js';
 import { reloadSkillsIfChanged } from '../core/skills.js';
 import { fireEvent, listEventConfigs, getEventByRef, getEventConfig, describeSchedule } from '../core/events.js';
@@ -49,7 +51,7 @@ function usage(): void {
 
 用法:
   agent cli [soul]                              本地终端机 REPL，直接跟 agent 对话（不碰飞书，有对话记忆）
-  agent serve [soul] [--only <agentId>] [--sup] [--quiet]  启动常驻服务；不带 soul 默认 tudigong；加 --sup 才挂监督者（定时事件/LP 补底/会话守护/热重启/PID 锁）+ 自动跑 user-token 数据采集（群成员/文档访问，采集不回复、不替你本人发言），不加则裸跑 worker、无采集；--quiet 静默模式：照常采集对话与数据、但不回复任何飞书 p2p/群/@（CLI 不受影响）
+  agent serve [soul] [--bot|--user|--both] [--sup] [--quiet]  启动常驻服务；不带 soul 默认 tudigong。启动模式（互斥，默认 --bot）：--bot 只起 bot 身份（对外回复）、--user 只起 user 身份（user-token 采集、不回复）、--both 两个都起。加 --sup 才挂监督者（定时事件/LP 补底/会话守护/热重启/PID 锁）+ 自动补一个 user-token 采集器（群成员/文档访问，采集不回复、不替你本人发言），不加则裸跑 worker；--quiet 静默模式：照常采集对话与数据、但不回复任何飞书 p2p/群/@（CLI 不受影响）
   agent update [--pull]                         重新构建并热重启运行中的 serve（--pull 先 git pull）
   agent agents                                  列出 configs 里的 agent 与其 identity / listen / trigger
   agent run <soul> [--channel cli]              本地 REPL 测试（不碰飞书）
@@ -62,6 +64,8 @@ function usage(): void {
   agent token-check [--test]                     查看 user token 剩余有效期并按需推送到期提醒（--test 发一条测试提醒到 Telegram）
   agent daily-reset [--floor <n>]               立即执行每日 LP 补底（预设下限 10）
   agent reset-all-pt [--to <n>]                 把所有人的 LP 重置为同一数值（预设 120）
+  agent lp-migrate [--from <soul>]              把某个 soul 库的 LP/徽章一次性迁入共享库 .agent/shared.db（预设 from tudigong）
+  agent link <from_open_id> <to_open_id>        把 from 这个 open_id 归并到 to 这个人（跨 app 同一人 LP 统一；from 自己的 LP 作废）
   agent doctor [--fix]                           扫描损坏的 kimi 会话并查看最近错误（--fix 隔离损坏会话）
   agent events                                   列出已定义的事件（含编号、范围、排程）
   agent event <编号|id> [--test] [--to <oc/ou>] [--dry-run]  手动触发一个事件（仅 server 端；--test 只发给操作者本人 P2P；--dry-run 只预览不发送）
@@ -73,10 +77,10 @@ function usage(): void {
 范例:
   agent cli                                     用默认 soul（tudigong）开 REPL 对话
   agent cli tudigong                            指定 soul 开 REPL 对话
-  agent serve                                   启动 tudigong（默认 soul），裸跑 worker、不挂监督者
-  agent serve --sup                             启动 tudigong + 监督者（常驻、可热重启、跑定时事件）
-  agent serve tudigong --sup                    指定 soul 启动 + 监督者
-  agent serve --only tudigong-bot --quiet       只启动 tudigong-bot、静默采集、裸跑无监督者
+  agent serve                                   启动 tudigong（默认 soul、默认 --bot），裸跑 worker、不挂监督者
+  agent serve --sup                             启动 tudigong 的 bot + 监督者（常驻、可热重启、跑定时事件）
+  agent serve tudigong --both --sup             指定 soul，bot + user 都启动 + 监督者
+  agent serve tudigong --user --quiet           只启动 tudigong 的 user 身份、静默采集、裸跑无监督者
   agent update                                  改完 code 后热重启（需 serve --sup 在跑）
   agent ask tudigong "你好"                     一次性问一句
   agent backfill                                迁移旧 JSONL 采集数据到数据库
@@ -88,15 +92,35 @@ function usage(): void {
 `);
 }
 
+// Reject tooling workspaces (_shared, _template); they are scaffolding, not runnable agents.
+function assertRunnableSoul(name: string): void {
+  if (isToolingWorkspace(name)) {
+    log.error(`【${name}】是工具型目录（_shared / _template 等下划线开头目录），不能作为 agent 启动。请用 create-agent skill 从 _template 创建真正的 workspace。`);
+    process.exit(1);
+  }
+}
+
+// Resolve the serve startup mode flags into the identity channels to run. --bot / --user / --both are
+// mutually exclusive; the default when none is given is bot-only.
+function parseServeIdentities(argv: string[]): Identity[] {
+  const picked = (['bot', 'user', 'both'] as const).filter((f) => hasFlag(argv, f));
+  if (picked.length > 1) {
+    log.error('--bot / --user / --both 互斥，只能选一个');
+    process.exit(1);
+  }
+  const mode = picked[0] ?? 'bot';
+  return mode === 'both' ? ['bot', 'user'] : [mode];
+}
+
 /** worker: read configs → for each enabled agent run an auth check, resolve it, build Agent + channel, and stay resident until a termination signal. */
 async function runWorker(target: WorkerTarget): Promise<void> {
   const cfg = loadConfigs();
+  // The startup mode (--bot / --user / --both) is authoritative: a soul's agents are picked by matching
+  // soul + selected identity, independent of the per-agent `enabled` flag.
   const ids = listAgents(cfg).filter((id) => {
     const raw = cfg.agents.agents[id];
-    if (raw?.enabled !== true) return false;
-    if (target.only) return id === target.only;
-    if (target.soul) return raw.soul === target.soul;
-    return false;
+    if (!raw) return false;
+    return raw.soul === target.soul && target.identities.includes(raw.identity);
   });
 
   // Startup cleanup: quarantine any sessions a previous crash / hot-reload left corrupt, so they
@@ -141,11 +165,8 @@ async function runWorker(target: WorkerTarget): Promise<void> {
 
   if (resolved.length === 0) {
     log.error(
-      target.only
-        ? `没有可启动的 agent（--only ${target.only} 未启用或不存在）`
-        : target.soul
-          ? `没有 soul 为 ${target.soul} 的 enabled agent`
-          : '没有任何 enabled 的 agent（请在 configs/agents.json 设置 enabled:true）'
+      `没有可启动的 agent：soul=${target.soul}、身份=${target.identities.join('/')}。` +
+        `请确认 configs/agents.json 里有对应 identity 的 agent（如 ${target.soul}-bot / ${target.soul}-user）。`
     );
     process.exit(1);
   }
@@ -946,9 +967,76 @@ async function cmd_reset_all_pt(argv: string[]): Promise<void> {
   console.log(`LP 重置完成：${result.affected} 名用户已重置为 ${result.target} LP`);
 }
 
+// Seed the shared LP database from a source per-agent db (default tudigong) so the existing community LP
+// and badges become the shared baseline. Copies only the LP cluster, idempotently (INSERT OR IGNORE).
+async function cmd_lp_migrate(argv: string[]): Promise<void> {
+  const srcName = (getFlag(argv, 'from') || 'tudigong').replace(/[^A-Za-z0-9._-]/g, '_');
+  const srcPath = path.join(RUNTIME_DIR, `${srcName}.db`);
+  if (!fs.existsSync(srcPath)) {
+    log.error(`源 db 不存在：${srcPath}`);
+    process.exit(1);
+  }
+  const db = getLpDb(); // creates + migrates the shared LP db
+  db.exec(`ATTACH DATABASE '${srcPath.replace(/'/g, "''")}' AS src`);
+  const tables = ['badges', 'profiles', 'pt_ledger', 'checkins', 'user_badges']; // parents before children (FK order)
+  try {
+    db.exec('BEGIN');
+    for (const t of tables) db.exec(`INSERT OR IGNORE INTO ${t} SELECT * FROM src.${t}`);
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+    db.exec('DETACH DATABASE src');
+    log.error('LP 迁移失败：', (e as Error).message);
+    process.exit(1);
+  }
+  db.exec('DETACH DATABASE src');
+  const counts = tables.map((t) => `${t}=${(db.prepare(`SELECT count(*) AS n FROM ${t}`).get() as { n: number }).n}`);
+  console.log(`LP 已迁入共享库（来源 ${srcName}.db）：${counts.join(', ')}`);
+}
+
+// Alias one open_id to another person's identity so their LP / badges unify across agents (each Feishu app
+// gives a person a different open_id). The `from` identity's own LP is discarded (作废以共享库为准).
+async function cmd_link(argv: string[]): Promise<void> {
+  const from = argv[1];
+  const to = argv[2];
+  if (!from || !to || from.startsWith('--') || to.startsWith('--')) {
+    log.error('用法: agent link <from_open_id> <to_open_id>（把 from 这个 open_id 归并到 to 这个人，from 自己的 LP 作废）');
+    process.exit(1);
+  }
+  const canon = store.canonicalId(to);
+  if (from === canon) {
+    console.log(`无需归并：${from} 已经是 ${canon}`);
+    return;
+  }
+  const db = getLpDb();
+  try {
+    db.exec('BEGIN');
+    // discard the source identity's own LP history, then point it at the canonical identity
+    db.prepare('DELETE FROM pt_ledger WHERE user_open_id = ?').run(from);
+    db.prepare('DELETE FROM checkins WHERE user_open_id = ?').run(from);
+    db.prepare('DELETE FROM user_badges WHERE user_open_id = ?').run(from);
+    db.prepare('DELETE FROM profiles WHERE open_id = ?').run(from);
+    db.prepare('UPDATE identity_links SET canonical_id = ? WHERE canonical_id = ?').run(canon, from);
+    db.prepare('INSERT OR REPLACE INTO identity_links(open_id, canonical_id) VALUES (?, ?)').run(from, canon);
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+    log.error('link 失败：', (e as Error).message);
+    process.exit(1);
+  }
+  console.log(`已归并：${from} → ${canon}（${from} 之后的 LP 都记到 ${canon}）`);
+}
+
 async function cmd_serve(argv: string[]): Promise<void> {
   const positionalSoul = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
-  const onlyFlag = getFlag(argv, 'only');
+  if (positionalSoul) assertRunnableSoul(positionalSoul);
+  const soul = positionalSoul ?? DEFAULT_SOUL;
+
+  // Startup mode: which identity channels of the soul to bring up. --bot (default) / --user / --both,
+  // mutually exclusive. --bot runs the replying bot; --user runs the user-token data plane (collect-only);
+  // --both runs them together.
+  const identities = parseServeIdentities(argv);
+
   // --quiet (静默/观察模式): keep running everything EXCEPT replying to feishu p2p/group/mention —
   // messages are still captured, members synced, data recorded. Propagated to the worker via the
   // AGENT_QUIET env var (the supervisor passes it through on spawn); channels read it from there.
@@ -961,7 +1049,7 @@ async function cmd_serve(argv: string[]): Promise<void> {
   // the worker, so both processes' logs flow through — distinguished by a [sup]/[wkr] tag.
   enableLogSink();
 
-  const target: WorkerTarget = onlyFlag ? { only: onlyFlag } : { soul: positionalSoul ?? DEFAULT_SOUL };
+  const target: WorkerTarget = { soul, identities };
 
   // AGENT_WORKER=1 means this process was spawned as a child by the supervisor → run the channel directly.
   // Otherwise a direct serve: run the supervisor only when --sup is passed, else a bare worker.
@@ -991,6 +1079,7 @@ async function cmd_cli(argv: string[]): Promise<void> {
     );
     process.exit(1);
   }
+  assertRunnableSoul(soul);
   process.env.AGENT_SOUL = soul; // names the DB file (.agent/<soul>.db)
   const agent = new Agent(soul);
   // Each startup gets a fixed session so this REPL conversation has short-term memory (/reset starts over).
@@ -1011,6 +1100,7 @@ async function cmd_ask(argv: string[]): Promise<void> {
     log.error('用法: agent ask <soul> <消息...>');
     process.exit(1);
   }
+  assertRunnableSoul(soul);
   process.env.AGENT_SOUL = soul; // names the DB file (.agent/<soul>.db)
   const agent = new Agent(soul, { journal: false });
   const reply = agent.respond({ message });
@@ -1023,6 +1113,7 @@ async function cmd_run(argv: string[]): Promise<void> {
     log.error(`找不到 soul【${soul ?? ''}】。可用：${listSouls().join(', ') || '(无)'}`);
     process.exit(1);
   }
+  assertRunnableSoul(soul);
   const channelName = getFlag(argv, 'channel') || 'cli';
   if (channelName !== 'cli') {
     log.error('run 仅支持 --channel cli（飞书请用 agent serve）');
@@ -1286,6 +1377,8 @@ const COMMANDS: CliCommand[] = [
   { names: ['memory'], run: cmd_memory },
   { names: ['daily-reset'], run: cmd_daily_reset },
   { names: ['reset-all-pt'], run: cmd_reset_all_pt },
+  { names: ['lp-migrate'], run: cmd_lp_migrate },
+  { names: ['link'], run: cmd_link },
   { names: ['serve'], run: cmd_serve },
   { names: ['update'], run: cmd_update },
   { names: ['cli'], run: cmd_cli },

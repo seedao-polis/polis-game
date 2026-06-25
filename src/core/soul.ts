@@ -43,6 +43,11 @@ export function listSouls(): string[] {
     .map((d) => d.name);
 }
 
+// Underscore-prefixed workspaces (e.g. _shared, _template) are tooling directories, not runnable agents.
+export function isToolingWorkspace(name: string): boolean {
+  return name.startsWith('_');
+}
+
 export interface AssembleSoulOptions {
   /**
    * Chat id of the active conversation. When provided, the per-chat policy's

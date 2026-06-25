@@ -300,10 +300,10 @@ export function loadConfigs(): Configs {
 
 /** Selects which agents a serve / supervisor invocation should run. */
 export interface WorkerTarget {
-  /** Run only this specific agent id. Mutually exclusive with soul. */
-  only?: string;
-  /** Run all enabled agents whose soul matches this workspace soul. Mutually exclusive with only. */
-  soul?: string;
+  /** Run the agents of this workspace soul. */
+  soul: string;
+  /** Which identity channels of that soul to bring up (bot / user / both). */
+  identities: Identity[];
 }
 
 /** List all agent ids defined in configs. */
