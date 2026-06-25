@@ -5,6 +5,7 @@
 > - **每条 LLM 回复扣 0.1 LP**（原 -1），**回复尾部 footer 显示到小数第一位**（`toFixed(1)`，如 `120.0 → 119.9 (-0.1)`）。LP 余额因此是小数：DB 列 `ap_balance`/`ap_ledger.delta` 虽声明 INTEGER，但 SQLite 亲和性会把非整数存成 REAL，无需迁移。
 > - 代码内部标识符（`FIRST_CONTACT_AP`、`ap_balance`、`ap_ledger`、`grantAp`/`spendAp`、`LLM_AP_COST`、reason 码）仍沿用 `ap` 旧名，**只改了展示字符串**。
 > - **DB 文件名不再写死**：改成按 soul 命名 `.agent/<soul>.db`（`db.ts` 读 `AGENT_SOUL`，默认 `tudigong`）；每个 entry point（serve worker / supervisor / cli·ask·run）都会 pin `AGENT_SOUL`，MCP server 经 `Agent.buildMcpConfig` 的 env 拿到同一值 → 同 soul 各进程共用一个库。tudigong 用 `.agent/tudigong.db`。
+> - **⚠️ LP / 游戏化已拆出共享库（2026-06-25，见 §9）**：积分 / 徽章 / profile 现在统一落 `.agent/shared.db`（`getLpDb()`），**所有 agent 共用一套 LP 经济**；`.agent/<soul>.db` 只剩对话记忆 / 消息 / 活动 / 名册等 per-agent 数据。下文凡说 LP 存在 `profiles`/`ap_ledger` 的，库已是 shared.db；命令也从 `reset-all-ap` 改名 `reset-all-pt`。
 > - 下文凡提到【AP】均指现在的 LP。
 > 玩家档案（profile）、LP 点数经济、每日签到、徽章/等级。动这块前先读这份。
 > 完整研究：`thoughts/shared/research/2026-06-16-npc-agent-user-profile-ap-memory-architecture.md`；
@@ -22,7 +23,7 @@
 - **任务奖励**：暂不做任务系统，只留接口 `store.rewardTask(openId, taskId, amount)`（reason `task:<id>`）。
 - **退费**：LLM 出错时 `grantAp(+cost, 'refund_on_error')` 退回。
 - **所有 AP 变动一律走 `grantAp` / `spendAp` / `checkIn`（内部 `tx()` + 写 `ap_ledger`），绝不直接 `UPDATE profiles`。**
-- **身份按 `open_id`**：同一人就是同一 open_id（实测 bot 事件与 user 列表接口在同一 app `example_lark_profile` 下 open_id 一致；未来若 bot/user 拆 app 再改用 `union_id`）。
+- **身份按 `open_id` + 跨 app 别名（2026-06-25 大改，见 §9）**：早期假设「同一人同一 open_id」只在**同一个 app** 内成立。多 agent 各用独立飞书 app 后（如 一涵），同一人在不同 app 下 **open_id 不同**；**union_id 取不到**，改用别名表 `identity_links` + `pnpm agent link` 把多个 open_id 归并到一个 canonical 身份，LP 层每次读写先解析 canonical。
 - 代码注释只写**静态功能描述**，不写日期/计划/改动历史；开发期**不 commit、不开 PR**。
 
 ## 1. ⚠️ 两个曾经致命、已修的 BUG（务必记住）
@@ -74,3 +75,18 @@
 - **P2 per-user memory + 每日 distillation**：`workspaces/<soul>/users/<open_id>/`、`assembleSoul(userOpenId?)` 注入、`distill.ts`、`agent distill`、MCP `user_memory_*` 工具。distillation 的【活跃用户】定义 操作者 暂缓。串行跑即可。
 - **P3 badge/level 引擎**：除 `first_contact` 外的徽章（`chatty`/`commander`/`loyal`）与升级公式仍是草案；`level` 列已就位（默认 1），升级逻辑待规则拍板。
 - 语言：所有内容（含运行时回复、命令、签到、文档）一律用**简体中文 + 大陆用语**对齐 bot 既有语气。
+
+## 9. LP 全局共享 + 跨 app 身份归并（2026-06-25 大改）
+
+**背景**：多 agent 各用独立飞书 app 后，① 不想每个 agent 各算各的 LP；② 同一人在不同 app 下 open_id 不同。
+
+- **共享库**：新增 `getLpDb()`/`lpTx()`（`db.ts`，指向 `.agent/shared.db`、带 `busy_timeout` 多进程并发写安全；活动库与共享库同文件时复用同一句柄）。LP 集群（`profiles`/`pt_ledger`/`checkins`/`badges`/`user_badges`）全落 shared.db；`getDb()` 仍是 per-agent（记忆 / 消息 / 活动 / 名册）。`gamification.ts` 的 LP 函数走 `getLpDb`/`lpTx`，但 `recordActivity*`（activities）/ `findOpenIdsByName`（chat_members）仍走 `getDb`；`recordInteraction` 因此拆成 `lpTx`(ensureProfile) + `tx`(activity) 两段（跨库不能同事务）。
+- **别名表 `identity_links`**（schema v20，`open_id PRIMARY KEY → canonical_id`）：LP 每次读写先 `cid(openId)` 解析 canonical（`gamification.ts`，未链就是自己），导出 `canonicalId()` 供别处用。
+- **为什么不用 union_id**：实测 `+get-user` 剥掉 union_id、raw `contact/v3/users` 缺 scope 报 `code:false`、事件 schema 无 union_id；且**两个独立自建 app 是否共享 union_id，在加 scope 前没法验证** → 放弃，改别名表（手动 link、可靠、不依赖飞书）。
+- **命令**（已是 `pt` 名，非旧 `ap`）：
+  - `pnpm agent lp-migrate [--from <soul>]`：把某 soul 库的 LP 集群 ATTACH + `INSERT OR IGNORE` 种进 shared.db（默认 from tudigong）。**首次已跑过**（土地公→shared.db，9 profiles / 49 ledger）。
+  - `pnpm agent link <from_open_id> <to_open_id>`：把 from 归并到 to 的 canonical，**from 自己的 LP 作废**，之后 from 的 LP 都记到 canonical。**已链**：一涵的 Ricky `ou_0769…` → 土地公的 `ou_9686…`。
+  - `reset-all-pt` / `daily-reset` 等仍在，作用对象现在是 shared.db。
+- **谁要 link**：只有**跨多个 bot**的少数人（每接一个新 app 的 bot，回头客就多一个 open_id）。多数成员只用一个 bot，不用 link。
+- **旧数据**：各 agent 单独库（`seealpha.db`/`profile-writer-yihan.db`）里的旧 LP **作废、以 shared.db 为准**（操作者拍板）。
+- 详见共用 skill `onboard-lark-bot/references/shared-lp-and-link.md`。

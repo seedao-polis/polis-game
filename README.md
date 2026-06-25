@@ -34,7 +34,7 @@ pnpm agent serve                 # 启动常驻服务（监督者，支持热重
 
 ```
 agent cli [soul]                              本地终端 REPL，直接跟 agent 对话（不碰飞书，有对话记忆）
-agent serve [soul] [--only <agentId>] [--quiet]  启动常驻服务；不带 soul 默认 tudigong（挂监督者）；其他 soul 裸跑无监督者；--quiet 静默/观察模式：照常采集但不回复任何飞书消息
+agent serve [soul] [--bot|--user|--both] [--sup] [--quiet]  启动常驻服务；不带 soul 默认 tudigong；启动模式互斥、默认 --bot：--bot 只起 bot、--user 只起 user 采集、--both 都起；加 --sup 挂监督者（热重启 / 定时事件 / LP 补底）；--quiet 静默/观察模式：照常采集但不回复任何飞书消息
 agent update [--pull]                         重新编译并热重启运行中的 serve（--pull 先 git pull）
 agent agents                                  列出 configs 里的 agent 及其 identity / listen / trigger
 agent run <soul> [--channel cli]              本地 REPL 测试
@@ -47,6 +47,9 @@ agent doc-views                               列出最近采集的文档访问�
 agent report daily|monthly [--date YYYY-MM-DD] [--lark-user <open_id>] [--lark-chat <chat_id>]   生成并发送运营数据报告（深色图表 → Telegram，可选飞书私聊/群）
 agent token-check [--test]                    查看 user token 剩余有效期并按需推送到期提醒
 agent daily-reset [--floor <n>]              立即执行每日 LP 补底
+agent reset-all-pt [--to <n>]                把所有人 LP 重置为同一数值（默认 120；走共享库 shared.db）
+agent lp-migrate [--from <soul>]             把某 soul 库的 LP/徽章迁入共享库 .agent/shared.db（默认 from tudigong）
+agent link <from_open_id> <to_open_id>       跨 app 同一人的身份归并：from 的 LP 记到 to
 agent doctor [--fix]                          扫描损坏的执行器会话（--fix 隔离损坏会话）
 agent events                                  列出已定义的事件
 agent event <编号|id> [--test] [--to <oc/ou>] [--dry-run]   手动触发一个事件
@@ -62,25 +65,50 @@ agent tg-test [消息...]                       发一条测试消息到 Telegra
 
 ## 启动模式：bot 还是本人
 
-跑哪些 agent 由 `configs/agents.json` 里每个 agent 的 `enabled` 决定——`enabled:false` 的**永远不会跑**；`--only <agentId>` 也必须那个 agent `enabled:true` 才生效。默认配置：`tudigong-bot`（机器人身份）启用、`tudigong-user`（操作者本人身份，且 `collectOnly` 只采集不回复）停用。
+`agent serve <soul>` 用 `--bot` / `--user` / `--both` 选要起哪些身份通道（互斥，**默认 `--bot`**）。启动模式由命令行旗标决定，不再依赖 `configs/agents.json` 的 `enabled`、也不再有 `--only`。`tudigong-user` 默认带 `collectOnly`（只采集不回复）。
 
 - **只跑 bot（默认 · 推荐）**
 
   ```bash
-  pnpm agent serve tudigong --sup
+  pnpm agent serve tudigong --bot --sup
   ```
 
-  本人身份已停用 → 对外只有 bot 回复；`--sup` 会额外起一个 user 身份的【采集器】，只采集群成员 / 文档访问数据、**绝不回复**。要纯裸 bot（连采集与定时事件 / LP 补底都不要）：`pnpm agent serve --only tudigong-bot`。
+  对外只有 bot 回复；`--sup` 会额外起一个 user 身份的【采集器】，只采集群成员 / 文档访问数据、**绝不回复**。要纯裸 bot（连采集与定时事件 / LP 补底都不要）：去掉 `--sup`，即 `pnpm agent serve tudigong --bot`。
 
-- **绝不让 bot 与本人同时回复**
+- **bot + 本人都起**
 
-  不要把两个 agent 同时设 `enabled:true`。最保险是显式限定单个：`pnpm agent serve --only tudigong-bot`。
+  ```bash
+  pnpm agent serve tudigong --both
+  ```
+
+  同时起 bot 身份与 user 身份。`--sup` 在场时 user 会被压成只采集（见下）。
 
 - **只跑本人（user 身份）**
 
-  先在 `configs/agents.json` 把 `tudigong-user` 设 `enabled:true`、`tudigong-bot` 设 `enabled:false`，再 `pnpm agent serve tudigong`。若要本人身份**真的开口回复**（而不只是采集），还要删掉 `tudigong-user` 的 `"collectOnly": true`，并且**不要加 `--sup`**（`--sup` 会强制把 user 压成只采集）。
+  ```bash
+  pnpm agent serve tudigong --user
+  ```
+
+  只起 user 身份通道。注意 `tudigong-user` 默认 `"collectOnly": true`（只采集不回复）；若要本人身份**真的开口回复**，删掉它的 `"collectOnly": true`，并且**不要加 `--sup`**（`--sup` 会强制把 user 压成只采集）。
 
 > **bot 与本人的区别**：`identity:"bot"` 以机器人身份发言（群里需先把 bot 拉进群，只收到【被 @】的消息）；`identity:"user"` 以操作者本人身份（impersonation）发言 / 采集，能看到本人可见的所有群，但以本人身份在外部群发消息会被飞书拦截，所以本人身份默认 `collectOnly`（只采集、不回复）。
+
+## 新建一个 agent
+
+从样板 `workspaces/_template/` 长出一个新 agent，全程有两个共用 skill 引导（`workspaces/_shared/skills/`）：
+
+- **`create-agent`**：复制 `_template` → 替换占位符 → 登记 `configs/agents.json` → 本地 `pnpm agent cli <soul>` 验收。soul 名**不能以 `_` 开头**（启动守卫会拒绝）。
+- **`onboard-lark-bot`**：把建好的 workspace 接上飞书当 bot（建飞书 app、配权限/事件、发布、写 `configs/lark.json` profile、`serve <soul> --bot`）。
+
+详见 `workspaces/tudigong/memory/agent-onboarding-playbook.md`。
+
+## LP 是跨 agent 的共享经济
+
+积分（LP）、徽章、用户 profile 存在**共享库** `.agent/shared.db`，所有 agent 共用一套经济；对话记忆仍按 agent 隔离在各自 `.agent/<soul>.db`。
+
+- 每个飞书 app 给同一个人**不同的 open_id**，同一人跨多个 bot 时 LP 会分叉。用 `pnpm agent link <新open_id> <canonical open_id>` 归并身份（只用一个 bot 的成员不用做）。
+- 首次启用共享库已用 `pnpm agent lp-migrate` 把现有 LP 种进去。
+- 详见 `workspaces/tudigong/memory/pt-gamification-playbook.md` 第 9 节。
 
 ## 多 bot 与 Lark profile
 

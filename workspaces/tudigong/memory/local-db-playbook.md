@@ -9,7 +9,7 @@
 - 所有存取走 `src/core/db.ts` 抽象层（`getDb()` / `tx()` / run/get/all），切驱动只改这一个文件。
 - 代价：`node:sqlite` 是实验性（import 时一行 `ExperimentalWarning`），且要把 `package.json` 的 `engines.node` 提到 `>=22`。
 - **采集范围：内部群 + 外部群都存**（不是只内部）。
-- B 类默认：DB 文件**按 soul 命名 `.agent/<soul>.db`**（2026-06-22 起不再写死；`db.ts` 读 `AGENT_SOUL` env，默认 `tudigong`，每个 entry point 都 pin，MCP server 经 `Agent.buildMcpConfig` env 拿到同值）。tudigong 用 `.agent/tudigong.db`；`AGENT_DB_PATH` 仍可覆盖整条路径（测试隔离用）。轮询游标暂留 JSON 文件；soul 记忆（markdown）与消息库分离；FTS5 用 `trigram` 分词器（支持中文子串）；LP（旧称 AP，Life Point）规则见 `ap-gamification-playbook.md`。
+- B 类默认：DB 文件**按 soul 命名 `.agent/<soul>.db`**（2026-06-22 起不再写死；`db.ts` 读 `AGENT_SOUL` env，默认 `tudigong`，每个 entry point 都 pin，MCP server 经 `Agent.buildMcpConfig` env 拿到同值）。tudigong 用 `.agent/tudigong.db`；`AGENT_DB_PATH` 仍可覆盖整条路径（测试隔离用）。轮询游标暂留 JSON 文件；soul 记忆（markdown）与消息库分离；FTS5 用 `trigram` 分词器（支持中文子串）；LP（旧称 AP，Life Point）规则见 `pt-gamification-playbook.md`。
 
 ## 1. 实测：node:sqlite 在本机（Node 22.22.0）都能用
 
@@ -47,7 +47,7 @@
 
 - bot 事件 `ev`（lark-cli event consume 扁平结构）发送者 open_id 在 **`ev.sender_id`**（实测；不是 `sender.id` / `sender_open_id` / `sender.sender_id.open_id`）。这跟列表接口的 `sender.id` 是两条不同路径，别混。
 - 显示名回填用 **`contact +get-user --user-id <openId> --user-id-type open_id --as user`**（`--as bot` 无通讯录权限、拿不到名字），缓存进 `profiles.name`。
-- 详见 `memory/ap-gamification-playbook.md`。
+- 详见 `memory/pt-gamification-playbook.md`。
 
 ## 7. 运营数据时序表 `member_sync_rounds`（2026-06-18 加，migration v10–v11）
 

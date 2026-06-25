@@ -73,7 +73,7 @@ rm -rf scripts/__pycache__          # 清掉编译产物
 | `create-agent-skills` | 元技能 | 怎么写 / 审 SKILL.md（写新 skill 前先读它）。 |
 | `create-badge` | 路由型 | 徽章 import / award / list；房规样板（结构对照它）。 |
 | `create-event` | 路由型 | 事件设计 → `registerEvent` 注册 → 配图 → dry-run/test 验收。对照 `event-system-playbook` 但**自包含**、用 `{{pt}}`/LP、资产路径写成 soul 相对 `workspaces/<soul>/assets/events/<id>/`。 |
-| `lp-usage-design` | 指南型 | 设计某 soul 的 LP 经济（单次扣费 / 初始 / 补底 / 签到 / 命令是否计费 / 退费 / 重置）；含 `scripts/lp_runway.py` 续航模拟器（纯标准库）。对照 `ap-gamification-playbook`。 |
+| `lp-usage-design` | 指南型 | 设计某 soul 的 LP 经济（单次扣费 / 初始 / 补底 / 签到 / 命令是否计费 / 退费 / 重置）；含 `scripts/lp_runway.py` 续航模拟器（纯标准库）。对照 `pt-gamification-playbook`。 |
 
 > 这两份（create-event / lp-usage-design）是从内部 memory（event-system / event-creation-prompt / ap-gamification）**中立化重写**而来：去厂商名、去外部产品 / 内部代号、自包含、简体化。要再做同类【把内部经验做成对外 skill】照本手册走。
 

@@ -115,4 +115,4 @@ DELETE FROM profiles WHERE open_id=?;
 - DB 状态触发钩子（个人 P2P 事件：恭喜升级 / AP 破万）。
 - 表情回应批次同步；更多触发规则（level-up / AP 门槛 / 徽章）。
 
-依赖：新增了 `@napi-rs/canvas`（预建二进位，免系统 libcairo）。相关 AP / 档案见 `memory/ap-gamification-playbook.md`，自愈 / 串行回复见 `memory/self-heal-playbook.md`。
+依赖：新增了 `@napi-rs/canvas`（预建二进位，免系统 libcairo）。相关 AP / 档案见 `memory/pt-gamification-playbook.md`，自愈 / 串行回复见 `memory/self-heal-playbook.md`。

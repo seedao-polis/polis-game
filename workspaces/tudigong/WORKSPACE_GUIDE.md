@@ -50,7 +50,7 @@ workspaces/tudigong/
 | `local-db-playbook.md` | 本地数据库选型、飞书消息字段真相、各数据表 |
 | `event-system-playbook.md` | 事件 / 触发框架：发图文、迎新、定时 + 随机 |
 | `event-creation-prompt-template.md` | 新建事件时填的模板 |
-| `ap-gamification-playbook.md` | LP 点数经济、每日签到 / 补底 |
+| `pt-gamification-playbook.md` | LP 点数经济、每日签到 / 补底 |
 | `badge-system-playbook.md` | 徽章导入 / 发放 / 查询 |
 | `community-notify-events-playbook.md` | 社区推播里程碑事件 |
 | `ops-report-playbook.md` | 运营数据日报 / 月报（深色图表） |
