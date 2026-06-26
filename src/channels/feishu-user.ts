@@ -1,6 +1,7 @@
 import type { Agent } from '../core/agent.js';
 import type { Channel } from './channel.js';
 import type { ResolvedAgent } from '../core/configs.js';
+import { resolveChatTarget } from '../core/configs.js';
 import {
   listMessages,
   sendText,
@@ -159,7 +160,9 @@ export class FeishuUserChannel implements Channel {
     const syncMembers = (chats: { chatId: string; name: string }[]): void => {
       // Visitor-count milestone: announce each time the watched 围观群's present count crosses a multiple
       // of VISITOR_STEP (every 100 people).
-      const VISITOR_WATCH_CHAT_ID = 'oc_example_public_group'; // SeeDAO 2.0 社区围观群
+      // SeeDAO 2.0 社区围观群; resolved from configs/lark.json's "围观群" alias. Empty when unconfigured,
+      // so the chat.chatId === VISITOR_WATCH_CHAT_ID check below never matches and no milestone fires.
+      const VISITOR_WATCH_CHAT_ID = resolveChatTarget('围观群') ?? '';
       const VISITOR_STEP = 100;
       let added = 0;
       let present = 0;

@@ -5,6 +5,7 @@ import { renderEventImage, type TextOverlay } from './event-render.js';
 import { uploadImage, sendPost, getUserName, listChatMembers, isChatGoneError, isChatInaccessibleError, type PostElement } from './lark.js';
 import * as store from './store.js';
 import { log } from './log.js';
+import { resolveChatTarget } from './configs.js';
 
 // ── event system (management game) ────────────────────────────
 // An event = a base image + text overlays (percentage-positioned) + a markdown caption (title/body)
@@ -187,8 +188,9 @@ const SELF_BOT_OPEN_ID = 'ou_example_bot';
 // Source and (production) target are both SeeDAO 运营小天地: candidates are this group's members, and
 // the event is posted to this group. (They're separate concepts that happen to coincide here.) Run
 // `pnpm agent event lurker-discovered --test` to instead send only to the operator's own P2P.
-const LURKER_SOURCE_CHAT_IDS = ['oc_example_ops_group_old']; // 运营小天地 — candidate pool
-const LURKER_TARGET_CHAT_ID = 'oc_example_ops_group_old'; // 运营小天地 — production target group
+// Resolved from configs/lark.json's "运营小天地" alias; empty when unconfigured (event skips cleanly).
+const LURKER_SOURCE_CHAT_IDS = [resolveChatTarget('运营小天地')].filter((id): id is string => Boolean(id)); // 运营小天地 — candidate pool
+const LURKER_TARGET_CHAT_ID = resolveChatTarget('运营小天地') ?? ''; // 运营小天地 — production target group
 // "silent for N days" window. Defaults to 3; overridable via env for testing / tuning.
 const LURKER_SILENT_DAYS = Number(process.env.LURKER_SILENT_DAYS) || 3;
 const LURKER_PT_REWARD = 3;
@@ -328,7 +330,7 @@ registerEvent({
 // no acquire event of its own. Posted to the SeeDAO 运营小天地 group. The base image has no text/symbol
 // overlays and is resized to 128px height (aspect kept). The recipient name and badge name come from
 // the award flow via member_name / badge_name vars.
-const BADGE_AWARDED_DEFAULT_CHAT_ID = 'oc_example_ops_group'; // SeeDAO 运营小天地
+const BADGE_AWARDED_DEFAULT_CHAT_ID = resolveChatTarget('运营小天地') ?? ''; // SeeDAO 运营小天地
 registerEvent({
   eventTypeId: 'badge-awarded-default',
   title: "{{member_name}} 得到 {{badge_name}} 徽章！",
@@ -350,7 +352,7 @@ registerEvent({
 // @-mentioned in the body (downgraded to plain "@name" text for anyone not in the target group). The
 // base image has no overlays and is resized to 128px height (aspect kept). badge_name comes from the
 // award flow via vars; the recipient list comes via opts.recipients.
-const BADGE_AWARDED_GROUP_CHAT_ID = 'oc_example_broadcast_group'; // SeeDAO 城邦快报
+const BADGE_AWARDED_GROUP_CHAT_ID = resolveChatTarget('城邦快报') ?? ''; // SeeDAO 城邦快报
 registerEvent({
   eventTypeId: 'badge-awarded-group',
   title: "有一群人得到 {{badge_name}} 徽章！",
@@ -382,7 +384,7 @@ registerEvent({
 // count newly crosses a milestone, to flag that slots are limited. Posted to the SeeDAO 城邦快报 group.
 // All placeholders (event_name, accept_num, remaining = 100-accept_num, event_link) come from the poll via
 // vars; the cap is fixed at 100. Base image has no overlays and is resized to 128px height (aspect kept).
-const CLASS_EVENT_NOTIFY_CHAT_ID = 'oc_example_broadcast_group'; // SeeDAO 城邦快报
+const CLASS_EVENT_NOTIFY_CHAT_ID = resolveChatTarget('城邦快报') ?? ''; // SeeDAO 城邦快报
 registerEvent({
   eventTypeId: 'class-event-notify',
   title: "【剩 {{remaining}} 名额】 {{event_name}}报名达 {{accept_num}} 人",
@@ -407,7 +409,7 @@ registerEvent({
 // the target group). visitor_num is the crossed milestone threshold (e.g. 400 — a round hundred, not the
 // exact live total such as 402), supplied by the poll via vars. Base image has no overlays and is resized
 // to 128px height.
-const VISITOR_NUM_NOTIFY_CHAT_ID = 'oc_example_broadcast_group'; // SeeDAO 城邦快报
+const VISITOR_NUM_NOTIFY_CHAT_ID = resolveChatTarget('城邦快报') ?? ''; // SeeDAO 城邦快报
 registerEvent({
   eventTypeId: 'visitor-num-notify',
   title: 'SeeDAO 访客人数达到 {{visitor_num}} 人',
@@ -435,7 +437,7 @@ registerEvent({
 // from the firing side via vars (a future proposal system, or a one-off fireEvent script — the
 // `agent event` CLI can't pass custom vars). Manual-only for now: no schedule, no @-mention, no reward.
 // Base image has no overlays and is resized to 128px height (aspect kept).
-const CITYHALL_PROPOSAL_VOTED_CHAT_ID = 'oc_example_ops_group'; // SeeDAO 运营小天地
+const CITYHALL_PROPOSAL_VOTED_CHAT_ID = resolveChatTarget('运营小天地') ?? ''; // SeeDAO 运营小天地
 registerEvent({
   eventTypeId: 'cityhall-proposal-voted-notify',
   title: '市政厅成员对 {{proposal_name}} 做出决议',
