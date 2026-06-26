@@ -44,7 +44,7 @@ agent backfill                                把旧 JSONL 采集记录迁移到
 agent backfill-members                        从历史日志补录群成员同步轮次
 agent calendar-events                         列出追踪中的未开始活动及最新报名数
 agent doc-views                               列出最近采集的文档访问记录（访问者 + 最近访问时间）
-agent report daily|monthly [--date YYYY-MM-DD] [--lark-user <open_id>] [--lark-chat <chat_id>]   生成并发送运营数据报告（深色图表 → Telegram，可选飞书私聊/群）
+agent report daily|monthly [--date YYYY-MM-DD] [--lark-user <open_id>] [--lark-chat <chat_id>] [--no-narrative]   生成并发送运营数据报告（深色图表 + 日报 AI 洞察 → Telegram，可选飞书私聊/群；--no-narrative 只发图表）
 agent token-check [--test]                    查看 user token 剩余有效期并按需推送到期提醒
 agent daily-reset [--floor <n>]              立即执行每日 LP 补底
 agent reset-all-pt [--to <n>]                把所有人 LP 重置为同一数值（默认 120；走共享库 shared.db）
@@ -149,10 +149,11 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt   # matplotlib + netwo
 # Linux 另需中文字型：apt-get install -y fonts-noto-cjk
 ```
 
-- **手动**：`agent report daily` / `agent report monthly`（`--date` 补发指定日/月；`--lark-user <open_id>` 飞书私聊预览，格式同群发）。
-- **自动**：监督者每日 **04:55**、每月 1 日 04:55 触发（发 Telegram + 飞书运营小天地）。改了报告代码需重新编译并重启 serve 才生效。
-- **时间口径**：逻辑日 05:00 → 次日 05:00（排在 04:55 是为了在 05:00 翻转前抓完整当日）。
-- 细节见 `workspaces/tudigong/memory/ops-report-playbook.md`。
+- **AI 社区运营洞察**（仅日报）：出图同时，Kimi 把当天采集的聊天 / 文档访问 / 成员 / 活动记录写成一段【社区运营日报】文字（今日概览 / 关键动态 / 运营建议，≤500 字），和图一起发出。**隐私分层**：只摘要公开群与会员群的内容，工作群仅计入指标（消息数、活跃人数），内部讨论不进分析。可用 `--no-narrative` 或环境变量 `OPS_REPORT_NARRATIVE=0` 关闭。
+- **手动**：`agent report daily` / `agent report monthly`（`--date` 补发指定日/月——补发某个逻辑日请用当天中午，如 `--date "2026-06-25 12:00"`，避免 05:00 翻转导致差一天；`--lark-user <open_id>` 飞书私聊预览，`--lark-chat <chat_id>` 发指定群，格式同群发）。
+- **自动**：监督者每日 **04:59**、每月 1 日 04:59 触发（发 Telegram + 飞书运营小天地）。改了报告代码需重新编译并重启 serve 才生效。
+- **时间口径**：逻辑日 05:00 → 次日 05:00（排在 04:59 是为了在 05:00 翻转前抓完整当日）。
+- 细节见 `workspaces/tudigong/memory/ops-report-playbook.md`、群发送目标见 `chat-targets-playbook.md`。
 
 ## 记忆与分群
 
