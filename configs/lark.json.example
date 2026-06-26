@@ -14,6 +14,10 @@
   "knownInternalChats": {
     "工作群": "oc_example_work_group",
     "工作人员": "oc_example_staff_group",
+    "市政厅工作群": "oc_example_cityhall_work_group",
+    "运营小天地": "oc_example_ops_group",
+    "城邦快报": "oc_example_broadcast_group",
+    "围观群": "oc_example_public_group",
     "AgentTasks": "oc_example_agent_tasks",
     "AgentNotify": "oc_example_agent_notify"
   },

@@ -327,6 +327,24 @@ function resolveAlias(lark: LarkFile, alias: string): string {
 }
 
 /**
+ * Resolve a chat alias into a usable chat_id for a send target, or null when it is not configured.
+ * Unlike resolveAlias, this never returns a non-chat string: an unknown alias, an empty value, or a
+ * sanitized `oc_example_*` placeholder all resolve to null, so callers skip delivery cleanly instead
+ * of handing the Feishu API an invalid receive_id. Real ids live in configs/lark.json's
+ * knownInternalChats; a config-load failure (e.g. in tests) also resolves to null.
+ */
+export function resolveChatTarget(alias: string, cfg?: Configs): string | null {
+  try {
+    const lark = (cfg ?? loadConfigs()).lark;
+    const id = lark.knownInternalChats[alias] ?? alias;
+    if (!id || !id.startsWith('oc_') || id.startsWith('oc_example')) return null;
+    return id;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Resolve listen into the actual list of chats to listen on.
  * - "all": call listChats to get all chats (no internal/external filtering), applying exclude (listen to as many as possible, no cherry-picking).
  * - "all-internal": same as above but keep only internal chats with external===false.

@@ -5,7 +5,7 @@ import { RUNTIME_DIR } from './paths.js';
 import { log } from './log.js';
 import * as store from './store.js';
 import { scanCorruptSessions, quarantineSession } from './kimi-session.js';
-import { loadConfigs, listAgents, resolveAgent, loadChatPolicies, type WorkerTarget } from './configs.js';
+import { loadConfigs, listAgents, resolveAgent, resolveChatTarget, loadChatPolicies, type WorkerTarget } from './configs.js';
 import { sendText } from './lark.js';
 import { flushTelegramSync } from './telegram.js';
 import { listScheduledEvents, rollScheduledEvent, type EventSchedule } from './events.js';
@@ -92,44 +92,53 @@ function scheduleDailyPtReset(): void {
   }, msUntilNext);
 }
 
-// SeeDAO 运营小天地 group; scheduled ops reports post here (alongside Telegram).
-const OPS_REPORT_CHAT_ID = 'oc_example_ops_group';
+// SeeDAO 运营小天地 group; scheduled ops reports post here (alongside Telegram). The real chat_id
+// lives in configs/lark.json's knownInternalChats under the "运营小天地" alias; when it is missing the
+// report still goes to Telegram and Feishu delivery is skipped (no invalid-receive_id error).
+function opsReportTargets(): { larkChat?: string } {
+  const chat = resolveChatTarget('运营小天地');
+  if (!chat) {
+    log.warn('运营报告未配置飞书群（configs/lark.json knownInternalChats 缺「运营小天地」别名），本次仅发 Telegram。');
+    return {};
+  }
+  return { larkChat: chat };
+}
 
 /**
- * Schedule the daily ops report at 04:55 local time, just before the 05:00 logical-day rollover,
- * so it captures the logical day that is about to close. Self-reschedules to the next 04:55.
+ * Schedule the daily ops report at 04:59 local time, just before the 05:00 logical-day rollover,
+ * so it captures the logical day that is about to close. Self-reschedules to the next 04:59.
  */
 function scheduleDailyOpsReport(): void {
   const now = new Date();
-  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 4, 55, 0, 0);
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 4, 59, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
   setTimeout(async () => {
     try {
-      // At 04:55 "now" still sits inside the closing logical day, so it resolves to that day.
-      await generateAndSendDailyReport(new Date(), { larkChat: OPS_REPORT_CHAT_ID });
+      // At 04:59 "now" still sits inside the closing logical day, so it resolves to that day.
+      await generateAndSendDailyReport(new Date(), opsReportTargets());
     } catch (e) {
       log.error('每日运营报告生成失败：', (e as Error).message);
     }
-    setTimeout(scheduleDailyOpsReport, 0); // re-anchor to the next 04:55
+    setTimeout(scheduleDailyOpsReport, 0); // re-anchor to the next 04:59
   }, next.getTime() - now.getTime());
 }
 
 /**
- * Schedule the monthly ops report at 04:55 on the 1st of each month, just before the 05:00 logical
- * rollover, so it captures the logical month that is about to close. Self-reschedules to the next 1st 04:55.
+ * Schedule the monthly ops report at 04:59 on the 1st of each month, just before the 05:00 logical
+ * rollover, so it captures the logical month that is about to close. Self-reschedules to the next 1st 04:59.
  */
 function scheduleMonthlyOpsReport(): void {
   const now = new Date();
-  let next = new Date(now.getFullYear(), now.getMonth(), 1, 4, 55, 0, 0);
-  if (next <= now) next = new Date(now.getFullYear(), now.getMonth() + 1, 1, 4, 55, 0, 0);
+  let next = new Date(now.getFullYear(), now.getMonth(), 1, 4, 59, 0, 0);
+  if (next <= now) next = new Date(now.getFullYear(), now.getMonth() + 1, 1, 4, 59, 0, 0);
   setTimeout(async () => {
     try {
-      // At 04:55 on the 1st "now" still sits inside the closing logical month.
-      await generateAndSendMonthlyReport(new Date(), { larkChat: OPS_REPORT_CHAT_ID });
+      // At 04:59 on the 1st "now" still sits inside the closing logical month.
+      await generateAndSendMonthlyReport(new Date(), opsReportTargets());
     } catch (e) {
       log.error('每月运营报告生成失败：', (e as Error).message);
     }
-    setTimeout(scheduleMonthlyOpsReport, 0); // re-anchor to the next month's 1st 04:55
+    setTimeout(scheduleMonthlyOpsReport, 0); // re-anchor to the next month's 1st 04:59
   }, next.getTime() - now.getTime());
 }
 
