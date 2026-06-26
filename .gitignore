@@ -12,6 +12,9 @@ configs/*.json
 # Per-instance memory journals (live community interaction logs — not framework code)
 workspaces/*/memory/journal/*.md
 
+# Generated person-profile deliverables (interview outputs, may contain PII — not framework code)
+workspaces/*/memory/profiles/
+
 # Logs
 logs
 *.log
