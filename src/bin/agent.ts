@@ -1138,9 +1138,11 @@ async function cmd_report(argv: string[]): Promise<void> {
     process.exit(1);
   }
   // Optional Feishu delivery: --lark-user <open_id> for a P2P preview, --lark-chat <chat_id> for a group.
+  // --no-narrative skips the AI community-ops narrative (daily only) for a fast charts-only run.
   const targets = {
     larkUser: getFlag(argv, 'lark-user'),
     larkChat: getFlag(argv, 'lark-chat'),
+    narrative: hasFlag(argv, 'no-narrative') ? false : undefined,
   };
   // Mirror logs to Telegram so this one-shot CLI's activity appears in the log channel.
   enableLogSink();

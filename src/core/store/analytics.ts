@@ -310,6 +310,36 @@ export function docViewReadersBetween(fromSec: number, toSec: number): Map<strin
 }
 
 /**
+ * Return per-document reader digests where last_view_time falls in [fromSec, toSec): each document's
+ * title and its DISTINCT reader count, most-read first. Title-and-count only (no viewer identities)
+ * keeps the daily narrative privacy-safe. Rows are grouped by file_token; the most recent non-empty
+ * title for that token is used. Documents with no resolvable title are dropped.
+ */
+export function docReaderDigestBetween(
+  fromSec: number,
+  toSec: number,
+): Array<{ title: string; readers: number }> {
+  try {
+    const rows = getDb().prepare(`
+      SELECT
+        (SELECT d2.title FROM doc_view_events d2
+          WHERE d2.file_token = d.file_token AND d2.title <> ''
+          ORDER BY d2.last_view_time DESC LIMIT 1) AS title,
+        COUNT(DISTINCT d.viewer_id) AS readers
+      FROM doc_view_events d
+      WHERE d.last_view_time >= ? AND d.last_view_time < ?
+      GROUP BY d.file_token
+      ORDER BY readers DESC
+    `).all(fromSec, toSec) as Array<{ title: string | null; readers: number }>;
+    return rows
+      .map((r) => ({ title: String(r.title ?? ''), readers: Number(r.readers) }))
+      .filter((r) => r.title !== '');
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Return a map of file_token -> distinct viewer open_ids whose last_view_time falls in [fromSec, toSec).
  * Lets callers classify a document's readers (e.g. staff vs non-staff) for the wiki tree coloring.
  */

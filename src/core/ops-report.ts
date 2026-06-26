@@ -33,6 +33,8 @@ import {
   localDateFromEpochSec,
   localDateTimeFromEpochSec,
 } from './time.js';
+import { resolveChatTarget } from './configs.js';
+import { generateOpsNarrative } from './ops-narrative.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, '..', '..');
@@ -48,11 +50,14 @@ const EXCLUDED_EVENT_KEYWORDS = ['市政厅每周二'];
 // Wiki node titles ending with any of these extensions are concrete file attachments, excluded from the tree.
 const EXCLUDED_FILE_EXTENSIONS = ['.png', '.gif', '.jpg', '.jpeg', '.pdf', '.md'];
 
-// Members of these chats count as SeeDAO staff; the wiki tree colors each node by its non-staff reader share.
-const STAFF_CHAT_IDS = [
-  'oc_example_work_group_old', // 市政厅工作群
-  'oc_example_ops_group', // 运营小天地
-];
+// Members of these chats count as SeeDAO staff; the wiki tree colors each node by its non-staff reader
+// share. Resolved from configs/lark.json's knownInternalChats aliases at report time; unconfigured
+// aliases are dropped (no staff coloring for that group rather than an error).
+function staffChatIds(): string[] {
+  return ['市政厅工作群', '运营小天地']
+    .map((alias) => resolveChatTarget(alias))
+    .filter((id): id is string => Boolean(id));
+}
 
 /** True when a wiki node title is a concrete file attachment that should not appear as a tree node. */
 function isExcludedFileTitle(title: string): boolean {
@@ -153,15 +158,16 @@ function resolveRange(period: Period, ref: Date): { from: number; to: number } {
  */
 function resolveStaffOpenIds(): Set<string> {
   const set = new Set<string>();
-  for (const chatId of STAFF_CHAT_IDS) {
+  const chatIds = staffChatIds();
+  for (const chatId of chatIds) {
     try {
       for (const openId of listChatMembers(chatId).keys()) set.add(openId);
     } catch {
       // skip this chat on failure and rely on the remaining chats or the fallback
     }
   }
-  if (set.size === 0) {
-    for (const id of chatMemberOpenIds(STAFF_CHAT_IDS)) set.add(id);
+  if (set.size === 0 && chatIds.length > 0) {
+    for (const id of chatMemberOpenIds(chatIds)) set.add(id);
   }
   return set;
 }
@@ -400,6 +406,38 @@ interface ReportTargets {
   larkChat?: string;
   // Feishu user open_id to post the report to (P2P preview).
   larkUser?: string;
+  // Set false to skip the AI community-ops narrative (CLI --no-narrative); env OPS_REPORT_NARRATIVE=0 also disables.
+  narrative?: boolean;
+}
+
+/** Split long text into Telegram-safe chunks (<= ~3500 chars), preferring paragraph then line breaks. */
+function splitForTelegram(text: string, maxChars = 3500): string[] {
+  if (text.length <= maxChars) return [text];
+  const chunks: string[] = [];
+  let cur = '';
+  for (const para of text.split('\n\n')) {
+    const piece = cur ? `${cur}\n\n${para}` : para;
+    if (piece.length <= maxChars) {
+      cur = piece;
+      continue;
+    }
+    if (cur) {
+      chunks.push(cur);
+      cur = '';
+    }
+    if (para.length <= maxChars) {
+      cur = para;
+      continue;
+    }
+    let rest = para; // a single paragraph longer than the limit — hard-split.
+    while (rest.length > maxChars) {
+      chunks.push(rest.slice(0, maxChars));
+      rest = rest.slice(maxChars);
+    }
+    cur = rest;
+  }
+  if (cur) chunks.push(cur);
+  return chunks;
 }
 
 /** Core report pipeline: gather data, spawn Python renderer, deliver to Telegram and/or Feishu. */
@@ -484,13 +522,27 @@ async function generateAndSendReport(period: Period, ref: Date, targets: ReportT
   const textSummary = buildTextSummary(period, range, memberLine, signupLines, wikiNodes);
   const orderedKeys = ['member', 'signup', 'wiki'];
 
+  // AI community-ops narrative (map-reduce over the day's collected records). Best-effort: any failure
+  // degrades to the mechanical summary so the charts still ship. Disable with OPS_REPORT_NARRATIVE=0 or
+  // targets.narrative === false (CLI --no-narrative). Monthly reports skip it (too coarse for chat digest).
+  let narrative: string | null = null;
+  if (period === 'daily' && targets.narrative !== false && process.env.OPS_REPORT_NARRATIVE !== '0') {
+    try {
+      narrative = await generateOpsNarrative(range, { dateLabel });
+      if (narrative) log.info('运营报告洞察生成完成');
+    } catch (e) {
+      log.error('运营报告洞察生成失败：', (e as Error).message);
+    }
+  }
+  const deliveryBody = narrative ? `${narrative}\n\n【数据摘要】\n${textSummary}` : textSummary;
+
   // Optional Feishu delivery (group chat or P2P preview), independent of Telegram.
   if (targets.larkChat || targets.larkUser) {
     try {
       sendReportToLark(
         { chatId: targets.larkChat, userId: targets.larkUser },
         `SeeDAO ${label}运营数据 · ${dateLabel}`,
-        textSummary,
+        deliveryBody,
         orderedKeys.map((k) => pngs[k]).filter((p): p is string => Boolean(p)),
       );
       log.info('运营报告已发送到飞书');
@@ -521,10 +573,12 @@ async function generateAndSendReport(period: Period, ref: Date, targets: ReportT
     }
   }
 
-  try {
-    await sendTelegramMessage(textSummary);
-  } catch (e) {
-    log.error('发送文字摘要失败：', (e as Error).message);
+  for (const chunk of splitForTelegram(deliveryBody)) {
+    try {
+      await sendTelegramMessage(chunk);
+    } catch (e) {
+      log.error('发送文字摘要失败：', (e as Error).message);
+    }
   }
 
   log.info('运营报告发送完成');

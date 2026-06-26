@@ -177,6 +177,47 @@ export function getRecentChatMessages(
 }
 
 /**
+ * Return every non-deleted message whose create_time falls in the half-open window [fromSec, toSec),
+ * oldest→newest. Powers the daily ops-report narrative: callers group by chat_id and classify each
+ * chat's tier (getChatTier) to decide which content may be summarized.
+ *
+ * Args are Unix SECONDS (matching the other *Between queries), but messages.create_time is stored in
+ * MILLISECONDS (Feishu's unit, via larkTimeToMs), so the window is converted to ms for the comparison.
+ */
+export function messagesBetween(fromSec: number, toSec: number): MessageRow[] {
+  const fromMs = Math.trunc(fromSec) * 1000;
+  const toMs = Math.trunc(toSec) * 1000;
+  const rows = getDb().prepare(
+    `SELECT * FROM messages
+       WHERE create_time >= ? AND create_time < ? AND deleted = 0
+       ORDER BY create_time ASC`
+  ).all(fromMs, toMs) as Record<string, unknown>[];
+  return rows.map(rowToMessage);
+}
+
+/** Lightweight chat metadata (display name + external flag) for labeling/grouping in reports. */
+export interface ChatMeta {
+  chatId: string;
+  name: string;
+  external: boolean;
+  chatMode?: string;
+}
+
+/** Look up a chat's display name and external flag from the chats table; null when unknown. */
+export function getChatMeta(chatId: string): ChatMeta | null {
+  const row = getDb()
+    .prepare('SELECT chat_id, name, external, chat_mode FROM chats WHERE chat_id = ?')
+    .get(chatId) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return {
+    chatId: row['chat_id'] as string,
+    name: (row['name'] as string) ?? '',
+    external: Boolean(row['external']),
+    chatMode: (row['chat_mode'] as string | null) ?? undefined,
+  };
+}
+
+/**
  * Retrieve messages sent by a specific user, ordered by most recent first.
  * An optional sinceUnix timestamp (Unix seconds) filters to messages at or after that time.
  */
