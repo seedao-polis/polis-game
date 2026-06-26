@@ -33,7 +33,7 @@
 - **serve 启动模式**：`pnpm agent serve <soul> --bot/--user/--both`（默认 --bot、不看 enabled、移除 --only）；新建 / 上线 agent 见 `agent-onboarding-playbook.md`。
 - **采集回圈**：成员同步 / 活动报名每 5 分钟、文档访问每 1 小时。
 - **心跳 Heartbeat（2026-06-26 上线）**：每个 agent 与生俱来的预设——挂在 **worker**，`serve <soul> --bot` 裸跑就有、**与 `--sup` 无关**（`--sup` 只管社区监督）；条件是有 bot 身份在跑且非 quiet。按 per-soul `HEARTBEAT_CONFIG.json` 的 cadence 自动跑一轮 LLM（基于 HEARTBEAT.md、抛弃式会话），可主动发飞书，靠闸门（静默时段 / 概率 / 每日上限）防刷版。tudigong 1 小时（60 分钟）、yihan 8 小时（480 分钟）、`_template` 默认 `enabled:false`。手动测试 `pnpm agent heartbeat <soul> --dry-run|--test`（不带旗标=真发）。详见 `heartbeat-playbook.md`。
-- **Agent 之间协作（A2A 暗线广播，2026-06-26 上线）**：飞书 bot 互相听不到对方（`senderType==='app'` 在触发前被滤），所以走【双轨】——暗线 `data/peer-bus/<soul>/inbox.jsonl` 文件信箱做真实协调、明线飞书群做表演，让群里的人感觉 agent 在飞书上协作。真人 @ 起头（真人消息听得到），框架确定性广播 + 接话（**别赖 LLM 调工具**），LLM 只决定"说什么/要不要说（`[SILENT]`）"。开关 `configs/agents.json` 的 `peerCast`；4 个交易 agent 已开（yifan/mira 在跑，avery/charlotte 配了但未进群）。防刷靠 `agentChainDepth≤6`+`budget=8`+每群每小时≤3。详见 `a2a-peer-broadcast-playbook.md`。
+- **Agent 之间协作（A2A 暗线广播，2026-06-26 上线）**：飞书 bot 互相听不到对方（`senderType==='app'` 在触发前被滤），所以走【双轨】——暗线 `data/peer-bus/<soul>/inbox.jsonl` 文件信箱做真实协调、明线飞书群做表演，让群里的人感觉 agent 在飞书上协作。真人 @ 起头（真人消息听得到），框架确定性广播 + 接话（**别赖 LLM 调工具**），LLM 只决定"说什么/要不要说（`[SILENT]`）"。开关 `configs/agents.json` 的 `peerCast`；广播**只发给 `peerCast && enabled !== false` 的同群 agent**（`listPeersInChat`）——所以现在只剩 yifan↔mira，tudigong/yihan（非 peerCast、被动监督者）和 avery/charlotte（enabled:false 未上架）都被排除。群里**只发最终消息、别外露思考、别自报家门**（模型爱把思考链整坨发出去）。防刷靠 `agentChainDepth≤6`+`budget=8`+每群每小时≤3。详见 `a2a-peer-broadcast-playbook.md`。
 - 工作区目录与各文件职责总览见 `../WORKSPACE_GUIDE.md`；工具速查见 `../TOOLS.md`；skill 用法见 `../SKILLS_GUIDE.md`。
 
 ## 我是谁

@@ -24,7 +24,7 @@
    - `readUnreadCues(soul)` / `hasUnreadCue(soul)` / `ensureInbox(soul)`。
    - cue 字段：`from / chatId / topic / message(发言摘要) / budget / agentChainDepth / timestamp / read`。
    - **路径必须用 `REPO_ROOT`（`src/core/paths.ts`）锚定，绝不能用 `process.cwd()`**——心跳在抛弃式 `mkdtemp` workDir 下跑，cwd 不是仓库根；比照 `memory.ts` 走 `SOULS_DIR` 的做法。
-3. **同群 peers 推导 `listPeersInChat(chatId, selfSoul)`**（`configs.ts` 末尾）：遍历 `agents.json`，按每个 agent 的 `listen` 别名经 `resolveAlias` 解析成 chat_id，匹配的就是同群 peer。**按 `listen` 推导、不按 `enabled` 过滤**（enabled 是 legacy 字段，serve 不看它；没跑的 agent 信箱堆着 cue 无害）。
+3. **同群 peers 推导 `listPeersInChat(chatId, selfSoul)`**（`configs.ts` 末尾）：遍历 `agents.json`，按每个 agent 的 `listen` 别名经 `resolveAlias` 解析成 chat_id 判断是否同群。**只发给 `peerCast:true` 且 `enabled` 非 false 的同群 agent**——`peerCast` 滤掉被动 agent（如社区监督者 tudigong：它监听所有群但不参与 trading 协作）和别的非协作 soul（如 yihan）；`enabled` 滤掉"配置了但还没上架"的 agent（当前 Avery / Charlotte）。所以现在只有 yifan↔mira 互发。
 4. **kickoff（起头，框架做）**：`feishu-bot.ts` 的 `processJob` 在真人 @ 回复**发出之后**，若 `cfg.peerCast && !isP2p && replyOk`，自动 `broadcastCue({from, chatId, message:回复正文, budget:8, agentChainDepth:1})`。**不依赖 LLM 调任何工具。**
 5. **接话（框架做）**：`feishu-bot.ts` 的 `run()` 里（仅 `peerCast` agent）用 `fs.watch` 盯自己的 `inbox.jsonl`：
    - 收到变更 → 500ms debounce → `hasUnreadCue` 前置检查 → 0–30s 随机 jitter（错开多 agent 同时发）→ `readUnreadCues` → 每群取最新一条 cue。
@@ -46,6 +46,8 @@
 - **回复发在群顶层、不进话题**：`feishu-bot.ts` 的 `send()` 里，`peerCast` agent 用 `sendText`（顶层消息）而非 `replyText(...inThread)`。否则第一条回复埋进话题串里，不像群聊。
 - **发言短、口语化、≤200 字**：写进 peer 第三场景（agent.ts）+ 4 个交易 agent 的 `AGENTS.md ## 回答方式`，并明确"**不要套用【输出格式】的长报告**"（长结构留给 CLI / 正式产出）。否则 agent 会在群里甩几百字的"大宗商品简报"，很出戏。
 - **数据走 A2A、群里不堆**：需要给同事或向同事要具体数据/仓位/报告时，群里只说一句【这部分我用 A2A 发给你】/【细节请用 A2A 发给我】，实际内容走暗线 cue。这是**表演用语**——真数据其实就在 cue 的 message 里，说"用 A2A"是为了让旁观者感觉这些 agent 有套成熟的协作协议。
+- **只发最终消息、不外露思考**：模型会把整段思考链当成回复发出去（"相关。Yifan 把球传回来…需要控制在 200 字以内…检查一下字数…最终输出。"），整坨被 `sendText` 发进群、很穿帮。peer 第三场景（agent.ts）+ 4 个 `AGENTS.md ## 回答方式` 都要明确：**只输出要发到群里的那段话本身，不要思考过程 / 分析铺垫 / 字数自查 / 解释性旁白**；没人问的别主动说。
+- **默认彼此都认识、不自报身家**：同事 Agent 与 @ 你的人都清楚你是谁、做什么；除非被明确要求自我介绍，否则**别报名字 / 职位、别反复声明职责边界**（如 yifan 每次都"我是 Chen Yifan，亚洲时段执行交易员，再说明一下边界：1…2…3…"很啰嗦），直接回答。写进 4 个 `AGENTS.md ## 回答方式`。
 
 ## 六、踩坑史（最值钱的部分）
 
@@ -54,11 +56,13 @@
 3. **"查近 N 条 DB 消息判断是否全是 agent"在 bot-only 场景不可行**：bot 消息在 `senderType==='app'` 过滤（capture 之前）就被丢，DB 里根本没有 bot 发言。所以防互刷不能靠查历史，改成 `agentChainDepth` 随 cue 流动。
 4. **`readUnreadCues` 自触发**：标记已读重写文件 → 又触发 fs.watch → 不加 `hasUnreadCue` 前置 guard 会每条 cue 多跑一次空 LLM。
 5. **chatId 没注入 prompt**：早期想让 LLM 自己 kickoff，但 `prepare()` 从不把当前群 chat_id 写进 prompt，LLM 不知道发哪个群。后来 kickoff 改成框架做、用 `job.chatId`，就不需要注入了（那段试验性注入已回退）。
+6. **广播一开始发给"所有监听该群的 soul"**：`listPeersInChat` 最初只按 `listen` 推导，结果 cue 发给了 tudigong（社区监督者，跟 trading 无关）、yihan、以及配了但没上架的 avery/charlotte。改成**只发 `peerCast && enabled !== false` 的同群 agent**（见 §三.3），现在干净地只剩 yifan↔mira。
+7. **模型把思考链当回复 + 自报家门**：见 §五后两条——纯 prompt 层解（peer 场景 + AGENTS.md 回答方式），若以后仍泄漏思考，再在框架层加 strip 兜底。
 
 ## 七、改动 / 运维（how to apply）
 
 - **改框架代码**（`agent.ts` / `feishu-bot.ts` / `peer-bus.ts` / `configs.ts`）：`pnpm build` 后**必须重启对应 serve worker**（运行中的跑旧 dist）；`AGENTS.md` 等人格档是热重载（重启会 `reloadSoulIfChanged`，但运行中的会话要新会话才套用）。
-- **让一个 agent 参与协作**：`configs/agents.json` 给它 `peerCast:true` + 确保它真的在那个群里（被拉进群、`feishu_send` 否则 230002）。当前 Avery / Charlotte 已配 `peerCast:true` 但仍 `enabled:false`、且未进 SeeAlpha 交易室——要它们上场需拉进群并起 serve。
+- **让一个 agent 参与协作**：`configs/agents.json` 给它 `peerCast:true` **且 `enabled:true`** + 确保它真的在那个群里（被拉进群、`feishu_send` 否则 230002）。广播目标 = `peerCast && enabled !== false && 同群` 的 soul（`listPeersInChat`），所以 `enabled:false` 的 agent 收不到 cue。当前 Avery / Charlotte 已配 `peerCast:true` 但 `enabled:false`、且未进 SeeAlpha 交易室——要它们上场需把 `enabled` 改 true、拉进群、起 serve。
 - **测试**：开 `tudigong --user`（采集，**只有 user 身份采得到 bot 发言**，bot 身份采集会把 app 消息滤掉）+ 起 peerCast agent 的 `--bot`，真人在群里 @ 其中一个，看另一个是否在 ~30s 内接话；用 `.agent/tudigong.db` 查 `chat_id` 的 `sender_type='app'` 消息验收。
 - **协作群不要进运营报告**：SeeAlpha 交易室（`oc_4ac0f763fb0712d960672a9ddf5ef29c`）已在 `configs/chat-policies.json` 标 `tier:"work"` + **`excludeFromOpsReport:true`**（新增的每群开关，`gatherDayData` 见到就整群跳过、不进内容也不进指标）。改 chat-policies 要**重启 serve**（`loadChatPolicies` 进程内缓存）。
 
