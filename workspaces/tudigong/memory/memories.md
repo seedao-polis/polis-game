@@ -20,6 +20,7 @@
 | 徽章导入 / 发放 / 查询 | `badge-system-playbook.md` |
 | 社区推播里程碑事件（人数 / 报名 / 徽章公告） | `community-notify-events-playbook.md` |
 | 运营数据日报 / 月报（深色图表） | `ops-report-playbook.md` |
+| 心跳 Heartbeat（按节奏自动跑一轮、主动发飞书、闸门防刷版） | `heartbeat-playbook.md` |
 | 多人多群记忆隔离、群组三级分类 | `memory-access-playbook.md` |
 | 运维日志镜像、到期提醒 | `telegram-playbook.md` |
 
@@ -30,6 +31,7 @@
 - **LP 经济**：初始 120、每条对话回复扣 0.1、每日 05:00 补底到 10。**LP 现在是全局共享库 `.agent/shared.db`、跨 agent 共用（2026-06-25）**，详见 `pt-gamification-playbook.md §9`。**LP 变动可按交流内容动态判定（per-soul `LP_STRATEGY.json`：一涵分访谈中/画重点/无关，tudigong 停用、维持固定扣分），详见 `pt-gamification-playbook.md §10`。**
 - **serve 启动模式**：`pnpm agent serve <soul> --bot/--user/--both`（默认 --bot、不看 enabled、移除 --only）；新建 / 上线 agent 见 `agent-onboarding-playbook.md`。
 - **采集回圈**：成员同步 / 活动报名每 5 分钟、文档访问每 1 小时。
+- **心跳 Heartbeat（2026-06-26 上线）**：每个 agent 与生俱来的预设——挂在 **worker**，`serve <soul> --bot` 裸跑就有、**与 `--sup` 无关**（`--sup` 只管社区监督）；条件是有 bot 身份在跑且非 quiet。按 per-soul `HEARTBEAT_CONFIG.json` 的 cadence 自动跑一轮 LLM（基于 HEARTBEAT.md、抛弃式会话），可主动发飞书，靠闸门（静默时段 / 概率 / 每日上限）防刷版。tudigong 1 小时（60 分钟）、yihan 8 小时（480 分钟）、`_template` 默认 `enabled:false`。手动测试 `pnpm agent heartbeat <soul> --dry-run|--test`（不带旗标=真发）。详见 `heartbeat-playbook.md`。
 - 工作区目录与各文件职责总览见 `../WORKSPACE_GUIDE.md`；工具速查见 `../TOOLS.md`；skill 用法见 `../SKILLS_GUIDE.md`。
 
 ## 我是谁
