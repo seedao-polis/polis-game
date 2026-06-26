@@ -17,6 +17,15 @@ import * as store from '../core/store.js';
 import { append as appendTranscript } from '../core/transcript.js';
 import { checkAndFireTriggers } from '../core/events.js';
 import { loadLpStrategy, judgeReply } from '../core/lp-strategy.js';
+import fs from 'node:fs';
+import {
+  ensureInbox,
+  hasUnreadCue,
+  readUnreadCues,
+  broadcastCue,
+  MAX_AGENT_CHAIN_DEPTH,
+  DEFAULT_CHAIN_BUDGET,
+} from '../core/peer-bus.js';
 
 // After a restart, only respond to messages sent after the startup time; allow some slack for clock skew to avoid replying to historical messages on restart.
 const STARTUP_GRACE_MS = 5000;
@@ -158,6 +167,9 @@ export class FeishuBotChannel implements Channel {
         // Bot identity already shows the agent's display name in Feishu, so a reply needs no name prefix
         // (replyPrefix is for the user channel, where messages appear under the operator's own account).
         if (isP2p) sendText({ chatId }, reply, { as: 'bot', profile });
+        // peerCast agents post group replies at the top level (not inside the @-message thread) so the
+        // cross-agent exchange reads as a normal group chat rather than a buried topic thread.
+        else if (cfg.peerCast) sendText({ chatId }, reply, { as: 'bot', profile });
         else if (messageId) replyText(messageId, reply, { as: 'bot', profile, inThread: true });
         else sendText({ chatId }, reply, { as: 'bot', profile });
         const { body, footer } = store.splitStatusFooter(reply);
@@ -186,6 +198,7 @@ export class FeishuBotChannel implements Channel {
       }
 
       let reply = '';
+      let replyOk = false; // genuine LLM reply (not an LP-insufficient / error fallback)
       if (job.senderOpenId) {
         // LP gating: deduct before calling the LLM; refund on error; show balance in footer on success.
         const strategy = loadLpStrategy(cfg.soul);
@@ -216,6 +229,7 @@ export class FeishuBotChannel implements Channel {
             }
             const netDelta = category.grant - cost;
             reply = store.stripStatusFooter(judged) + store.buildStatusFooter(job.senderOpenId, netDelta, category.footerLabel || undefined);
+            replyOk = true;
 
             // Fire-and-forget rolling user memory summary every SUMMARY_INTERVAL successful replies.
             // Never awaited — must not block the serial pump or delay the Feishu reply.
@@ -234,12 +248,29 @@ export class FeishuBotChannel implements Channel {
       } else {
         try {
           reply = await agent.respondAsync({ message: job.text, context: job.context, session: job.sessionKey, chatId: job.chatId, source: channelName });
+          replyOk = true;
         } catch (e) {
           log.error('agent 回复失败（已回退通用回复）：', (e as Error).message);
           reply = '（抱歉，我这边出错了，请稍后再试。）';
         }
       }
       send(job.messageId, job.chatId, reply, job.isP2p);
+      // Peer kickoff: after a genuine group reply, broadcast a cue so same-chat colleague agents can
+      // opt into the conversation. Deterministic (not LLM-driven) so collaboration reliably appears.
+      if (replyOk && cfg.peerCast && !job.isP2p) {
+        const body = store.splitStatusFooter(reply).body.trim();
+        if (body) {
+          const peers = broadcastCue({
+            from: cfg.soul,
+            chatId: job.chatId,
+            topic: job.text.slice(0, 60),
+            message: body.slice(0, 200),
+            budget: DEFAULT_CHAIN_BUDGET,
+            agentChainDepth: 1, // human-initiated chain starts at depth 1
+          });
+          if (peers.length) log.info(`peer kickoff 广播给：${peers.join('、')}`);
+        }
+      }
     };
 
     const pump = async (): Promise<void> => {
@@ -484,7 +515,106 @@ export class FeishuBotChannel implements Channel {
     // Re-run any replies a previous restart interrupted (clear orphaned reactions, refund LP, retry).
     recover();
 
+    // ── Peer-bus inbox watcher (cross-agent group collaboration) ──────────
+    // When a same-chat colleague broadcasts a cue into this soul's inbox, fs.watch fires. After a
+    // debounce + random jitter (so peers don't post in unison), the framework reads the cue, asks the
+    // LLM only to decide "say something or stay silent", then deterministically posts the reply and
+    // relays the chain onward. Posting/relay live in the framework (not the LLM) so the collaboration
+    // reliably appears in the group. Only peerCast agents take part.
+    let peerWatcher: fs.FSWatcher | null = null;
+    if (cfg.peerCast) {
+      const peerInboxFile = ensureInbox(cfg.soul);
+
+      // Per-chat hourly cap on auto-replies: an anti-flood backstop independent of the LLM.
+      const peerReplyCounts = new Map<string, { hour: number; count: number }>();
+      const PEER_MAX_REPLIES_PER_HOUR = 3;
+      const peerRateOk = (chatId: string): boolean => {
+        const hour = Math.floor(Date.now() / 3_600_000);
+        const e = peerReplyCounts.get(chatId);
+        return !e || e.hour !== hour || e.count < PEER_MAX_REPLIES_PER_HOUR;
+      };
+      const bumpPeerRate = (chatId: string): void => {
+        const hour = Math.floor(Date.now() / 3_600_000);
+        const e = peerReplyCounts.get(chatId);
+        if (!e || e.hour !== hour) peerReplyCounts.set(chatId, { hour, count: 1 });
+        else e.count += 1;
+      };
+
+      let peerDebounce: ReturnType<typeof setTimeout> | null = null;
+      peerWatcher = fs.watch(peerInboxFile, (event) => {
+        if (event !== 'change') return;
+        if (peerDebounce) return; // collapse the burst of events from a single append
+        peerDebounce = setTimeout(async () => {
+          peerDebounce = null;
+          if (quiet) return; // muted: never post
+
+          // Cheap guard: reading cues marks them read by rewriting the file, which itself fires a
+          // 'change' event; skip when nothing is unread so the self-induced rewrite is a no-op.
+          if (!hasUnreadCue(cfg.soul)) return;
+
+          const cues = readUnreadCues(cfg.soul);
+          // Collapse to the latest cue per chat — a burst in one chat needs only one reply.
+          const latestByChat = new Map<string, (typeof cues)[number]>();
+          for (const c of cues) latestByChat.set(c.chatId, c);
+
+          for (const cue of latestByChat.values()) {
+            // Anti-loop: a chain too deep (no human rejoined) or out of budget winds down.
+            if (cue.agentChainDepth >= MAX_AGENT_CHAIN_DEPTH || cue.budget <= 0) continue;
+            if (!peerRateOk(cue.chatId)) { log.info(`peer 接话已达本群每小时上限，跳过（${cue.chatId}）`); continue; }
+
+            // Jitter (0–30 s) so peers reacting to the same cue don't post in the same instant.
+            await new Promise<void>((r) => setTimeout(r, Math.floor(Math.random() * 30_000)));
+
+            let reply = '';
+            try {
+              reply = await agent.respondAsync({
+                message:
+                  `【同群同事广播】${cue.from} 刚在本群说：\n${cue.message}\n\n` +
+                  `（话题：${cue.topic}）请判断这段讨论是否和你的角色相关：` +
+                  `相关就直接输出你要在群里说的话；不相关就只输出 [SILENT]，不要输出其它内容。`,
+                source: 'peer',
+                // Fresh session per turn: peer turns may overlap (a new cue can arrive during the
+                // jitter wait), and the cue already carries the context, so no shared session is needed.
+                session: `${cfg.id}-peer-${cue.chatId}-${Date.now()}`,
+              });
+            } catch (e) {
+              log.error(`peer 接话失败【${cfg.soul}】：${(e as Error).message}`);
+              continue;
+            }
+
+            const body = store.stripStatusFooter(reply).trim();
+            if (!body || body.includes('[SILENT]')) { log.info(`peer 评估后沉默（话题：${cue.topic}）`); continue; }
+
+            try {
+              sendText({ chatId: cue.chatId }, body, { as: 'bot', profile });
+              log.info(`peer 接话已发送（${cue.chatId}）：${preview(body)}`);
+            } catch (e) {
+              log.error(`peer 发送失败：${(e as Error).message}`);
+              continue;
+            }
+            bumpPeerRate(cue.chatId);
+
+            // Relay the chain onward (deeper, less budget) so other peers may join in turn.
+            const nextDepth = cue.agentChainDepth + 1;
+            const nextBudget = cue.budget - 1;
+            if (nextDepth < MAX_AGENT_CHAIN_DEPTH && nextBudget > 0) {
+              const peers = broadcastCue({
+                from: cfg.soul,
+                chatId: cue.chatId,
+                topic: cue.topic,
+                message: body.slice(0, 200),
+                budget: nextBudget,
+                agentChainDepth: nextDepth,
+              });
+              if (peers.length) log.info(`peer 续播给：${peers.join('、')}（depth ${nextDepth}, budget ${nextBudget}）`);
+            }
+          }
+        }, 500); // debounce window
+      });
+    }
+
     const stop = (): void => {
+      peerWatcher?.close();
       consumer.stop();
       log.info('已退出。');
       flushTelegramSync(); // best-effort: drain buffered logs to Telegram before exiting

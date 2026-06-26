@@ -171,3 +171,6 @@ __pycache__/
 
 # operational-report scratch output (auto-cleaned)
 .ops-report-*
+
+# Peer-bus inbox (runtime state, may contain conversation summaries)
+data/peer-bus/

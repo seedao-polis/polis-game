@@ -4,6 +4,17 @@ import { z } from 'zod';
 import { remember, searchMemories } from '../core/memory.js';
 import { sendText } from '../core/lark.js';
 import * as store from '../core/store.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { REPO_ROOT } from '../core/paths.js';
+import { listPeersInChat } from '../core/configs.js';
+
+const PEER_BUS_DIR = path.join(REPO_ROOT, 'data', 'peer-bus');
+
+// In-process rate limiter: prevent a single soul from flooding a chat.
+const _chatBroadcastCounts = new Map<string, { hour: number; count: number }>();
+// Max broadcasts per soul per chat within one hour.
+const MAX_BROADCASTS_PER_HOUR_PER_CHAT = 3;
 
 // ── Built-in framework tools (exposed via an MCP stdio server for kimi-cli to call) ─────
 // Note: stdout is the JSON-RPC channel, so any logging must go through stderr.
@@ -152,6 +163,119 @@ server.registerTool(
       return `[${r.chatId}] ${r.senderName || r.senderOpenId}: ${snippet}`;
     });
     return textResult(lines.join('\n'));
+  }
+);
+
+server.registerTool(
+  'peer_list',
+  {
+    title: '查询同群的其他 Agent',
+    description: '列出正在监听同一个飞书群的所有其他 Agent soul 名称（用于广播前确认）。',
+    inputSchema: {
+      chatId: z.string().describe('飞书群 chat_id（oc_xxx）'),
+    },
+  },
+  async ({ chatId }) => {
+    const peers = listPeersInChat(chatId, SOUL);
+    return textResult(peers.length
+      ? `同群 Agent：${peers.join('、')}`
+      : '（该群无其他 Agent）');
+  }
+);
+
+server.registerTool(
+  'peer_recv',
+  {
+    title: '读取暗线信箱',
+    description:
+      '读取本 Agent 信箱里未读的同事广播 cue。' +
+      '读完后标记为已读。budget ≤ 0 或 agentChainDepth 过大时不应再广播。',
+    inputSchema: {
+      limit: z.number().int().optional().describe('最多读取条数，默认全部'),
+    },
+  },
+  async ({ limit }) => {
+    const inboxFile = path.join(PEER_BUS_DIR, SOUL, 'inbox.jsonl');
+    if (!fs.existsSync(inboxFile)) return textResult('（信箱为空）');
+    const lines = fs.readFileSync(inboxFile, 'utf8').split('\n').filter(Boolean);
+    const unread = lines
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+      .filter((e) => e && !e.read);
+    const batch = limit != null ? unread.slice(0, limit) : unread;
+    if (batch.length === 0) return textResult('（没有未读 cue）');
+    // Mark all entries as read
+    const updated = lines.map((l) => {
+      try { const e = JSON.parse(l); e.read = true; return JSON.stringify(e); }
+      catch { return l; }
+    });
+    fs.writeFileSync(inboxFile, updated.join('\n') + '\n', 'utf8');
+    const summary = batch.map((e: Record<string, unknown>) =>
+      `[来自 ${e.from}] 群：${e.chatId} | 话题：${e.topic} | 预算 ${e.budget} | 链深度 ${e.agentChainDepth ?? 1}\n${e.message}`
+    ).join('\n---\n');
+    return textResult(summary);
+  }
+);
+
+server.registerTool(
+  'peer_broadcast',
+  {
+    title: '广播暗线 cue 给同群所有同事 Agent',
+    description:
+      '把刚在飞书的发言摘要广播给同一群里所有其他 Agent 的信箱，' +
+      '让他们可以选择 opt-in 接话。budget 递减到 0 后自动停止广播；' +
+      'agentChainDepth 记录链深度（真人触发=1，peer 触发递增），达阈值时接收方自动降低接话概率。',
+    inputSchema: {
+      chatId: z.string().describe('我刚发言的飞书群 chat_id（oc_xxx）'),
+      topic: z.string().optional().describe('本次讨论话题名（助接收方评估相关性）'),
+      message: z.string().describe('我在飞书说了什么（摘要，≤150 字）'),
+      budget: z.number().int().optional().describe('剩余对话预算（默认 8；接收方回复后应 -1 再广播）'),
+      agentChainDepth: z.number().int().optional().describe('链深度（真人触发=1；peer 触发时传上游 depth+1；≥6 时接收方停止广播）'),
+    },
+  },
+  async ({ chatId, topic, message, budget, agentChainDepth }) => {
+    const effectiveBudget = budget ?? 8;
+    const effectiveDepth = agentChainDepth ?? 1;
+
+    // Budget-exhausted gate
+    if (effectiveBudget <= 0) {
+      return textResult('（budget 已耗尽，停止广播）');
+    }
+
+    // Per-chat hourly rate limit
+    const hourKey = `${SOUL}-${chatId}-${Math.floor(Date.now() / 3_600_000)}`;
+    const current = _chatBroadcastCounts.get(hourKey)?.count ?? 0;
+    if (current >= MAX_BROADCASTS_PER_HOUR_PER_CHAT) {
+      return textResult(`（已达本群每小时广播上限 ${MAX_BROADCASTS_PER_HOUR_PER_CHAT} 次，跳过）`);
+    }
+    _chatBroadcastCounts.set(hourKey, {
+      hour: Math.floor(Date.now() / 3_600_000),
+      count: current + 1,
+    });
+
+    const peers = listPeersInChat(chatId, SOUL);
+    if (peers.length === 0) return textResult('（该群无其他 Agent，无需广播）');
+
+    const entry = JSON.stringify({
+      from: SOUL,
+      chatId,
+      topic: topic ?? '未指定',
+      message,
+      budget: effectiveBudget,
+      agentChainDepth: effectiveDepth,
+      timestamp: new Date().toISOString(),
+      read: false,
+    });
+
+    let sent = 0;
+    for (const peer of peers) {
+      const dir = path.join(PEER_BUS_DIR, peer);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.appendFileSync(path.join(dir, 'inbox.jsonl'), entry + '\n', 'utf8');
+      sent++;
+    }
+    return textResult(
+      `已广播给 ${sent} 位同事：${peers.join('、')} | budget 剩余 ${effectiveBudget} | 链深度 ${effectiveDepth}`
+    );
   }
 );
 

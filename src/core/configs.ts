@@ -61,6 +61,10 @@ export interface RawAgentConfig {
   /** When true, the channel only collects/syncs (roster, doc-view, RSVP, message capture) and never
    *  replies. Lets the user-token data collection run without ever answering on the operator's behalf. */
   collectOnly?: boolean;
+  /** When true, this agent participates in cross-agent group collaboration: after replying in a group
+   *  it broadcasts a cue to same-chat peers, and it auto-evaluates incoming peer cues to opt into the
+   *  conversation. Off by default so non-collaborating agents are unaffected. */
+  peerCast?: boolean;
 }
 
 export interface AgentsFile {
@@ -273,6 +277,8 @@ export interface ResolvedAgent {
   /** When true, the channel only collects/syncs and never replies (user-token data collection without
    *  operator-impersonation replies). */
   collectOnly: boolean;
+  /** When true, the agent broadcasts to and opts into same-chat peer collaboration. */
+  peerCast: boolean;
 }
 
 /**
@@ -474,5 +480,33 @@ export function resolveAgent(agentId: string, cfg?: Configs): ResolvedAgent {
     notifyChatId,
     interactExternal: raw.interactExternal ?? false,
     collectOnly: raw.collectOnly ?? false,
+    peerCast: raw.peerCast ?? false,
   };
+}
+
+/**
+ * List every soul (other than selfSoul) that listens to a given chat_id.
+ * Used by peer_broadcast to know which peers to write cues to.
+ * Handles 'all' / 'all-internal' (treat as "listen to every chat") and
+ * string[] (alias array resolved via resolveAlias).
+ */
+export function listPeersInChat(chatId: string, selfSoul: string, cfg?: Configs): string[] {
+  const c = cfg ?? loadConfigs();
+  const seen = new Set<string>();
+  const peers: string[] = [];
+  for (const raw of Object.values(c.agents.agents)) {
+    if (raw.soul === selfSoul) continue;
+    if (seen.has(raw.soul)) continue;
+    if (raw.listen === 'all' || raw.listen === 'all-internal') {
+      peers.push(raw.soul);
+      seen.add(raw.soul);
+      continue;
+    }
+    const resolvedIds = raw.listen.map((alias) => resolveAlias(c.lark, alias));
+    if (resolvedIds.includes(chatId)) {
+      peers.push(raw.soul);
+      seen.add(raw.soul);
+    }
+  }
+  return peers;
 }
