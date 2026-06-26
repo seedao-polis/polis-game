@@ -7,7 +7,7 @@ import { readFileSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
-import { getChatTier, loadConfigs, type ChatTier, type KimiProfile } from './configs.js';
+import { getChatTier, getChatPolicy, loadConfigs, type ChatTier, type KimiProfile } from './configs.js';
 import {
   messagesBetween,
   getChatMeta,
@@ -98,6 +98,9 @@ export interface GatherOptions {
   maxLinesPerChat?: number;
   /** Tier resolver (injectable for tests); defaults to the chat-policies classification. */
   tierOf?: (chatId: string) => ChatTier;
+  /** Predicate for chats omitted entirely from the report (injectable for tests); defaults to the
+   *  chat-policies excludeFromOpsReport flag. */
+  excludeChat?: (chatId: string) => boolean;
 }
 
 /**
@@ -109,6 +112,7 @@ export function gatherDayData(range: { from: number; to: number }, opts: GatherO
   const contentTiers = opts.contentTiers ?? DEFAULT_CONTENT_TIERS;
   const maxLines = opts.maxLinesPerChat ?? 400;
   const tierOf = opts.tierOf ?? getChatTier;
+  const excludeChat = opts.excludeChat ?? ((id: string) => getChatPolicy(id)?.excludeFromOpsReport === true);
   const bots = botOpenIds();
 
   // ── chats (from messages) ──
@@ -122,6 +126,7 @@ export function gatherDayData(range: { from: number; to: number }, opts: GatherO
   const chats: ChatDayDigest[] = [];
   let totalMessages = 0;
   for (const [chatId, rows] of byChat) {
+    if (excludeChat(chatId)) continue; // omit configured chats (e.g. agent-collaboration rooms) from the report entirely
     const meta = getChatMeta(chatId);
     const tier = tierOf(chatId);
     const includeContent = contentTiers.includes(tier);

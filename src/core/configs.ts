@@ -123,6 +123,9 @@ export interface ChatPolicy {
   tier: ChatTier;
   /** Optional extra text appended after the tier policy in the assembled system prompt. */
   systemPromptAppend?: string;
+  /** When true, this chat is omitted entirely from the community ops report (no content, no metrics).
+   *  For internal rooms whose traffic is not community activity (e.g. agent-collaboration rooms). */
+  excludeFromOpsReport?: boolean;
 }
 
 export interface ChatPoliciesFile {
