@@ -208,7 +208,8 @@ async function runWorker(target: WorkerTarget): Promise<void> {
   const runs: Promise<void>[] = [];
   for (const r of resolved) {
     log.info(
-      `启动 agent【${r.id}】（identity=${r.identity}，soul=${r.soul}，监听 ${r.chats.length} 群，trigger=${r.trigger}）`
+      `启动 agent【${r.id}】（identity=${r.identity}，soul=${r.soul}，监听 ${r.chats.length} 群，trigger=${r.trigger}` +
+        `${r.collectOnly ? '，采集专用·不回复（被 @ 也不应答）' : ''}）`
     );
     const agent = new Agent(r.workspace, {
       workspace: r.workspace,
