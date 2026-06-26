@@ -1,0 +1,7 @@
+{
+  "cadenceMinutes": 120,
+  "enabled": false,
+  "silentHours": [18, 6],
+  "probability": 1.0,
+  "dailyLimit": 6
+}
