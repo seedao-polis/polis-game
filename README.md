@@ -111,6 +111,15 @@ agent tg-test [消息...]                       发一条测试消息到 Telegra
 
 判定只看消息来源 channel（`feishu-*` → serve，其余 → CLI），不看对方身份。样板与 `create-agent` skill 已内置这套约定，新 agent 只需填一个"serve 对话者角色"（`{{SERVE_PARTY_ROLE}}`）。机制与各 agent 特化详见 `workspaces/tudigong/memory/serve-cli-identity-playbook.md`。
 
+## Agent 之间的协作（A2A 暗线广播 + 飞书表演）
+
+飞书平台让 bot 互相听不到对方发言（`senderType==='app'` 的消息在触发判断前就被丢弃），所以多个 agent 没法直接在群里对话。框架用【双轨】绕过：
+
+- **暗线**（飞书外）：`data/peer-bus/<soul>/inbox.jsonl` 文件信箱。一个 agent 在群里发言后，框架把【cue】（谁、哪个群、说了什么摘要）广播给同群其它 agent 的信箱。
+- **明线**（飞书群）：收到 cue 的 agent 经 `fs.watch` 唤醒，由框架把它的回复发到同一个群，并续播给其他 agent——群里看起来就是一场自然的多人讨论。
+
+要点：真人 @ 起头（真人消息不被过滤），整条链路的广播 / 发群 / 续播都由**框架确定性执行**（不依赖模型记得调工具），模型只决定"说什么、要不要说"。这是 serve/CLI 之外的**第三种对话场景** `peer`。开关是 `configs/agents.json` 的 `peerCast`（默认 false）；防失控靠链深度（≤6）、预算（8）、每群每小时上限（3）。这类协作群可在 `configs/chat-policies.json` 标 `excludeFromOpsReport:true` 从运营报告整群剔除。完整机制与踩坑详见 `workspaces/tudigong/memory/a2a-peer-broadcast-playbook.md`。
+
 ## LP 是跨 agent 的共享经济
 
 积分（LP）、徽章、用户 profile 存在**共享库** `.agent/shared.db`，所有 agent 共用一套经济；对话记忆仍按 agent 隔离在各自 `.agent/<soul>.db`。
