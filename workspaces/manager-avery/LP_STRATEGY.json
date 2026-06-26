@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "judgeEnabled": false,
+  "marker": "LP_JUDGE",
+  "cost": 0.1,
+  "categories": [
+    { "name": "default", "grant": 0.0, "reason": "", "footerLabel": "", "isDefault": true }
+  ]
+}
