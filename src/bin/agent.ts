@@ -31,6 +31,7 @@ import { reloadSoulIfChanged } from '../core/skills.js';
 import { fireEvent, listEventConfigs, getEventByRef, getEventConfig, describeSchedule } from '../core/events.js';
 import { enableLogSink, flushTelegramSync, isTelegramConfigured, sendTelegramMessage, sendTelegramAlert } from '../core/telegram.js';
 import { checkUserTokenExpiry, describeTokenExpiry } from '../core/token-watch.js';
+import { startHeartbeat } from '../core/heartbeat.js';
 import { generateAndSendDailyReport, generateAndSendMonthlyReport } from '../core/ops-report.js';
 import { getFlag, hasFlag } from '../core/argv.js';
 
@@ -72,6 +73,7 @@ function usage(): void {
   agent unsend <message_id> [--as bot|user]     撤回一条已发送的消息（默认 as bot；事件消息就是 bot 发的）
   agent report daily|monthly [--date YYYY-MM-DD] [--lark-user <open_id>] [--lark-chat <chat_id>]  生成并发送运营数据报告（默认 Telegram；--lark-user 私聊预览，--lark-chat 发群）
   agent tg-test [消息...]                        发一条测试消息到 Telegram（验证 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID）
+  agent heartbeat <soul> [--dry-run] [--test]   手动触发一次心跳巡检（--dry-run 只预览；--test 只发操作者 P2P）
   agent help                                    显示说明
 
 范例:
@@ -216,6 +218,18 @@ async function runWorker(target: WorkerTarget): Promise<void> {
     });
     const channel = channelForIdentity(r.identity, r);
     runs.push(channel.run(agent));
+  }
+
+  // Heartbeat is intrinsic to a served agent, not a supervisor feature: arm it in the worker so it runs
+  // whether serve is bare or supervised. Gate it to the bot identity (the heartbeat acts as the bot) and
+  // skip it in quiet mode — this also avoids double-firing when bot and user identities run as separate
+  // processes. The recurring timer is process-local and dies with the worker on shutdown / hot-reload.
+  const botAgent = resolved.find((r) => r.identity === 'bot');
+  if (botAgent && process.env.AGENT_QUIET !== '1') {
+    startHeartbeat(botAgent.workspace, {
+      larkProfile: botAgent.larkProfile,
+      kimiProfile: botAgent.kimiProfile,
+    });
   }
 
   await Promise.all(runs);
@@ -1175,6 +1189,64 @@ async function cmd_tg_test(argv: string[]): Promise<void> {
   }
 }
 
+// ── heartbeat CLI ─────────────────────────────────────────────
+
+async function cmd_heartbeat(argv: string[]): Promise<void> {
+  const soul = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+  if (!soul) {
+    log.error(
+      '用法: agent heartbeat <soul> [--dry-run] [--test]\n' +
+        '      --dry-run 只预览 prompt 和闸门状态，不调用 LLM\n' +
+        '      --test    调用 LLM 但注入测试指令（只发给操作者本人 P2P）'
+    );
+    process.exit(1);
+  }
+  if (!soulExists(soul)) {
+    log.error(`找不到 soul【${soul}】。可用：${listSouls().join(', ') || '(无)'}`);
+    process.exit(1);
+  }
+  assertRunnableSoul(soul);
+  process.env.AGENT_SOUL = soul;
+
+  // Resolve lark profile from the first enabled agent (same pattern as cmd_event).
+  let larkProfile: string | undefined;
+  try {
+    const cfg = loadConfigs();
+    for (const id of listAgents(cfg)) {
+      if (cfg.agents.agents[id]?.enabled) {
+        larkProfile = resolveAgent(id, cfg).larkProfile;
+        break;
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  const dryRun = hasFlag(argv, 'dry-run');
+  const testMode = hasFlag(argv, 'test');
+
+  // Mirror to Telegram so this one-shot CLI's log appears in the log channel.
+  enableLogSink();
+  process.on('exit', () => {
+    try {
+      flushTelegramSync();
+    } catch {
+      /* best-effort */
+    }
+  });
+
+  const modeTag = dryRun ? 'dry-run' : testMode ? 'test 模式' : '手动触发';
+  log.info(`心跳${modeTag}【${soul}】…`);
+  try {
+    const { heartbeatTick } = await import('../core/heartbeat.js');
+    await heartbeatTick(soul, { larkProfile, dryRun, testMode });
+    console.log(`心跳${modeTag}完成：soul=${soul}`);
+  } catch (e) {
+    log.error(`心跳${modeTag}失败：${(e as Error).message}`);
+    process.exit(1);
+  }
+}
+
 // ── memory management CLI ─────────────────────────────────────
 
 async function cmd_memory(argv: string[]): Promise<void> {
@@ -1389,6 +1461,7 @@ const COMMANDS: CliCommand[] = [
   { names: ['run'], run: cmd_run },
   { names: ['report'], run: cmd_report },
   { names: ['tg-test'], run: cmd_tg_test },
+  { names: ['heartbeat'], run: cmd_heartbeat },
 ];
 
 const COMMAND_INDEX = new Map<string, CliCommand>();

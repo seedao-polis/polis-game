@@ -54,6 +54,11 @@ ls workspaces/<new-agent-name>/
 
 11. **LP_STRATEGY.json** — 无占位符，默认随样板带「停用评分」版（每条固定扣 `cost`、不评分，等于老行为），一般不动。只有需要「按每次交流的内容给 LP 评分 / 加分」的 agent（如访谈类）才改 `judgeEnabled:true` 并定义 `categories`（含 `criteria` 判定标准）。字段与范例见 `references/lp-strategy.md`。
 
+12. **HEARTBEAT_CONFIG.json** — 无占位符，直接随样板复制（`enabled:false` 预设停用）。
+    - 如需调整节奏：改 `cadenceMinutes`（分钟数）
+    - 如需调整闸门：改 `silentHours`、`probability`、`dailyLimit`
+    - 确认 HEARTBEAT.md 内容写妥后再改 `enabled:true` 启动心跳
+
 ## 步骤 4：确认无残留占位符
 
 ```bash
@@ -61,6 +66,14 @@ grep -rn "{{" workspaces/<new-agent-name>/
 ```
 
 若输出非空，列出所有残留项并逐一处理，直到输出为空。
+
+## 步骤 5.5：确认 HEARTBEAT_CONFIG.json 存在
+
+```bash
+ls workspaces/<new-agent-name>/HEARTBEAT_CONFIG.json
+```
+
+文件应存在（从 _template 复制而来）。若不存在，手动从 `_template/HEARTBEAT_CONFIG.json` 复制一份。
 
 ## 步骤 5：删除 BOOT.md 顶部的样板警告
 
@@ -70,7 +83,7 @@ grep -rn "{{" workspaces/<new-agent-name>/
 </process>
 
 <success_criteria>
-- `workspaces/<new-agent-name>/` 目录存在，包含完整的 9 个 .md 文件
+- `workspaces/<new-agent-name>/` 目录存在，包含完整的 9 个 .md 文件 + `LP_STRATEGY.json` + `HEARTBEAT_CONFIG.json`
 - `grep -rn "{{" workspaces/<new-agent-name>/` 输出为空（无残留占位符）
 - BOOT.md 顶部的 `⚠️` 样板警告已删除
 - 可以进入下一个 workflow：`register-agent.md`

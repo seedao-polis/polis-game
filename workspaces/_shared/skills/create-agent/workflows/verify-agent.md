@@ -60,6 +60,8 @@ grep -rn "{{" workspaces/<new-agent>/
 - [ ] agent 能正确介绍自己的名字与角色
 - [ ] agent 回复语言符合配置要求
 - [ ] BOOT.md 顶部的 `⚠️` 样板警告已删除
+- [ ] `workspaces/<new-agent>/HEARTBEAT_CONFIG.json` 存在（`cat workspaces/<new-agent>/HEARTBEAT_CONFIG.json`）
+- [ ] HEARTBEAT.md 已改写为主动语境（含「心跳醒来时主动做的事」与「节制原则」段落，不再出现「当有人说」的被动语境）
 
 </process>
 
