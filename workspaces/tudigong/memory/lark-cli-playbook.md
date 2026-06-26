@@ -94,7 +94,7 @@
 
 - **建话题**：在话题群（如 AgentTasks）直接 `im +messages-send --chat-id oc_xxx --as bot --markdown "..."`（不带 reply）就会开一个新话题。飞书**没有单独设置话题标题的接口**——标题就写在内容首行（用 **加粗** 当标题）。
 - **富文本**：`--markdown` 会自动转成 post 格式，支持 **加粗**、• 列表、emoji、换行；要排版好看就用它，别用 `--text`。
-- **改帖**：lark-cli **没有编辑消息的命令**。发错了只能撤回（`im messages delete --params '{"message_id":"om_xxx"}' --as bot --yes`）再重发；撤回只是收回内容、会留下一条【已撤回】的空记录，话题也无法通过 API 关闭。
+- **改帖（2026-06-26 更正：能编辑！）**：lark-cli 封装的子命令里没有编辑命令，但 **Feishu 有编辑消息 API**，用 raw `lark-cli api PUT /open-apis/im/v1/messages/<om_id> --as bot --data - --format json`（body 走 **stdin `--data -`**：`{"msg_type":"post","content":"<JSON 字符串>"}`，post 的 content 同 send 即 `{"zh_cn":{"title","content"}}`）。成功 `code===0`、返回新 content。**坑**：`--data @file` 受 cwd 沙箱限制（只接受 cwd 相对路径），所以大 JSON 用 `--data -` 喂 stdin 最省事。只能编辑**本 bot 发的** text/post（先 `api GET /im/v1/messages/<id>` 取 `data.items[0].body.content`，改完再 PUT）。实测可把运营报告里的 `「」` 原地改成 `【】` 而不撤回重发。撤回仍是 `im messages delete --message-id om_xxx --as bot --yes`（留【已撤回】空记录）；话题无法通过 API 关闭。
 - **多行 / emoji 内容**：不要直接在命令行拼引号。写一个临时 node 脚本，把内容当数组元素传给 `execFileSync('node', [run, ...])`，避开 shell 引号转义和中文 / emoji 编码问题（框架的 `lark.ts` 就是这么做的）。
 - **中文排版习惯（操作者要求）**：给 SeeDAO 飞书群的内容一律**简体中文 + 大陆用语**；中文强调 / 书名 / 标签统一用 **【】**。
 

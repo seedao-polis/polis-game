@@ -22,7 +22,7 @@ Node 查 SQLite + 即时采集 wiki 节点树 → 组 JSON spec → `spawn` Pyth
 ## 工作人员归类（红蓝着色）
 
 - 工作人员 = `STAFF_CHAT_IDS` = 市政厅工作群 `oc_example_work_group_old` ∪ 运营小天地 `oc_example_ops_group` 的成员。
-- `resolveStaffOpenIds()` **每次产图前即时 `listChatMembers` 抓**（失败回退本地 `chatMemberOpenIds(DB)`）→ 每日 04:55 产图前自然更新一次。
+- `resolveStaffOpenIds()` **每次产图前即时 `listChatMembers` 抓**（失败回退本地 `chatMemberOpenIds(DB)`）→ 每日 04:59 产图前自然更新一次。
 - 每文件 `nonstaff = viewers 中不在 staff 集合的数量`，比例 → 节点颜色蓝↔红插值。⚠️ `doc_view_events.viewer_id` 与 `chat_members.open_id` 同为 `ou_`，可直接匹配。
 
 ## 图表（`scripts/`，深色 16:9）
@@ -42,8 +42,8 @@ Node 查 SQLite + 即时采集 wiki 节点树 → 组 JSON spec → `spawn` Pyth
 
 ## 排程 + 触发
 
-- supervisor 挂 `scheduleDailyOpsReport`（每日 **04:55**）+ `scheduleMonthlyOpsReport`（每月 1 日 04:55），都 `{ larkChat: 运营小天地 }` + Telegram。
-- ⚠️ **为什么 04:55 不是 05:00**：05:00 是逻辑日翻转点，**过了就翻到新（空）逻辑日**。04:55 用 `ref=new Date()`（现在）捕捉【即将收尾的当前逻辑日/月】。**别传 yesterday**（在 04:55 会 `logicalDayStart` 多退一天）。
+- supervisor 挂 `scheduleDailyOpsReport`（每日 **04:59**，2026-06-26 从 04:55 改）+ `scheduleMonthlyOpsReport`（每月 1 日 04:59），都 `{ larkChat: 运营小天地 }`（经 `opsReportTargets()` 解析）+ Telegram。
+- ⚠️ **为什么 04:59 不是 05:00**：05:00 是逻辑日翻转点，**过了就翻到新（空）逻辑日**。04:59 用 `ref=new Date()`（现在）捕捉【即将收尾的当前逻辑日/月】。**别传 yesterday**（在 04:59 会 `logicalDayStart` 多退一天）。
 - ⚠️ 排程**在 serve 启动时才挂上** → 改了代码要 `pnpm build` + **重启 serve**（最新构建）才生效；serve 没跑就不触发。从 repo 目录起。
 - **CLI**：`pnpm agent report daily|monthly [--date YYYY-MM-DD] [--lark-user <open_id>] [--lark-chat <chat_id>]`。`--lark-user` 私聊预览（=群发格式，验收用）、`--lark-chat` 发群。一次性 CLI 已 `enableLogSink()`+退出 `flushTelegramSync()`。
 - **log**：serve 的 log→Telegram 镜像（`[sup]` 标签，`TELEGRAM_LOG_LEVEL=info`）会显示【运营报告生成开始 / 渲染完成 / 已发送到飞书 / 发送完成】+ 失败时的 error（`Python渲染失败` / `发送飞书失败` / `发送图表失败` / `每日运营报告生成失败`），便于定位哪步出问题。
@@ -54,4 +54,25 @@ Node 查 SQLite + 即时采集 wiki 节点树 → 组 JSON spec → `spawn` Pyth
 
 ## 改动文件
 
-`src/core/ops-report.ts`（新，主管线）、`store.ts`（5 个区间/成员查询函数）、`lark.ts`（`WikiNode.parentNodeToken` + `listWikiChildNodes` 解析）、`supervisor.ts`（两个 04:55 排程 + `OPS_REPORT_CHAT_ID`）、`bin/agent.ts`（`report` 子命令 + `--lark-user/--lark-chat`）、`scripts/`（`render_report.py`、`charts/{fonts,line_chart,tree_chart}.py`、`requirements.txt`、`README.md`）、`.gitignore`（`scripts/.venv/`、`.ops-report-*`）。无 DB migration（不持久化 wiki 层级，每次报告即时采集）。
+`src/core/ops-report.ts`（新，主管线）、`store.ts`（5 个区间/成员查询函数）、`lark.ts`（`WikiNode.parentNodeToken` + `listWikiChildNodes` 解析）、`supervisor.ts`（两个 04:59 排程 + `opsReportTargets()` 经 `resolveChatTarget` 解析运营小天地）、`bin/agent.ts`（`report` 子命令 + `--lark-user/--lark-chat`）、`scripts/`（`render_report.py`、`charts/{fonts,line_chart,tree_chart}.py`、`requirements.txt`、`README.md`）、`.gitignore`（`scripts/.venv/`、`.ops-report-*`）。无 DB migration（不持久化 wiki 层级，每次报告即时采集）。
+
+## AI 社区运营洞察（2026-06-26 加，**仅日报**）
+
+> 目的：每日 04:59 出图的同时，让 Kimi 把当天采集的记录写成一份【社区运营日报】文字，**和图片一起**发到运营小天地 + Telegram。模块 `src/core/ops-narrative.ts`。月报不生成（聊天摘要按月太粗）。
+
+- **数据采集 `gatherDayData(range)`**（纯函数、可测，只读 DB+config）：把一个逻辑日的 messages / member_sync_rounds / doc_view / RSVP 汇成结构化 `DayData`。隐私分层（**核心**）：公开+会员群（`getChatTier`）做**内容摘要**，工作群**只给指标**（消息数、活跃人数）、`lines=[]` 绝不进 prompt；**bot 自己的消息**（各 profile `botOpenId`）从活跃与内容里剔除。
+- **新增 store 查询**：`messagesBetween(fromSec,toSec)`——⚠️ **`messages.create_time` 是毫秒**（Feishu，`larkTimeToMs`），函数内部把秒窗口 ×1000；**其它 `*Between` 全是秒**（doc_view.last_view_time、member synced_at、rsvp synced_at）。还有 `getChatMeta`、`docReaderDigestBetween`（标题+读者数、**无 viewer 身份**，隐私安全）。
+- **map-reduce（"一次或多次"）`generateOpsNarrative(range)`**：内容字数 ≤ `singlePassCharLimit`(默认 6000) 或仅 1 个内容群 → **单次**（原文直进 reduce）；否则 **map**（每个公开/会员群单独 `runKimiAsync` 出摘要，**并发默认 3**，失败的群丢弃只留指标）→ **reduce** 汇总成日报。每次调用 throwaway workDir、`continueSession:false`、timeout 取 kimi profile（默认 600s）。**任何失败/空/未配置 → 返回 null 优雅降级**（只发图+机械摘要、不报错）。
+- **可调 prompt**（改文案不用 build，缺失回退内置常量）：`workspaces/tudigong/prompts/ops-report-analyst.md`（reduce/分析师，**全文≤500字**、三块结构【今日概览】【关键动态】【运营建议】，2026-06-26 从 500~900字8段精简）+ `ops-report-group-digest.md`（map/单群摘要）。**字数硬约束已实现**（光靠 prompt 软约束会超——实测 ask 500 出 711）：reduce 出稿后若 >500 字（`MAX_NARRATIVE_CHARS`，可经 `NarrativeOptions.maxChars` 调）→ `enforceNarrativeLength` 先用 Kimi 压缩一遍（**强制保留【运营建议】**）→ 仍超则 `hardTruncate` 按句子边界截断（按 code point 计、中文一字算一个）。所以无论 LLM 怎么发挥都 ≤500。
+- **投递**：复用 `sendReportToLark`（飞书富文本 post：文字=`洞察 + 【数据摘要】机械摘要`，附三图）+ Telegram（`splitForTelegram` 把长文切 ≤3500 字多条发）。目标群仍由 `opsReportTargets()` 取【运营小天地】。
+- **开关**：`pnpm agent report daily --no-narrative`（CLI 跳过）/ `OPS_REPORT_NARRATIVE=0`（env 关）。验收：`pnpm agent report daily --lark-user <自己 open_id>` 发 P2P 预览（不打扰群）。
+- ⚠️ **时序**：04:59 触发后多次 kimi 可能让报告推迟到 05:1x 才发出；但取数区间在**触发那一刻**就按 `ref=now` 锁定了逻辑日，发送过程跨过 05:00 不影响取数（同原有 04:55 的理由）。
+- 改动文件：`ops-narrative.ts`(新)、`store/messages.ts`(`messagesBetween`/`getChatMeta`)、`store/analytics.ts`(`docReaderDigestBetween`)、`ops-report.ts`(集成+`splitForTelegram`+`narrative` 开关)、`bin/agent.ts`(`--no-narrative`)、`workspaces/tudigong/prompts/*`。无 DB migration。
+
+### 运维 / 踩坑（2026-06-26，都实测过）
+- **手动补发某逻辑日**：`pnpm agent report daily --date "YYYY-MM-DD 12:00" --lark-chat <运营小天地 id>`（发群目标见 [chat-targets-playbook.md]）。⚠️ `--date` 要给**当天中午**（逻辑日 05:00–次日04:59 内任意时刻）：05:00 之后 `ref=now` 会解析到**当天刚开始的空逻辑日**；只写 `--date YYYY-MM-DD`（=00:00、在 05:00 之前）会被 `logicalDayStart` 退到**前一天**逻辑日（off-by-one）。
+- ⚠️ **`runKimiAsync` 的 workDir 必须先存在**：`generateOpsNarrative` 给每次 kimi 调用建 `freshWorkDir`（`mkdirSync recursive`）。漏建 → `execFileSync` 报 `spawn .../kimi ENOENT`，**误导**：错误指向 kimi 二进制，真因是 **cwd 不存在**。任何 `runKimiAsync` 调用方都要保证 workDir 存在。
+- **隐私分层 + 重启坑**：内容摘要 tier = public+member（`DEFAULT_CONTENT_TIERS`）；work 群（市政厅工作群/运营小天地/AgentTasks/AgentNotify + **AI 秘密基地**）只计指标、内容不进 prompt。改 `configs/chat-policies.json` 的 tier 后**要重启 serve**（`loadChatPolicies` 进程内缓存一次），CLI 手动触发即时生效。
+- **文字规范**：analyst prompt 已硬性要求**简体中文+大陆用语、禁用「」『』、强调/标题用【】、书名群名《》**。
+- **改 / 撤已发报告**：撤回 `im messages delete --message-id <om> --as bot --yes`（留【已撤回】空记录）；**原地编辑不重发** 用 raw `api PUT /open-apis/im/v1/messages/<om> --as bot --data -`（详见 [lark-cli-playbook.md] §9），适合只改括号/错字。
+- **冒烟（不发送）**：`AGENT_SOUL=tudigong` + `logicalDayStart` 算窗口 → 直接调 `gatherDayData`（查数据流/tier 分层）或 `generateOpsNarrative`（跑 Kimi 但不发）；量测已发叙事字数可 `listMessages` 取 post.content 按 `【数据摘要】` 切。
