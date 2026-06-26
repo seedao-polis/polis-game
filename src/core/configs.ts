@@ -485,10 +485,12 @@ export function resolveAgent(agentId: string, cfg?: Configs): ResolvedAgent {
 }
 
 /**
- * List every soul (other than selfSoul) that listens to a given chat_id.
- * Used by peer_broadcast to know which peers to write cues to.
- * Handles 'all' / 'all-internal' (treat as "listen to every chat") and
- * string[] (alias array resolved via resolveAlias).
+ * List the soul names that should receive a peer-broadcast cue for a given chat_id: agents that opt
+ * into peer collaboration (peerCast) AND are active (not explicitly disabled) AND listen to the chat,
+ * excluding selfSoul. The peerCast check excludes passive agents (e.g. a community caretaker that
+ * watches every group but does not take part in agent-to-agent collaboration); the active check skips
+ * agents that are configured but not currently in service.
+ * Handles 'all' / 'all-internal' (treat as "listen to every chat") and string[] (resolveAlias).
  */
 export function listPeersInChat(chatId: string, selfSoul: string, cfg?: Configs): string[] {
   const c = cfg ?? loadConfigs();
@@ -497,6 +499,8 @@ export function listPeersInChat(chatId: string, selfSoul: string, cfg?: Configs)
   for (const raw of Object.values(c.agents.agents)) {
     if (raw.soul === selfSoul) continue;
     if (seen.has(raw.soul)) continue;
+    if (!raw.peerCast) continue; // only collaborators receive cues (skip passive/monitor agents)
+    if (raw.enabled === false) continue; // skip configured-but-disabled agents
     if (raw.listen === 'all' || raw.listen === 'all-internal') {
       peers.push(raw.soul);
       seen.add(raw.soul);
