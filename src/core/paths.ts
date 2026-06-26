@@ -83,3 +83,32 @@ export function resolveLarkRun(): string | null {
   }
   return null;
 }
+
+/**
+ * Build the kimi-code MCP config JSON that exposes the framework's built-in tool server
+ * (Feishu messaging, member roster, etc.) to a session. Returns undefined when the server
+ * bundle is not yet built. The optional feishuChatId binds tool actions to one chat; omit it
+ * for contexts that have no fixed target (e.g. a background heartbeat that decides recipients).
+ */
+export function buildAgentMcpConfig(opts: {
+  soul: string;
+  larkProfile?: string;
+  feishuChatId?: string;
+}): string | undefined {
+  if (!fs.existsSync(MCP_SERVER_JS)) return undefined;
+  const env: Record<string, string> = { AGENT_SOUL: opts.soul };
+  if (opts.feishuChatId) env.AGENT_FEISHU_CHAT = opts.feishuChatId;
+  if (opts.larkProfile) env.LARK_PROFILE = opts.larkProfile;
+  const larkRun = resolveLarkRun();
+  if (larkRun) env.LARK_RUN = larkRun;
+  if (process.env.APPDATA) env.APPDATA = process.env.APPDATA;
+  return JSON.stringify({
+    mcpServers: {
+      agent: {
+        command: process.execPath, // use the same node
+        args: [MCP_SERVER_JS],
+        env,
+      },
+    },
+  });
+}

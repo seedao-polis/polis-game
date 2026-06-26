@@ -10,7 +10,7 @@ import { getProfile, recordError } from './store.js';
 import { getFilteredMemories, upsertMemory, getRecentUserMessagesInChat } from './store/memory.js';
 import { allowedNamespaces, resolveWriteScope } from './memory-policy.js';
 import { log, newCorrId, writePostmortem } from './log.js';
-import { MCP_SERVER_JS, RUNTIME_DIR, SOULS_DIR, resolveLarkRun } from './paths.js';
+import { RUNTIME_DIR, SOULS_DIR, buildAgentMcpConfig } from './paths.js';
 import { isAdmin } from './configs.js';
 import type { KimiProfile } from './configs.js';
 import { loadLpStrategy, buildJudgeInstruction } from './lp-strategy.js';
@@ -99,21 +99,10 @@ export class Agent {
 
   /** Build the MCP config (framework tools) attached to kimi. Returns undefined if not yet built. */
   private buildMcpConfig(): string | undefined {
-    if (!fs.existsSync(MCP_SERVER_JS)) return undefined;
-    const env: Record<string, string> = { AGENT_SOUL: this.name };
-    if (this.opts.feishuChatId) env.AGENT_FEISHU_CHAT = this.opts.feishuChatId;
-    if (this.opts.larkProfile) env.LARK_PROFILE = this.opts.larkProfile;
-    const larkRun = resolveLarkRun();
-    if (larkRun) env.LARK_RUN = larkRun;
-    if (process.env.APPDATA) env.APPDATA = process.env.APPDATA;
-    return JSON.stringify({
-      mcpServers: {
-        agent: {
-          command: process.execPath, // use the same node
-          args: [MCP_SERVER_JS],
-          env,
-        },
-      },
+    return buildAgentMcpConfig({
+      soul: this.name,
+      larkProfile: this.opts.larkProfile,
+      feishuChatId: this.opts.feishuChatId,
     });
   }
 
