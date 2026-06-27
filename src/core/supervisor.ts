@@ -232,8 +232,14 @@ function armEventTimer(eventTypeId: string, delayMs: number): void {
   armedEventTimers.set(eventTypeId, t);
 }
 
+// Push minute-cadence event ticks off the whole-minute / 整点 grid, and space multiple events apart, so
+// scheduled-event checks never fire exactly on the hour together with the data-collection polls. The
+// offset phase carries forward because each subsequent tick reschedules at the plain interval.
+const MINUTE_EVENT_PHASE_OFFSET_MS = 17_000;
+const MINUTE_EVENT_STAGGER_MS = 3_000;
+
 /** Start a recurring tick for a minute-cadence event (re-anchored on each supervisor start). */
-function armMinuteLoop(eventTypeId: string, everyMinutes: number): void {
+function armMinuteLoop(eventTypeId: string, everyMinutes: number, index = 0): void {
   const existing = armedEventTimers.get(eventTypeId);
   if (existing) clearTimeout(existing);
   const ms = Math.max(1, everyMinutes) * 60_000;
@@ -241,15 +247,17 @@ function armMinuteLoop(eventTypeId: string, everyMinutes: number): void {
     void fireScheduledNow(eventTypeId);
     armedEventTimers.set(eventTypeId, setTimeout(tick, ms));
   };
-  armedEventTimers.set(eventTypeId, setTimeout(tick, ms));
-  log.info(`事件已排程【${eventTypeId}】：每 ${everyMinutes} 分钟判定一次`);
+  const firstDelay = ms + MINUTE_EVENT_PHASE_OFFSET_MS + index * MINUTE_EVENT_STAGGER_MS;
+  armedEventTimers.set(eventTypeId, setTimeout(tick, firstDelay));
+  log.info(`事件已排程【${eventTypeId}】：每 ${everyMinutes} 分钟判定一次（首次延后 ${Math.round(firstDelay / 1000)} 秒以错开整点）`);
 }
 
 /** Arm every minute-cadence event's recurring tick (called once on startup). */
 function armMinuteEvents(): void {
+  let index = 0;
   for (const cfg of listScheduledEvents()) {
     const sch = cfg.schedule!;
-    if (sch.kind === 'minutes') armMinuteLoop(cfg.eventTypeId, sch.everyMinutes);
+    if (sch.kind === 'minutes') armMinuteLoop(cfg.eventTypeId, sch.everyMinutes, index++);
   }
 }
 

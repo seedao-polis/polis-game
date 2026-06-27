@@ -88,7 +88,7 @@ export interface LarkFile {
   profiles: Record<string, LarkProfile>;
   knownInternalChats: Record<string, string>;
   notifyChat: string;
-  discovery: { mode: string; refreshMinutes: number };
+  discovery: { mode: string; refreshMinutes: number; refreshMs?: number; staggerMs?: number };
   event: { key: string };
 }
 
@@ -256,8 +256,11 @@ export interface ResolvedAgent {
   listenAll: boolean;
   /** Re-discover the chat list (for the user channel to periodically rescan and pick up newly joined chats) */
   rediscover: () => ResolvedChat[];
-  /** Rescan interval (milliseconds, from lark.discovery.refreshMinutes) */
+  /** Rescan interval (milliseconds, from lark.discovery.refreshMs ?? refreshMinutes) */
   discoveryRefreshMs: number;
+  /** Gap (ms) inserted between consecutive per-chat/per-item polls within one cycle, to spread the
+   *  load and avoid a thundering herd at the top of the hour. */
+  discoveryStaggerMs: number;
   capture: boolean;
   trigger: TriggerMode;
   triggerPrefix: string;
@@ -445,8 +448,12 @@ export function resolveAgent(agentId: string, cfg?: Configs): ResolvedAgent {
   const rediscover = (): ResolvedChat[] => resolveListen(raw, c.lark, larkProfile);
   const chats = rediscover();
   const listenAll = raw.listen === 'all';
+  // Prefer an explicit refreshMs so the cadence can sit off whole-minute / 整点 boundaries (e.g. 7m17s),
+  // which avoids phase-locking to the top of the hour; fall back to the legacy whole-minute refreshMinutes.
   const discoveryRefreshMs =
-    Math.max(1, c.lark.discovery?.refreshMinutes ?? 10) * 60_000;
+    c.lark.discovery?.refreshMs ?? Math.max(1, c.lark.discovery?.refreshMinutes ?? 10) * 60_000;
+  // Spread per-chat polls within a cycle by this much (0 disables staggering).
+  const discoveryStaggerMs = Math.max(0, c.lark.discovery?.staggerMs ?? 3_000);
 
   const identity = raw.identity;
   const selfOpenId =
@@ -467,6 +474,7 @@ export function resolveAgent(agentId: string, cfg?: Configs): ResolvedAgent {
     listenAll,
     rediscover,
     discoveryRefreshMs,
+    discoveryStaggerMs,
     capture: raw.capture ?? identity === 'user',
     trigger: raw.trigger ?? 'mention',
     triggerPrefix: raw.triggerPrefix ?? '',

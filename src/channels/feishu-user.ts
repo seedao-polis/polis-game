@@ -68,6 +68,8 @@ function isAgentMessage(content: string): boolean {
   return content.startsWith('🤖');
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 export class FeishuUserChannel implements Channel {
   readonly name = 'feishu-user';
   private cfg: ResolvedAgent;
@@ -103,8 +105,8 @@ export class FeishuUserChannel implements Channel {
 
     log.info(
       `${agent.name} 已上线（飞书 user 频道，profile=${profile}${modeNote}）。` +
-        `启动监听 ${cfg.chats.length} 个群（${cfg.listenAll ? '全部群' : '内部群'}），每 ${cfg.pollIntervalMs}ms 轮询，` +
-        `每 ${Math.round(cfg.discoveryRefreshMs / 60_000)} 分钟重扫一次群清单。`
+        `启动监听 ${cfg.chats.length} 个群（${cfg.listenAll ? '全部群' : '内部群'}），每 ${cfg.pollIntervalMs}ms 轮询（各群起步错开 ${cfg.discoveryStaggerMs}ms），` +
+        `每 ${Math.round(cfg.discoveryRefreshMs / 1000)} 秒重扫一次群清单（成员/报名同步同周期、每项间隔 ${cfg.discoveryStaggerMs}ms 依序进行）。`
     );
     log.info(`   触发模式：${cfg.trigger}；采集：${cfg.capture ? '开' : '关'}`);
 
@@ -139,8 +141,13 @@ export class FeishuUserChannel implements Channel {
           log.info(`群【${chat.name || chat.chatId}】恢复可访问，重新开始监听。`);
         }
         started.add(chat.chatId);
+        // Stagger each chat's poll-loop start so the loops never fire in unison (a burst that hammers
+        // Feishu at the same instant, e.g. on the hour). Steady-state cadence stays at pollIntervalMs;
+        // only the initial phase is offset. `added` is the pre-increment index, so the first chat starts
+        // immediately and each subsequent one is pushed back by one stagger step.
+        const startDelayMs = added * cfg.discoveryStaggerMs;
         added += 1;
-        this.startChatLoop(agent, chat.chatId, chat.name, chat.external, () => running);
+        this.startChatLoop(agent, chat.chatId, chat.name, chat.external, () => running, startDelayMs);
       }
       return added;
     };
@@ -157,7 +164,7 @@ export class FeishuUserChannel implements Channel {
     // everyone (internal AND external), even people who never spoke; new joiners are imported, leavers
     // are kept (present=0) in case they return. Best-effort per chat. Each listChatMembers is a
     // blocking lark-cli call, so this briefly delays polling — acceptable on the discovery cadence.
-    const syncMembers = (chats: { chatId: string; name: string }[]): void => {
+    const syncMembers = async (chats: { chatId: string; name: string }[]): Promise<void> => {
       // Visitor-count milestone: announce each time the watched 围观群's present count crosses a multiple
       // of VISITOR_STEP (every 100 people).
       // SeeDAO 2.0 社区围观群; resolved from configs/lark.json's "围观群" alias. Empty when unconfigured,
@@ -173,9 +180,17 @@ export class FeishuUserChannel implements Channel {
       const joined: store.MemberRef[] = [];
       const leftMembers: store.MemberRef[] = [];
       const renamedMembers: store.MemberRef[] = [];
+      // Spread the per-chat fetches across the cycle: each listChatMembers is a blocking lark-cli call,
+      // and firing them all back-to-back used to land a burst of requests at the top of the cycle (which,
+      // on a whole-minute cadence, collided at 整点). A small gap between chats avoids the thundering herd.
+      const staggerMs = cfg.discoveryStaggerMs;
+      let polled = 0;
       for (const chat of chats) {
+        if (!running) return;
         if (!chat.chatId) continue;
         if (store.isChatInactive(chat.chatId)) continue; // known gone/inaccessible → skip silently
+        if (polled > 0 && staggerMs > 0) await sleep(staggerMs);
+        polled += 1;
         try {
           const roster = listChatMembers(chat.chatId, { profile });
           // We're always a member of a chat we monitor, so a truly empty roster means the fetch failed
@@ -272,7 +287,8 @@ export class FeishuUserChannel implements Channel {
     // Poll all upcoming (not-yet-started) Feishu calendar events and record per-event RSVP counts into
     // calendar_event_rsvp_rounds. Runs on the same discoveryRefreshMs cadence as member sync. No quiet
     // guard: RSVP collection is pure data gathering, same as member sync — runs in quiet mode too.
-    const syncCalendarEventRsvp = (): void => {
+    const syncCalendarEventRsvp = async (): Promise<void> => {
+      const staggerMs = cfg.discoveryStaggerMs;
       try {
         const nowSec = Math.floor(Date.now() / 1000);
         const startIso = new Date().toISOString().slice(0, 10);
@@ -298,7 +314,12 @@ export class FeishuUserChannel implements Channel {
         // Signup milestones for course-type activities (共学/课). When the signup count (accept + tentative)
         // newly crosses one of these, a "limited slots" reminder fires once.
         const CLASS_SIGNUP_THRESHOLDS = [10, 25, 40, 50, 60, 75, 90];
+        // Stagger the per-event attendee fetches for the same reason as member sync (see above).
+        let polledEv = 0;
         for (const e of tracked) {
+          if (!running) return;
+          if (polledEv > 0 && staggerMs > 0) await sleep(staggerMs);
+          polledEv += 1;
           try {
             const attendees = listEventAttendees(e.calendarId, e.eventId, { profile });
             let accepted = 0;
@@ -397,7 +418,8 @@ export class FeishuUserChannel implements Channel {
     // edit/read access to reject the access-record call; those are counted as a coverage gap, and the
     // first rejection in a wiki space short-circuits the rest of that space. No quiet guard: like member
     // sync this is pure data gathering and runs in quiet mode too.
-    const syncDocViewRecords = (): void => {
+    const syncDocViewRecords = async (): Promise<void> => {
+      const staggerMs = cfg.discoveryStaggerMs;
       try {
         // Reduce every candidate document to the object token + type the access-record API expects.
         const targets: Array<{ fileToken: string; fileType: string; source: string; spaceId: string; title: string }> = [];
@@ -423,8 +445,14 @@ export class FeishuUserChannel implements Channel {
         // Spaces lacking owner/admin rights reject every file identically; remember them so one rejection
         // skips the rest of that space instead of probing every node.
         const forbiddenSpaces = new Set<string>();
+        // Stagger the per-document access-record reads: this hourly pass scans the most documents of any
+        // loop (~one blocking call each), so without spreading them it is the densest burst we emit.
+        let scanAttempts = 0;
         for (const t of capped) {
+          if (!running) return;
           if (t.spaceId && forbiddenSpaces.has(t.spaceId)) continue;
+          if (scanAttempts > 0 && staggerMs > 0) await sleep(staggerMs);
+          scanAttempts += 1;
           let records;
           try {
             records = listFileViewRecords(t.fileToken, t.fileType, { profile });
@@ -471,22 +499,25 @@ export class FeishuUserChannel implements Channel {
       }
     };
 
-    // Initial sync runs slightly after startup so the poll loops come online first.
+    // Initial sync runs slightly after startup so the poll loops come online first. Member sync and RSVP
+    // each stagger their internal per-chat/per-event calls, so this is awaited (fire-and-forget).
     setTimeout(() => {
-      if (running) {
-        syncMembers(cfg.chats);
-        syncCalendarEventRsvp();
-      }
+      if (!running) return;
+      void (async () => {
+        await syncMembers(cfg.chats);
+        await syncCalendarEventRsvp();
+      })();
     }, 3000);
 
     // Document access-record polling runs on its own hourly loop, independent of the message poll and
-    // discovery cadences, with the first pass deferred until startup has settled.
-    const docViewLoop = (): void => {
+    // discovery cadences, with the first pass deferred until startup has settled. The scan itself now
+    // staggers its per-document reads, so reschedule only AFTER it completes (no overlapping passes).
+    const docViewLoop = async (): Promise<void> => {
       if (!running) return;
-      syncDocViewRecords();
-      if (running) setTimeout(docViewLoop, DOC_VIEW_REFRESH_MS);
+      await syncDocViewRecords();
+      if (running) setTimeout(() => void docViewLoop(), DOC_VIEW_REFRESH_MS);
     };
-    setTimeout(docViewLoop, DOC_VIEW_INITIAL_DELAY_MS);
+    setTimeout(() => void docViewLoop(), DOC_VIEW_INITIAL_DELAY_MS);
 
     // Watch the user token's expiry and push escalating Telegram reminders as it nears the re-login
     // deadline. Independent of the message poll cadence; reminders de-duplicate per grant so renewing
@@ -499,21 +530,24 @@ export class FeishuUserChannel implements Channel {
     setTimeout(tokenWatchLoop, TOKEN_WATCH_INITIAL_DELAY_MS);
 
     // Periodically rescan the chat list (pick up newly joined chats) AND refresh every chat's member
-    // roster, on the discovery cadence (discoveryRefreshMs).
-    const rescan = (): void => {
+    // roster, on the discovery cadence (discoveryRefreshMs, e.g. 7m17s — deliberately off the whole-minute
+    // grid so the cycle never phase-locks to 整点). Member sync and RSVP each stagger their internal calls,
+    // so the next cycle is scheduled only AFTER this one finishes — never overlapping, and the small
+    // stagger-tail (a handful of seconds) is negligible against the multi-minute period.
+    const rescan = async (): Promise<void> => {
       if (!running) return;
       try {
         const chats = cfg.rediscover();
         const added = startNew(chats);
         if (added > 0) log.info(`重扫群清单：新增监听 ${added} 个群（共 ${started.size}）`);
-        syncMembers(chats);
-        syncCalendarEventRsvp();
+        await syncMembers(chats);
+        await syncCalendarEventRsvp();
       } catch (e) {
         log.warn('重扫群清单失败：', (e as Error).message);
       }
-      if (running) setTimeout(rescan, cfg.discoveryRefreshMs);
+      if (running) setTimeout(() => void rescan(), cfg.discoveryRefreshMs);
     };
-    setTimeout(rescan, cfg.discoveryRefreshMs);
+    setTimeout(() => void rescan(), cfg.discoveryRefreshMs);
 
     return new Promise(() => {
       /* stays resident until SIGINT */
@@ -526,7 +560,8 @@ export class FeishuUserChannel implements Channel {
     chatId: string,
     chatName: string,
     external: boolean,
-    isRunning: () => boolean
+    isRunning: () => boolean,
+    initialDelayMs = 0
   ): void {
     const cfg = this.cfg;
     const profile = cfg.larkProfile;
@@ -831,6 +866,9 @@ export class FeishuUserChannel implements Channel {
       }
       if (isRunning()) setTimeout(tick, nextDelay);
     };
-    tick();
+    // Defer the first poll by the caller-supplied stagger offset so sibling chat loops don't all fire
+    // their first tick at the same instant (0 = start immediately, preserving the original behavior).
+    if (initialDelayMs > 0) setTimeout(tick, initialDelayMs);
+    else tick();
   }
 }
