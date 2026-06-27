@@ -35,6 +35,11 @@ const KEEP_HEAD = 50;
 const KEEP_TAIL = 50;
 // Spacing between consecutive chunks within one flush, to respect the ~1 msg/s per-chat limit.
 const INTER_CHUNK_MS = 1100;
+// Exponential backoff when Telegram is persistently unreachable, so we don't burn ~30s of timeouts on
+// every flush cycle (and don't spam stderr). 30s → 60 → 120 → 240 → 480 → 600s (capped).
+const FLUSH_BACKOFF_BASE_MS = 30_000;
+const FLUSH_BACKOFF_MAX_MS = 10 * 60_000;
+const FLUSH_BACKOFF_MAX_SHIFT = 5;
 
 function token(): string {
   return (process.env.TELEGRAM_BOT_TOKEN || '').trim();
@@ -61,6 +66,8 @@ let tag = 'sup'; // distinguishes supervisor vs worker lines (both run `serve`)
 let timer: NodeJS.Timeout | null = null;
 let sending = false; // guard so timer flushes never overlap
 let buffer: string[] = [];
+let flushFailStreak = 0; // consecutive failed flushes (drives backoff + quiet-after-first)
+let flushCooldownUntil = 0; // epoch ms before which flushes are skipped (backoff window)
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -93,14 +100,19 @@ export function pushLogLine(level: string, line: string): void {
   const rank = LEVEL_RANK[level as Level] ?? LEVEL_RANK.INFO;
   if (rank < threshold) return;
   buffer.push(`[${tag}] ${line.replace(/\n+$/, '')}`);
-  if (buffer.length > MAX_BUFFER_LINES) {
-    const omitted = buffer.length - KEEP_HEAD - KEEP_TAIL;
-    buffer = [
-      ...buffer.slice(0, KEEP_HEAD),
-      `… 省略 ${omitted} 行（完整见本地日志）…`,
-      ...buffer.slice(-KEEP_TAIL),
-    ];
-  }
+  buffer = coalesce(buffer);
+}
+
+/** Coalesce an over-long buffer to head + an elision note + tail, so we never try to ship hundreds of
+ *  messages at once (and trip rate limits). The full detail is always in the local log file. */
+function coalesce(lines: string[]): string[] {
+  if (lines.length <= MAX_BUFFER_LINES) return lines;
+  const omitted = lines.length - KEEP_HEAD - KEEP_TAIL;
+  return [
+    ...lines.slice(0, KEEP_HEAD),
+    `… 省略 ${omitted} 行（完整见本地日志）…`,
+    ...lines.slice(-KEEP_TAIL),
+  ];
 }
 
 /** Pack lines into messages each <= maxChars, joining with newlines; hard-splits any over-long line. */
@@ -127,8 +139,13 @@ function* chunkLines(lines: string[], maxChars: number): Generator<string> {
 }
 
 // ── outbound transport: per-attempt timeout + retry ────────────
-const TG_TIMEOUT_MS = 10_000;
 const TG_RETRIES = 2; // total attempts = TG_RETRIES + 1
+
+/** Per-attempt fetch timeout; overridable via TELEGRAM_TIMEOUT_MS for slow networks (min 1s, default 10s). */
+function timeoutMs(): number {
+  const v = Number(process.env.TELEGRAM_TIMEOUT_MS);
+  return Number.isFinite(v) && v >= 1000 ? v : 10_000;
+}
 
 /** Surface undici's underlying cause (ECONNRESET / ETIMEDOUT / EAI_AGAIN…) instead of a bare "fetch failed". */
 function describeFetchError(e: unknown): string {
@@ -143,7 +160,7 @@ async function tgFetch(url: string, init: RequestInit): Promise<Response> {
   for (let attempt = 0; attempt <= TG_RETRIES; attempt++) {
     if (attempt > 0) await sleep(500 * attempt); // backoff: 500ms, then 1000ms
     try {
-      return await fetch(url, { ...init, signal: AbortSignal.timeout(TG_TIMEOUT_MS) });
+      return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs()) });
     } catch (e) {
       lastErr = e;
     }
@@ -166,9 +183,17 @@ async function postMessage(text: string): Promise<void> {
   }
 }
 
-/** Drain the buffer to Telegram. Never overlaps; on failure the batch is dropped (kept in local log). */
+/**
+ * Drain the buffer to Telegram. Never overlaps. When Telegram is persistently unreachable we back off
+ * exponentially (skipping flushes during the cooldown), requeue the unsent lines so the backlog ships on
+ * recovery instead of being dropped, and stay quiet — only the first failure of a streak and the recovery
+ * are written to stderr, so a network outage no longer spams the local log every cycle.
+ */
 async function flushAsync(): Promise<void> {
   if (sending || buffer.length === 0) return;
+  // In backoff: skip the flush. New lines keep buffering (and coalescing), so nothing accumulates
+  // unbounded, and we avoid burning ~30s of timeouts on every cycle while Telegram is down.
+  if (flushCooldownUntil && Date.now() < flushCooldownUntil) return;
   sending = true;
   const lines = buffer;
   buffer = [];
@@ -179,8 +204,27 @@ async function flushAsync(): Promise<void> {
       first = false;
       await postMessage(chunk);
     }
+    // Success → if we were backing off, note the recovery once and resume the normal cadence.
+    if (flushFailStreak > 0) {
+      process.stderr.write(`[telegram] 推送已恢复（曾连续失败 ${flushFailStreak} 次）\n`);
+      flushFailStreak = 0;
+      flushCooldownUntil = 0;
+    }
   } catch (e) {
-    process.stderr.write(`[telegram] 推送失败（已丢弃本批，完整见本地日志）：${describeFetchError(e)}\n`);
+    // Failure → requeue the unsent lines ahead of anything buffered during the attempt (coalesced so it
+    // stays bounded), then back off. Only the first failure of a streak is logged to avoid stderr spam.
+    buffer = coalesce(lines.concat(buffer));
+    flushFailStreak += 1;
+    const backoff = Math.min(
+      FLUSH_BACKOFF_BASE_MS * 2 ** Math.min(flushFailStreak - 1, FLUSH_BACKOFF_MAX_SHIFT),
+      FLUSH_BACKOFF_MAX_MS
+    );
+    flushCooldownUntil = Date.now() + backoff;
+    if (flushFailStreak === 1) {
+      process.stderr.write(
+        `[telegram] 推送失败，进入退避（约每 ${Math.round(backoff / 1000)}s 重试一次、期间静默，完整日志见本地）：${describeFetchError(e)}\n`
+      );
+    }
   } finally {
     sending = false;
   }
