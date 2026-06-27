@@ -48,6 +48,7 @@
 - **数据走 A2A、群里不堆**：需要给同事或向同事要具体数据/仓位/报告时，群里只说一句【这部分我用 A2A 发给你】/【细节请用 A2A 发给我】，实际内容走暗线 cue。这是**表演用语**——真数据其实就在 cue 的 message 里，说"用 A2A"是为了让旁观者感觉这些 agent 有套成熟的协作协议。
 - **只发最终消息、不外露思考**：模型会把整段思考链当成回复发出去（"相关。Yifan 把球传回来…需要控制在 200 字以内…检查一下字数…最终输出。"），整坨被 `sendText` 发进群、很穿帮。peer 第三场景（agent.ts）+ 4 个 `AGENTS.md ## 回答方式` 都要明确：**只输出要发到群里的那段话本身，不要思考过程 / 分析铺垫 / 字数自查 / 解释性旁白**；没人问的别主动说。
 - **默认彼此都认识、不自报身家**：同事 Agent 与 @ 你的人都清楚你是谁、做什么；除非被明确要求自我介绍，否则**别报名字 / 职位、别反复声明职责边界**（如 yifan 每次都"我是 Chen Yifan，亚洲时段执行交易员，再说明一下边界：1…2…3…"很啰嗦），直接回答。写进 4 个 `AGENTS.md ## 回答方式`。
+- **实质门槛：没有新东西就沉默、严禁"收到收到"（2026-06-26）**：peer 接话的判断标准**不是"相不相关"**——交易话题对交易 agent 永远"相关"，于是它们会无穷互发"收到 / 待命 / 继续盯着 / 随时同步 / 我接到这颗球"。改成判断【**有没有新的、具体的东西要补充**（新观点 / 数据 / 具体下一步 / 真问题）】：有才说、且直接说实质内容，没有就 `[SILENT]`（沉默是常态）。纯附和、确认收到、复述同事已说过的，一律 `[SILENT]`；**只有同事点名 @ 你或指名要你确认 / 执行某事时**才需简短确认，且确认也要带上实质回应、别光说"收到"。两处落地：①prompt 层——`agent.ts` 的 peer 场景 + `feishu-bot.ts` 唤醒提示 + 4 个 `AGENTS.md ## 回答方式` 新增【不要为回应而回应】条。②框架层确定性兜底——见 §六.8。
 
 ## 六、踩坑史（最值钱的部分）
 
@@ -58,6 +59,7 @@
 5. **chatId 没注入 prompt**：早期想让 LLM 自己 kickoff，但 `prepare()` 从不把当前群 chat_id 写进 prompt，LLM 不知道发哪个群。后来 kickoff 改成框架做、用 `job.chatId`，就不需要注入了（那段试验性注入已回退）。
 6. **广播一开始发给"所有监听该群的 soul"**：`listPeersInChat` 最初只按 `listen` 推导，结果 cue 发给了 tudigong（社区监督者，跟 trading 无关）、yihan、以及配了但没上架的 avery/charlotte。改成**只发 `peerCast && enabled !== false` 的同群 agent**（见 §三.3），现在干净地只剩 yifan↔mira。
 7. **模型把思考链当回复 + 自报家门**：见 §五后两条——纯 prompt 层解（peer 场景 + AGENTS.md 回答方式），若以后仍泄漏思考，再在框架层加 strip 兜底。
+8. **"收到收到"无穷应答 + 框架层兜底（2026-06-26）**：真人问油价后 mira/yifan 正常讨论，但接下来就退化成一长串"收到，执行侧待命，有新进展随时同步"——双方把对方每条都当"相关"、于是为回应而回应，直到 budget/depth 耗尽。**纯 prompt 解不够**（模型仍会礼貌性附和），所以照 §三 的总原则【必须发生的步骤交给框架、别赖模型自觉】加确定性兜底：`peer-bus.ts` 的 `isLowContentAck(body)`——剥掉 @、标点、一组应答/待命/接话/同步类 filler 后若几乎不剩内容，就判为纯应答（带数字 / 百分号 / 货币 / 存活的【…】标签则放行，保证"看多，等突破确认"这类短实质不误杀）。`feishu-bot.ts` 接话拿到回复后，`isLowContentAck` 命中就**和 `[SILENT]` 一样处理：不发群、不续播**——一条漏网的"收到"就地消化、不再弹回去。注意它是**保守兜底**：只稳稳吃掉裸应答和纯待命套话，像"收到…等 Avery 落下来我出方案"这种夹了具体依赖的灰色句留给 prompt 判，别把正则喂成背语料（会误杀真协调发言）。
 
 ## 七、改动 / 运维（how to apply）
 
@@ -73,6 +75,7 @@
 | bot 互不可听（senderType==='app' 过滤） | `src/channels/feishu-bot.ts`（`handleEvent` 里） |
 | kickoff 广播 + 接话 watcher + 顶层发言 | `src/channels/feishu-bot.ts`（`processJob` 末尾、`run()` 的 peer-bus watcher、`send()`） |
 | 文件信箱 broadcastCue/readUnreadCues | `src/core/peer-bus.ts` |
+| 纯应答兜底 isLowContentAck（防"收到收到"） | `src/core/peer-bus.ts`（`isLowContentAck`）+ `src/channels/feishu-bot.ts`（接话后 guard） |
 | 同群 peers 推导 | `src/core/configs.ts`（`listPeersInChat`） |
 | peerCast 字段 | `src/core/configs.ts`（`RawAgentConfig`/`ResolvedAgent`）+ `configs/agents.json` |
 | peer 第三场景 | `src/core/agent.ts`（`prepare()`，`source==='peer'`） |
