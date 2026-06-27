@@ -35,6 +35,45 @@ interface StoredCue extends PeerCue {
   read: boolean;
 }
 
+// Bare acknowledgements / standby filler ("收到", "待命", "继续盯着", "我接到这颗球"…) carry no new
+// information and are exactly what fuels the endless "收到收到" ping-pong between peers. The peer
+// prompt already tells agents to stay [SILENT] in that case; this is the deterministic backstop
+// (per the project rule: must-happen steps belong to the framework, not the model's discretion). When
+// it fires, the caller treats the turn as silent — nothing is posted, the chain is not relayed — so a
+// stray acknowledgement dies instead of bouncing back.
+const ACK_PHRASES = [
+  // bare acknowledgements
+  '收到', '知道了', '知道啦', '了解', '了然', '明白了', '明白', '清楚了', '清楚', '好的', '好嘞',
+  '没问题', '稍等', '稍候', '稍后', '辛苦了', 'ok', 'okay', 'got it', 'noted',
+  // "I caught the ball" relay filler
+  '我接到这颗球', '接到这颗球', '接到球', '收到这颗球', '继续回答',
+  // standby / handoff filler — "I'm watching, will sync later", carries no new information
+  '保持同步', '随时同步', '同步最新', '同步给你', '同步给', '同步一下', '随时喊我', '随时喊',
+  '随时叫我', '随时叫', '待命', '候命', '执行侧', '我这边', '我这', '继续盯着', '继续盯',
+  '继续跟', '继续看', '持续盯', '持续跟', '持续关注', '保持关注', '盯着', '有新进展', '有进展',
+  '有变化', '有突变', '第一时间', '随时反馈', '及时反馈', '立刻', '马上',
+];
+
+/**
+ * True when a peer reply is essentially a content-free acknowledgement. Heuristic: strip @mentions,
+ * punctuation/whitespace and every known ack phrase; if almost nothing real is left, it was filler.
+ * A digit / percent / currency, or a 【…】 tag with surviving content, vetoes suppression so a short
+ * but concrete reply ("看多，等突破确认") is never mistaken for an ack.
+ */
+export function isLowContentAck(body: string): boolean {
+  const text = body.trim();
+  if (!text) return true;
+  // Concrete signal: any number / percent / money means the agent said something specific.
+  if (/[0-9０-９%％$＄￥]/.test(text)) return false;
+  let rest = text
+    .replace(/@\S+/g, '')                          // @somebody
+    .replace(/[，。、,.!！?？~～;；:：…—\-\s（）()「」""'']/g, ''); // punctuation + whitespace
+  for (const p of ACK_PHRASES) rest = rest.split(p).join('');
+  // A 【…】 tag that survives the strip is real content (a call, a label, a topic).
+  if (/【[^】]+】/.test(rest)) return false;
+  return rest.length <= 6;
+}
+
 function inboxFile(soul: string): string {
   return path.join(PEER_BUS_DIR, soul, 'inbox.jsonl');
 }

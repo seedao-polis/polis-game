@@ -23,6 +23,7 @@ import {
   hasUnreadCue,
   readUnreadCues,
   broadcastCue,
+  isLowContentAck,
   MAX_AGENT_CHAIN_DEPTH,
   DEFAULT_CHAIN_BUDGET,
 } from '../core/peer-bus.js';
@@ -570,8 +571,9 @@ export class FeishuBotChannel implements Channel {
               reply = await agent.respondAsync({
                 message:
                   `【同群同事广播】${cue.from} 刚在本群说：\n${cue.message}\n\n` +
-                  `（话题：${cue.topic}）请判断这段讨论是否和你的角色相关：` +
-                  `相关就直接输出你要在群里说的话；不相关就只输出 [SILENT]，不要输出其它内容。`,
+                  `（话题：${cue.topic}）这是群里的自由讨论、不是点名问你。` +
+                  `只有当你有【新的、具体的】东西要补充（新观点 / 数据 / 具体下一步 / 真问题）才输出你要在群里说的话；` +
+                  `如果只是想附和、确认收到、或复述别人已说过的，就只输出 [SILENT]，不要输出其它内容。`,
                 source: 'peer',
                 // Fresh session per turn: peer turns may overlap (a new cue can arrive during the
                 // jitter wait), and the cue already carries the context, so no shared session is needed.
@@ -584,6 +586,9 @@ export class FeishuBotChannel implements Channel {
 
             const body = store.stripStatusFooter(reply).trim();
             if (!body || body.includes('[SILENT]')) { log.info(`peer 评估后沉默（话题：${cue.topic}）`); continue; }
+            // Deterministic backstop: even if the model slips and emits a bare acknowledgement, drop it
+            // here so it is neither posted nor relayed — this is what actually breaks the 收到收到 chain.
+            if (isLowContentAck(body)) { log.info(`peer 判定为纯应答、按沉默处理（话题：${cue.topic}）：${preview(body)}`); continue; }
 
             try {
               sendText({ chatId: cue.chatId }, body, { as: 'bot', profile });
