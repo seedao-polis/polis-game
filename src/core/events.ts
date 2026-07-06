@@ -458,6 +458,46 @@ registerEvent({
   gapLines: 1,
 });
 
+// Like-maniac milestone announcement — fired by the reaction-harvest poll when a community member's
+// cumulative emoji-reaction count (across the monitored non-work groups) newly crosses a multiple of 6.
+// Posted to the SeeDAO 围观群 group. member_name comes from the poll via vars; the rewarded member's
+// open_id comes via actorOpenId, and prepare() grants them LP after a successful send. Base image has no
+// overlays and is resized to 128px height (aspect kept).
+const LIKE_MANIAC_NOTIFY_CHAT_ID = resolveChatTarget('围观群') ?? ''; // SeeDAO 围观群
+const LIKE_MANIAC_PT_REWARD = 20;
+registerEvent({
+  eventTypeId: 'like-maniac-notify',
+  title: '点赞狂魔 {{member_name}} 出现了',
+  description: [
+    '社区成员 **{{member_name}}** 近期对社区动态疯狂点赞',
+    'SeeDAO 是不是做对什么事，让人会如此疯狂的按赞呢？让我们继续看下去',
+    '',
+    '> 此事件在社区成员累计点赞达 6 的倍数时发生',
+  ].join('\n'),
+  scope: 'global',
+  targetChatId: LIKE_MANIAC_NOTIFY_CHAT_ID,
+  baseImage: 'assets/events/like-maniac-notify-bg.png',
+  overlays: [],
+  imageHeight: 128,
+  gapLines: 1,
+  // The event body names the member as bold text (member_name), not a tappable @, to keep the sentence
+  // formatting the operator specified. prepare() only wires the LP reward for the rewarded reactor.
+  prepare: (opts) => {
+    const actor = opts.actorOpenId;
+    return {
+      afterSend: () => {
+        if (!actor) return;
+        try {
+          store.grantPt(actor, LIKE_MANIAC_PT_REWARD, 'event:like-maniac-notify');
+          log.info(`点赞狂魔奖励：${actor} +${LIKE_MANIAC_PT_REWARD} LP`);
+        } catch (e) {
+          log.warn('点赞狂魔事件发 LP 失败：', (e as Error).message);
+        }
+      },
+    };
+  },
+});
+
 /**
  * Human-readable target label for logs: "群名（chat_id）" for a group / "用户名（open_id）" for a P2P,
  * falling back to the bare id when the name isn't known (e.g. chat not yet synced into the directory).

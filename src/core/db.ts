@@ -589,6 +589,36 @@ CREATE TABLE IF NOT EXISTS identity_links (
 CREATE INDEX IF NOT EXISTS idx_identity_links_canonical ON identity_links(canonical_id);
 `;
 
+// Chat reaction harvest: one row per (message, reactor, emoji) reaction observed by the reaction-sync
+// poll on non-work groups. Deduped by the composite PK so re-seeing the same reaction on later polls is
+// a no-op (INSERT OR IGNORE), letting a member's cumulative "like" count = COUNT(*) by reactor drive the
+// like-maniac milestone event. Lives in the per-soul db (like chat_members / doc_view_events); the shared
+// LP db gets the (empty, unused) table too since both dbs share one migration set.
+const SCHEMA_V21 = `
+CREATE TABLE IF NOT EXISTS chat_reactions (
+  message_id      TEXT NOT NULL,
+  chat_id         TEXT NOT NULL,
+  reactor_open_id TEXT NOT NULL,
+  emoji_type      TEXT NOT NULL,
+  action_time     INTEGER NOT NULL DEFAULT 0,
+  first_seen      INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (message_id, reactor_open_id, emoji_type)
+);
+CREATE INDEX IF NOT EXISTS idx_chat_reactions_reactor ON chat_reactions(reactor_open_id);
+`;
+
+// Pinned messages: one row per message the reaction poll has auto-pinned (once a message drew reactions
+// from >= a chat's autoPinMinReactors distinct people). The PK makes the pin idempotent — a message
+// already recorded here is never re-pinned, so the poll doesn't hammer the pin API on every round.
+const SCHEMA_V22 = `
+CREATE TABLE IF NOT EXISTS pinned_messages (
+  message_id    TEXT PRIMARY KEY,
+  chat_id       TEXT NOT NULL,
+  reactor_count INTEGER NOT NULL DEFAULT 0,
+  pinned_at     INTEGER NOT NULL DEFAULT (unixepoch())
+);
+`;
+
 /** Apply ordered, idempotent schema migrations tracked in schema_migrations. */
 function runMigrations(db: Db): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -620,6 +650,8 @@ function runMigrations(db: Db): void {
     { version: 18, description: 'long-term memory store (memory_items, namespace/visibility/sensitivity)', sql: SCHEMA_V18 },
     { version: 19, description: 'rename gamification points AP->LP (ap_* tables/columns -> pt_*)', run: migrateLpRename },
     { version: 20, description: 'identity links (alias per-app open_ids to one canonical LP identity)', sql: SCHEMA_V20 },
+    { version: 21, description: 'chat reaction harvest (per-member cumulative like count for milestones)', sql: SCHEMA_V21 },
+    { version: 22, description: 'pinned messages (auto-pin popular messages, idempotent)', sql: SCHEMA_V22 },
   ];
   for (const m of migrations) {
     if (applied.has(m.version)) continue;

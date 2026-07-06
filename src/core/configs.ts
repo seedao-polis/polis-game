@@ -130,6 +130,9 @@ export interface ChatPolicy {
   /** When true, this chat is omitted entirely from the community ops report (no content, no metrics).
    *  For internal rooms whose traffic is not community activity (e.g. agent-collaboration rooms). */
   excludeFromOpsReport?: boolean;
+  /** When set (>0), the reaction poll auto-pins a message in this chat once it has been reacted to by
+   *  at least this many distinct people (today's messages only). Absent/0 disables auto-pin for the chat. */
+  autoPinMinReactors?: number;
 }
 
 export interface ChatPoliciesFile {
@@ -221,6 +224,17 @@ export function getChatTier(chatId: string): ChatTier {
   const cfg = loadChatPolicies();
   const policy = cfg.chatPolicies[chatId];
   return policy?.tier ?? cfg.defaultTier ?? 'public';
+}
+
+/**
+ * Auto-pin threshold for a chat: the minimum number of distinct people whose reactions on a message
+ * trigger an automatic pin. Returns 0 (disabled) when the chat has no autoPinMinReactors configured or
+ * it is not a positive number. Config-driven so groups opt in via chat-policies.json (no hardcoded ids).
+ */
+export function getAutoPinThreshold(chatId: string): number {
+  const policy = loadChatPolicies().chatPolicies[chatId];
+  const n = policy?.autoPinMinReactors;
+  return typeof n === 'number' && n > 0 ? Math.floor(n) : 0;
 }
 
 /**

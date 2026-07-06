@@ -5,7 +5,7 @@
 ## 1. 群 ID 速查（别记错）
 
 - **运营小天地**（外部群、status=normal、bot 在内）：`oc_example_ops_group`。⚠️ 有个**同名内部群** `oc_example_ops_group_old` 已 **dissolved**，别用（旧事件 lurker 还指着它）。
-- **城邦快报**：`oc_example_broadcast_group`（外部）。
+- **城邦快报**：`oc_example_broadcast_group`（外部）。⚠️ **2026-07-01 起，原本发往城邦快报的三条群推播（`badge-awarded-group` / `class-event-notify` / `visitor-num-notify`）全部改发【围观群】**（tudigong bot 已入围观群）；城邦快报别名仍在 `configs/lark.json`，但已无任何事件以它为目标。
 - **SeeDAO 2.0 社区围观群**：`oc_example_public_group`。
 - 常用 open_id：管理员 `ou_example_admin`；操作者（内部那个）`ou_example_operator`；海外号 `ou_example_member`。
 
@@ -15,10 +15,11 @@
 |---|---|---|---|
 | `badge-awarded` | 每位新得主 | personal P2P | 发放私信恭喜 |
 | `badge-awarded-default` | 单人发放、徽章无自定事件 | 运营小天地 | 单人群公告 |
-| `badge-awarded-group` | 多人(2+)发放、徽章无自定事件 | 城邦快报 | `prepare()` 动态 @ 全员，靠 `opts.recipients` |
-| `class-event-notify` | 课程报名跨里程碑 | 运营小天地 | RSVP 轮询触发，详见 §5 |
-| `visitor-num-notify` | 围观群人数每满 100 | 运营小天地 | 成员同步轮询触发，详见 §6 |
+| `badge-awarded-group` | 多人(2+)发放、徽章无自定事件 | 围观群 | `prepare()` 动态 @ 全员，靠 `opts.recipients`（2026-07-01 由城邦快报改此） |
+| `class-event-notify` | 课程报名跨里程碑 | 围观群 | RSVP 轮询触发，详见 §5（2026-07-01 由城邦快报改此） |
+| `visitor-num-notify` | 围观群人数每满 100 | 围观群 | 成员同步轮询触发，详见 §6（2026-07-01 由城邦快报改此） |
 | `cityhall-proposal-voted-notify` | 市政厅对提案做出决议 | 运营小天地 | 手动触发（未来接提案系统）；无 @、无奖励，详见 §10 |
+| `like-maniac-notify` | 成员累计点赞跨 6 的倍数 | 围观群 | 表情反应轮询触发，奖励 LP+20，详见 §11（2026-07-03） |
 
 底图都从图床下载落地到 `assets/badges/`（徽章）或 `assets/events/`（其它）。
 
@@ -65,3 +66,28 @@
 - **静态全局事件**（`scope:'global'`、`overlays:[]`、`imageHeight:128`、`gapLines:1`、无 `prepare`/`schedule`/`mentions`/奖励），目标 = 运营小天地 `oc_example_ops_group`。底图 `assets/events/cityhall-proposal-voted-notify-bg.png`（图床 `i.meee.com.tw/CfGED5G.png` 落地，1254²，不叠字）。
 - **三个占位符全靠 `vars` 注入**：`proposal_name`（提案名，标题+正文）、`proposal_voted_result`（结果如【通过】【不通过】，正文粗体）、`proposal_url`（提案链接，正文末尾自动 link）。目前**手动触发**（未来接提案系统）；`agent event` CLI 传不了 vars → 实发要用 §9 的临时 `fireEvent` 脚本带 `vars`。
 - 坑复用 §3：结果行 `决议： **{{proposal_voted_result}}**` 在全角冒号 `：` 后**补一个半角空格**再起 `**`，否则 CJK 紧贴 `**` 可能不渲染粗体。
+
+## 11. 点赞狂魔 `like-maniac-notify`（2026-07-03）
+
+社区成员累计点赞（表情反应）跨 **6 的倍数**时触发，目标 = 围观群，奖励 **LP+20**。这是第一个以【表情反应】为来源信号的事件，需要先建一整套【反应采集】机制。
+
+- **数据来源（关键发现）**：`im +chat-messages-list` **不带 `--no-reactions`** 时，每条消息内联返回 `reactions.details[]`——含 `emoji_type`、`operator.operator_id`（点赞者 open_id）、`operator.operator_type`（`user`/`app`）、`action_time`（unix 秒）。所以**不用逐条消息额外调 API**，轮询消息列表就能拿到反应。主轮询循环用 `--no-reactions` 抑制它省流量；`listMessages(chatId,{includeReactions:true})`（`src/core/lark.ts`）保留并解析成 `LarkMessage.reactions: MessageReaction[]`。
+- **累计计数**：新表 **`chat_reactions`（migration v21）**，PK `(message_id, reactor_open_id, emoji_type)`——同一人对同一条消息同一表情**只算一次**（`recordChatReaction` 用 `INSERT OR IGNORE`、返回是否新插入）。某人累计点赞数 = `memberReactionCount(openId)` = `COUNT(*) by reactor`（`src/core/store/reactions.ts`）。
+- **触发轮询 `syncChatReactions`**（`feishu-user.ts`，挂 discovery cadence、跟 syncMembers 同周期、排在其后好让名字先入库）：对每个**非工作群**（`getChatTier(chatId)!=='work'`）取**最近 18 则**消息（`REACTION_SCAN_MESSAGES`、对应模板【近 18 则讯息】）的反应，逐条 `recordChatReaction`，累计本轮每人新增数；某人 `floor(now/6) > floor((now-delta)/6)` 即跨越 6 的倍数 → `fireEvent('like-maniac-notify', {actorOpenId, vars:{member_name}})`。
+- **首轮基线 guard**：第一轮只**播种**已存在的历史反应（记库、不触发里程碑），用 state cursor `feishu-reactions-seed-<profile>`（`lastPosition===1`=已播种、跨重启保留）标记；否则启动即把一堆旧反应判成跨越、群里刷屏。对照 §7 的【上一轮 vs 本轮】通用模式，只是多了首轮播种。
+- **排除项**：`operator_type!=='user'`（滤掉 bot/app 反应）、`reactor===botOpenId`（bot 自己）、`emoji_type ∈ {reactionEmoji, queuedReactionEmoji}`（`Status_PrivateMessage`/`OnIt` 是「思考中/排队」进度指示，非真点赞）。**操作者不排除**（他也是居民，符合【只排除 bot】惯例）。
+- **事件定义**：静态 `scope:'global'`、`overlays:[]`、`imageHeight:128`、`gapLines:1`，底图 `assets/events/like-maniac-notify-bg.png`（图床 `i.meee.com.tw/wR0g7BZ.png` 落地，1254²，不叠字）。标题 `点赞狂魔 {{member_name}} 出现了`（**去掉模板里的引号**，遵 §3【标题纯文字】）；正文把 `member_name` 当**粗体文字**（不是可点 @，为保运营者写的粗体句式，@ 无法嵌进 md 粗体）。`prepare()` 只挂 `afterSend` 发 LP+20 给 `opts.actorOpenId`（发成功才发奖）。
+- **改了轮询循环 = 要重启 serve**（`syncChatReactions` 在 worker 里，但热重载 `agent update` 会重启 worker → 生效；若只想稳妥就整个重启 serve）。研究/实现代码：`src/core/{db,lark,events}.ts`、`src/core/store/reactions.ts`、`src/channels/feishu-user.ts`；测试在 `src/core/store.test.ts`（`chat reactions: dedupe...`）。
+
+## 12. 热门消息自动置顶（2026-07-03，**不是事件、是飞书运营动作**）
+
+某消息被**去重 ≥N 人**按表情反应就**自动置顶**（Feishu Pin），跟 §11 的表情采集共用同一次 `listMessages({includeReactions:true})` 抓取，但**独立于事件系统**（不发图、不发公告、不进 events.ts，纯 `im pins` 操作）。生产目标=**围观群**，阈值 **3**、**仅当天(逻辑日)消息**。
+
+- **飞书 Pin API（实测于运营小天地，已清理）**：`im pins create --data '{"message_id":"om_xxx"}' --as bot`（建，看 `code===0`）/ `im pins list --params '{"chat_id":"oc_xxx"}'`（查）/ `im pins delete --params '{"message_id":"om_xxx"}' --yes`（移除，**`--yes` 是命令旗标、不能塞 params**，我踩过一次）。bot / user 身份都行，需 scope `im:message.pins:write_only`（SeeDAO 应用已具备），**bot 必须在群里**否则失败。封装成 `lark.pinMessage/unpinMessage(messageId,{as,profile})`（best-effort 返回 boolean，绝不抛）。
+- **配置驱动、不写死群 id**：`configs/chat-policies.json` 每群加 `"autoPinMinReactors": 3` 即启用（缺省/0=不启用）；helper `getAutoPinThreshold(chatId)`（`src/core/configs.ts`）。目前只在**围观群**开。要加群改 config 即可、但**改 config 要重启 serve**（chat-policies 有缓存）。
+- **判定**：`syncChatReactions` 里每条消息去重人数 = `Set(operator_id)`（滤 `operator_type!=='user'`、bot 自己、指示表情 `Status_PrivateMessage`/`OnIt`——和 §11 同一套排除）；`humanReactors.size >= 阈值` **且** `create_time >= logicalDayStart(now)`（**仅当天**，`src/core/time.ts`）**且** 没置顶过 → `pinMessage(as:'bot')` + `store.recordPinnedMessage`。
+- **幂等**：新表 **`pinned_messages`（migration v22）**，PK `message_id`、`recordPinnedMessage` 用 `INSERT OR IGNORE`、返回是否新插入；`isMessagePinned` 先查、置顶过就跳，**永不重复调 API**。
+- **扫描范围合并**：原本 `syncChatReactions` 只扫非工作群（为 §11 点赞）；现改成【非工作群(点赞) **或** 配了 autoPin 的群】都扫，一次抓取同时喂两个用途。工作群若将来也想置顶，给它配 `autoPinMinReactors` 即可（会只做置顶、不做点赞采集）。
+- **首轮不 gate 置顶**：§11 的首轮基线 guard 只压【点赞里程碑】不发；**置顶在循环内、每轮都跑**，所以首次启动就会把当天已够 3 人的热门消息置顶（安静幂等、不像点赞事件会群发刷屏，可接受）。
+- **每群上限 5 条、超了取消最旧（2026-07-03）**：常量 `PIN_CAP=5`（feishu-user.ts）。每成功置顶一条后，`store.pinnedMessagesOldestBeyond(chatId, 5)` 取【我们自己置顶】里超过 5 条的最旧几条（按 `pinned_at DESC, rowid DESC` OFFSET 5、只算 `pinned_messages` 里的行 → **绝不动人工置顶**），逐条 `unpinMessage` + `removePinnedMessage`。**取消后无论 unpin 成功与否都移除追踪**——unpin 失败几乎都是【消息已删/被手动取消】即本就不在置顶里，留着会把上限逻辑卡死；代价是极偶发的临时网络失败会多留一条可见置顶，可接受。实测：运营小天地连置 6 条→自动取消最旧→恰好剩 5（已全部清理）。
+- **注意**：只按【条数】上限，没做【时间过期】取消（如隔天取消）；要的话在轮询里对 `pinned_messages` 按 `pinned_at` 加个 TTL 扫描即可。研究/实现：`src/core/{db,lark,configs}.ts`、`src/core/store/reactions.ts`（`recordPinnedMessage`/`isMessagePinned`/`pinnedMessagesOldestBeyond`/`removePinnedMessage`）、`src/channels/feishu-user.ts`；测试 `src/core/store.test.ts`（`pinned messages: record once...` + `...cap eviction...`）。

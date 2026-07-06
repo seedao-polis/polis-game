@@ -1,7 +1,8 @@
 import type { Agent } from '../core/agent.js';
 import type { Channel } from './channel.js';
 import type { ResolvedAgent } from '../core/configs.js';
-import { resolveChatTarget } from '../core/configs.js';
+import { resolveChatTarget, getChatTier, getAutoPinThreshold } from '../core/configs.js';
+import { logicalDayStart } from '../core/time.js';
 import {
   listMessages,
   sendText,
@@ -284,6 +285,156 @@ export class FeishuUserChannel implements Channel {
       if (added > 0 || left > 0 || renamed > 0) log.info(summary);
       else log.debug(summary);
     };
+
+    // Reaction poll: for each group, fetch the last N messages WITH their reactions once and drive two
+    // separate concerns off that single fetch:
+    //   (1) like-maniac harvest — NON-WORK groups only: record each (message, reactor, emoji) into
+    //       chat_reactions (deduped); when a member's cumulative like count crosses a multiple of
+    //       LIKE_STEP, fire the like-maniac milestone once. The first round only seeds the backlog.
+    //   (2) auto-pin popular messages — any group with autoPinMinReactors configured (config-driven, see
+    //       chat-policies.json): when TODAY's message has been reacted to by >= that many distinct people,
+    //       pin it (once, idempotent via pinned_messages).
+    // A group is scanned if it needs EITHER concern. Runs on the discovery cadence alongside member sync
+    // (which populates reactor display names first).
+    const REACTION_SCAN_MESSAGES = 18; // "近 18 则讯息" per the event spec
+    const LIKE_STEP = 6; // fire when cumulative likes crosses a multiple of 6
+    const PIN_CAP = 5; // keep at most this many of OUR auto-pins per chat; unpin the oldest beyond it
+    const REACTION_SEED_KEY = `feishu-reactions-seed-${profile}`;
+    // Processing-indicator reactions the bot/operator add while replying (added→removed) are NOT genuine
+    // likes; skip them so a thinking/queued marker never inflates a like count (both concerns).
+    const INDICATOR_EMOJIS = new Set([cfg.reactionEmoji, cfg.queuedReactionEmoji]);
+    const BOT_OPEN_ID = cfg.larkProfileMeta.botOpenId;
+    const syncChatReactions = async (chats: { chatId: string; name: string }[]): Promise<void> => {
+      const staggerMs = cfg.discoveryStaggerMs;
+      const seeded = loadCursor(REACTION_SEED_KEY).lastPosition === 1;
+      // Only TODAY's (current logical day) messages are eligible for auto-pin.
+      const todayStartMs = logicalDayStart(new Date()).getTime();
+      // New (first-seen) reactions per reactor this round → drives the cumulative-crossing check.
+      const newByMember = new Map<string, number>();
+      let scannedChats = 0;
+      let totalNew = 0;
+      let pinned = 0;
+      let unpinnedOld = 0;
+      let polled = 0;
+      for (const chat of chats) {
+        if (!running) return;
+        if (!chat.chatId) continue;
+        if (store.isChatInactive(chat.chatId)) continue; // known gone/inaccessible → skip silently
+        const doLikeTally = getChatTier(chat.chatId) !== 'work'; // likes are only harvested in non-work groups
+        const pinThreshold = getAutoPinThreshold(chat.chatId); // 0 = auto-pin disabled for this chat
+        if (!doLikeTally && pinThreshold === 0) continue; // nothing to do for this chat
+        if (polled > 0 && staggerMs > 0) await sleep(staggerMs);
+        polled += 1;
+        try {
+          const messages = listMessages(chat.chatId, {
+            pageSize: REACTION_SCAN_MESSAGES,
+            sort: 'desc',
+            includeReactions: true,
+            profile,
+          });
+          scannedChats += 1;
+          for (const msg of messages) {
+            // Single pass over this message's reactions: collect distinct human reactors (for the pin
+            // check) and, in non-work groups, record each reaction (for the like tally).
+            const humanReactors = new Set<string>();
+            for (const rx of msg.reactions ?? []) {
+              if (rx.operatorType && rx.operatorType !== 'user') continue; // skip app/bot reactions
+              if (rx.reactorOpenId === BOT_OPEN_ID) continue; // never count the bot itself
+              if (INDICATOR_EMOJIS.has(rx.emojiType)) continue; // skip processing-indicator reactions
+              humanReactors.add(rx.reactorOpenId);
+              if (doLikeTally) {
+                const fresh = store.recordChatReaction({
+                  messageId: msg.messageId,
+                  chatId: chat.chatId,
+                  reactorOpenId: rx.reactorOpenId,
+                  emojiType: rx.emojiType,
+                  actionTime: rx.actionTime,
+                });
+                if (fresh) {
+                  newByMember.set(rx.reactorOpenId, (newByMember.get(rx.reactorOpenId) ?? 0) + 1);
+                  totalNew += 1;
+                }
+              }
+            }
+            // Auto-pin: a today's message reacted to by >= threshold distinct people gets pinned once.
+            if (pinThreshold > 0 && humanReactors.size >= pinThreshold && !store.isMessagePinned(msg.messageId)) {
+              const createMs = Number(msg.createTime);
+              if (Number.isFinite(createMs) && createMs >= todayStartMs) {
+                if (pinMessage(msg.messageId, { as: 'bot', profile })) {
+                  store.recordPinnedMessage(msg.messageId, chat.chatId, humanReactors.size);
+                  pinned += 1;
+                  log.info(
+                    `热门消息置顶【${chat.name || chat.chatId}】：${humanReactors.size} 人反应（阈值 ${pinThreshold}），已置顶 message_id=${msg.messageId}`
+                  );
+                  // Cap: keep at most PIN_CAP of OUR auto-pins in this chat; unpin the oldest beyond it.
+                  // Drop each from tracking regardless of the unpin result — an unpin failure almost always
+                  // means the pin is already gone (message deleted / unpinned by hand), so keeping the row
+                  // would wedge the cap; the small risk is one extra visible pin after a transient blip.
+                  for (const oldId of store.pinnedMessagesOldestBeyond(chat.chatId, PIN_CAP)) {
+                    const removed = unpinMessage(oldId, { as: 'bot', profile });
+                    store.removePinnedMessage(oldId);
+                    unpinnedOld += 1;
+                    if (removed) {
+                      log.info(`热门消息取消置顶【${chat.name || chat.chatId}】：超过 ${PIN_CAP} 条上限，取消最旧 message_id=${oldId}`);
+                    } else {
+                      log.warn(`热门消息取消置顶失败但已移除追踪【${chat.name || chat.chatId}】：message_id=${oldId}（可能已被删除或手动取消）`);
+                    }
+                  }
+                } else {
+                  log.warn(
+                    `热门消息置顶失败【${chat.name || chat.chatId}】：message_id=${msg.messageId}（bot 可能不在群或缺 Pin 权限）`
+                  );
+                }
+              }
+            }
+          }
+        } catch (e) {
+          if (isChatGoneError(e)) {
+            store.markChatInactive(chat.chatId, 'dissolved');
+            continue;
+          }
+          // Inaccessible: the per-chat poll loop owns the conservative stand-down; just skip here.
+          if (isChatInaccessibleError(e)) continue;
+          log.warn(`表情反应采集失败【${chat.name || chat.chatId}】：`, (e as Error).message);
+        }
+      }
+
+      // First-ever round: only seed the LIKE backlog (no milestone firing), then remember we've seeded so
+      // subsequent rounds fire on genuinely new reactions. Auto-pin is NOT gated by the seed flag — it
+      // ran inside the loop above, so today's already-popular messages get pinned even on the first round.
+      if (!seeded) {
+        saveCursor(REACTION_SEED_KEY, { lastPosition: 1, lastMessageId: null });
+        log.info(
+          `表情反应采集：首轮基线，已记录 ${totalNew} 条历史反应（本轮不触发点赞里程碑），本轮置顶 ${pinned} 条热门消息，共扫描 ${scannedChats} 个群。`
+        );
+        return;
+      }
+
+      // Steady state: for each member with new reactions, fire once if their cumulative count newly
+      // crossed a multiple of LIKE_STEP. fire-and-forget — fireEvent never throws into this poll.
+      for (const [openId, delta] of newByMember) {
+        if (delta <= 0) continue;
+        const now = store.memberReactionCount(openId);
+        const prev = now - delta;
+        const crossed = Math.floor(now / LIKE_STEP) > Math.floor(prev / LIKE_STEP);
+        const name = store.memberName(openId) || openId;
+        if (!crossed) {
+          log.debug(`点赞监测【${name}】：累计 ${now}（本轮 +${delta}），下一阈值 ${(Math.floor(now / LIKE_STEP) + 1) * LIKE_STEP}`);
+          continue;
+        }
+        const milestone = Math.floor(now / LIKE_STEP) * LIKE_STEP;
+        log.info(`点赞狂魔提醒触发【${name}】：累计点赞 ${prev} → ${now}，跨越 ${milestone}，发送通知`);
+        void fireEvent('like-maniac-notify', {
+          profile,
+          triggerReason: 'like_milestone',
+          actorOpenId: openId,
+          vars: { member_name: name },
+        });
+      }
+      const summary = `表情反应采集完成：扫描 ${scannedChats} 个群，新增 ${totalNew} 条反应，置顶 ${pinned} 条热门消息，取消旧置顶 ${unpinnedOld} 条`;
+      if (totalNew > 0 || pinned > 0 || unpinnedOld > 0) log.info(summary);
+      else log.debug(summary);
+    };
     // Poll all upcoming (not-yet-started) Feishu calendar events and record per-event RSVP counts into
     // calendar_event_rsvp_rounds. Runs on the same discoveryRefreshMs cadence as member sync. No quiet
     // guard: RSVP collection is pure data gathering, same as member sync — runs in quiet mode too.
@@ -505,6 +656,7 @@ export class FeishuUserChannel implements Channel {
       if (!running) return;
       void (async () => {
         await syncMembers(cfg.chats);
+        await syncChatReactions(cfg.chats);
         await syncCalendarEventRsvp();
       })();
     }, 3000);
@@ -541,6 +693,7 @@ export class FeishuUserChannel implements Channel {
         const added = startNew(chats);
         if (added > 0) log.info(`重扫群清单：新增监听 ${added} 个群（共 ${started.size}）`);
         await syncMembers(chats);
+        await syncChatReactions(chats);
         await syncCalendarEventRsvp();
       } catch (e) {
         log.warn('重扫群清单失败：', (e as Error).message);

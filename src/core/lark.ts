@@ -34,6 +34,20 @@ export interface LarkMessage {
   threadId?: string;
   /** Position of this message within its thread */
   threadMessagePosition?: number;
+  /** Emoji reactions on this message; only populated when listMessages is called with includeReactions. */
+  reactions?: MessageReaction[];
+}
+
+/** A single emoji reaction on a message (one reactor + one emoji), from the message-list reactions.details[]. */
+export interface MessageReaction {
+  /** open_id of the person who reacted */
+  reactorOpenId: string;
+  /** emoji_type, e.g. 'PARTY' / 'THUMBSUP' */
+  emojiType: string;
+  /** operator_type, e.g. 'user' (a person) vs 'app' (a bot) */
+  operatorType: string;
+  /** when the reaction was added (unix seconds); 0 when absent */
+  actionTime: number;
 }
 
 /** Single chat entry from internal-group discovery results. */
@@ -697,8 +711,11 @@ export function isChatInaccessibleError(e: unknown): boolean {
 
 export function listMessages(
   chatId: string,
-  opts: { pageSize?: number; sort?: 'asc' | 'desc'; profile?: string } = {}
+  opts: { pageSize?: number; sort?: 'asc' | 'desc'; profile?: string; includeReactions?: boolean } = {}
 ): LarkMessage[] {
+  // The message-list API returns each message's emoji reactions inline (reactions.details[]); the poll
+  // loop suppresses them with --no-reactions since it doesn't need them. Pass includeReactions to keep
+  // them (used by the reaction-harvest sync for the like-maniac milestone).
   const res = larkExec(
     [
       'im',
@@ -709,7 +726,7 @@ export function listMessages(
       String(opts.pageSize ?? 20),
       '--sort',
       opts.sort ?? 'desc',
-      '--no-reactions',
+      ...(opts.includeReactions ? [] : ['--no-reactions']),
       '--format',
       'json',
     ],
@@ -738,8 +755,30 @@ export function listMessages(
       threadMessagePosition: m.thread_message_position != null
         ? Number(m.thread_message_position)
         : undefined,
+      ...(opts.includeReactions ? { reactions: extractReactions(m) } : {}),
     };
   });
+}
+
+/**
+ * Extract the flat list of emoji reactions from a message's reactions.details[]. Each detail is one
+ * reactor + one emoji; the operator carries the reactor's open_id and type ('user' vs 'app'). Returns
+ * an empty array when the message has no reactions.
+ */
+function extractReactions(m: any): MessageReaction[] {
+  const details: any[] = m?.reactions?.details ?? [];
+  const out: MessageReaction[] = [];
+  for (const d of details) {
+    const openId = d?.operator?.operator_id;
+    if (typeof openId !== 'string' || !openId) continue;
+    out.push({
+      reactorOpenId: openId,
+      emojiType: typeof d?.emoji_type === 'string' ? d.emoji_type : '',
+      operatorType: typeof d?.operator?.operator_type === 'string' ? d.operator.operator_type : '',
+      actionTime: Number.parseInt(d?.action_time, 10) || 0,
+    });
+  }
+  return out;
 }
 
 /**
@@ -991,6 +1030,33 @@ export function removeReaction(
       '--format',
       'json',
     ],
+    { profile: opts.profile }
+  );
+  return res?.code === 0;
+}
+
+/**
+ * Pin a message to the top of its chat (Feishu "Pin 消息", native `im pins create`). Best-effort:
+ * returns true on success (envelope code 0), false on any failure (bot not in the chat, missing scope,
+ * message deleted, …) and never throws — safe to call from a poll loop. Needs the bot to be in the chat.
+ */
+export function pinMessage(messageId: string, opts: { as?: 'user' | 'bot'; profile?: string } = {}): boolean {
+  const asArgs = opts.as ? ['--as', opts.as] : [];
+  const res = larkExec(
+    ['im', 'pins', 'create', '--data', JSON.stringify({ message_id: messageId }), ...asArgs, '--format', 'json'],
+    { profile: opts.profile }
+  );
+  return res?.code === 0;
+}
+
+/**
+ * Remove a message's pin (Feishu "移除 Pin 消息", native `im pins delete`). The CLI requires the --yes
+ * confirmation flag (a client-side gate, not sent to the backend). Best-effort boolean, never throws.
+ */
+export function unpinMessage(messageId: string, opts: { as?: 'user' | 'bot'; profile?: string } = {}): boolean {
+  const asArgs = opts.as ? ['--as', opts.as] : [];
+  const res = larkExec(
+    ['im', 'pins', 'delete', '--params', JSON.stringify({ message_id: messageId }), '--yes', ...asArgs, '--format', 'json'],
     { profile: opts.profile }
   );
   return res?.code === 0;

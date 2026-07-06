@@ -8,3 +8,4 @@ export * from './store/members.js';
 export * from './store/analytics.js';
 export * from './store/ops.js';
 export * from './store/memory.js';
+export * from './store/reactions.js';

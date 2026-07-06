@@ -107,6 +107,71 @@ test('leaderboard ranks users by LP descending', () => {
   assert.ok(top.indexOf(c) < top.indexOf(a), 'c (3000) outranks a (1000)');
 });
 
+test('chat reactions: dedupe by (message, reactor, emoji) and count per reactor', () => {
+  const a = uid();
+  const b = uid();
+  // Six distinct reactions by a → count 6; one by b.
+  for (let i = 0; i < 6; i++) {
+    assert.equal(
+      store.recordChatReaction({ messageId: `om_${i}`, chatId: 'oc_r', reactorOpenId: a, emojiType: 'PARTY', actionTime: i }),
+      true,
+      'a new reaction is newly inserted'
+    );
+  }
+  assert.equal(store.recordChatReaction({ messageId: 'om_b', chatId: 'oc_r', reactorOpenId: b, emojiType: 'THUMBSUP' }), true);
+
+  // Re-seeing the same (message, reactor, emoji) is a no-op, even with a different action_time.
+  assert.equal(
+    store.recordChatReaction({ messageId: 'om_0', chatId: 'oc_r', reactorOpenId: a, emojiType: 'PARTY', actionTime: 999 }),
+    false,
+    'a duplicate reaction is ignored'
+  );
+  // A different emoji on the same message by the same reactor is a distinct reaction.
+  assert.equal(store.recordChatReaction({ messageId: 'om_0', chatId: 'oc_r', reactorOpenId: a, emojiType: 'HEART' }), true);
+
+  assert.equal(store.memberReactionCount(a), 7, 'a has 6 PARTY + 1 HEART');
+  assert.equal(store.memberReactionCount(b), 1);
+  assert.equal(store.memberReactionCount(uid()), 0, 'an unknown reactor has no reactions');
+
+  // Blank fields are rejected without inserting.
+  assert.equal(store.recordChatReaction({ messageId: '', chatId: 'oc_r', reactorOpenId: a, emojiType: 'PARTY' }), false);
+  assert.equal(store.recordChatReaction({ messageId: 'om_x', chatId: 'oc_r', reactorOpenId: '', emojiType: 'PARTY' }), false);
+});
+
+test('pinned messages: record once (idempotent) and query', () => {
+  const m = 'om_pin_1';
+  assert.equal(store.isMessagePinned(m), false, 'unknown message is not pinned');
+  assert.equal(store.recordPinnedMessage(m, 'oc_r', 3), true, 'first record is newly inserted');
+  assert.equal(store.isMessagePinned(m), true, 'now reported as pinned');
+  assert.equal(store.recordPinnedMessage(m, 'oc_r', 5), false, 'a second record for the same message is ignored');
+  // Blank ids are rejected.
+  assert.equal(store.recordPinnedMessage('', 'oc_r', 3), false);
+  assert.equal(store.recordPinnedMessage('om_pin_2', '', 3), false);
+});
+
+test('pinned messages: cap eviction returns oldest beyond the cap, per chat', () => {
+  const chat = 'oc_cap';
+  // Record 7 pins in order; insertion order (rowid) breaks ties on equal pinned_at, so c1 is oldest.
+  for (let i = 1; i <= 7; i++) {
+    assert.equal(store.recordPinnedMessage(`om_c${i}`, chat, 3), true);
+  }
+  // A pin in another chat must not be affected by this chat's cap.
+  store.recordPinnedMessage('om_other', 'oc_zzz', 3);
+
+  // Cap 5 → the two oldest (c1, c2) are beyond the cap, returned oldest-first.
+  assert.deepEqual(store.pinnedMessagesOldestBeyond(chat, 5), ['om_c1', 'om_c2']);
+  // Cap >= count → nothing to evict.
+  assert.deepEqual(store.pinnedMessagesOldestBeyond(chat, 7), []);
+  assert.deepEqual(store.pinnedMessagesOldestBeyond(chat, 10), []);
+
+  // Evicting the oldest brings it back under the cap.
+  store.removePinnedMessage('om_c1');
+  store.removePinnedMessage('om_c2');
+  assert.deepEqual(store.pinnedMessagesOldestBeyond(chat, 5), []);
+  assert.equal(store.isMessagePinned('om_c1'), false, 'evicted message is no longer tracked');
+  assert.equal(store.isMessagePinned('om_other'), true, 'other chat pin untouched');
+});
+
 test('resetDailyPtFloor lifts only below-floor balances', () => {
   const low = uid();
   const high = uid();
