@@ -52,7 +52,7 @@ agent badge list [target]
 1. **逐人私信** `badge-awarded`（scope=personal）：每位新得主收一条 P2P 恭喜私信（128px 底图）。
 2. **一条群公告**，事件 ID 按下面优先级决定：
    - 徽章的 `event` 字段非空 → 取其 `/` 前第一段作为事件 ID（覆盖默认）；
-   - 否则新得主 **2 人及以上** → `badge-awarded-group` → 发到 **SeeDAO 城邦快报**（`oc_example_broadcast_group`），正文 @ 全部新得主；
+   - 否则新得主 **2 人及以上** → `badge-awarded-group` → 发到 **SeeDAO 围观群**（`oc_example_public_group`），正文 @ 全部新得主；
    - 否则**单人** → `badge-awarded-default` → 发到 **SeeDAO 运营小天地**（`oc_example_ops_group`）。
    - 指定的自订事件若未在 `src/core/events.ts` 注册，则跳过、只打印警告。
 

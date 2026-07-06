@@ -40,7 +40,7 @@ agent badge award <badge-ref> <target> [target2 ...] [--note "<备注>"]
 
 ## 第 5 步：回报
 
-把实际新发放的人数、触发的群公告去向（城邦快报 / 运营小天地 / 自订事件）回报用户。
+把实际新发放的人数、触发的群公告去向（围观群 / 运营小天地 / 自订事件）回报用户。
 </process>
 
 <success_criteria>

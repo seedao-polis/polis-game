@@ -348,11 +348,11 @@ registerEvent({
 });
 
 // Default batch badge-award announcement — fired once when a badge is awarded to 2+ members at once and
-// the badge names no acquire event of its own. Posted to the SeeDAO 城邦快报 group. Every recipient is
+// the badge names no acquire event of its own. Posted to the SeeDAO 围观群 group. Every recipient is
 // @-mentioned in the body (downgraded to plain "@name" text for anyone not in the target group). The
 // base image has no overlays and is resized to 128px height (aspect kept). badge_name comes from the
 // award flow via vars; the recipient list comes via opts.recipients.
-const BADGE_AWARDED_GROUP_CHAT_ID = resolveChatTarget('城邦快报') ?? ''; // SeeDAO 城邦快报
+const BADGE_AWARDED_GROUP_CHAT_ID = resolveChatTarget('围观群') ?? ''; // SeeDAO 围观群
 registerEvent({
   eventTypeId: 'badge-awarded-group',
   title: "有一群人得到 {{badge_name}} 徽章！",
@@ -381,10 +381,10 @@ registerEvent({
 });
 
 // Course-signup milestone announcement — fired by the calendar RSVP poll when a 共学/课 activity's signup
-// count newly crosses a milestone, to flag that slots are limited. Posted to the SeeDAO 城邦快报 group.
+// count newly crosses a milestone, to flag that slots are limited. Posted to the SeeDAO 围观群 group.
 // All placeholders (event_name, accept_num, remaining = 100-accept_num, event_link) come from the poll via
 // vars; the cap is fixed at 100. Base image has no overlays and is resized to 128px height (aspect kept).
-const CLASS_EVENT_NOTIFY_CHAT_ID = resolveChatTarget('城邦快报') ?? ''; // SeeDAO 城邦快报
+const CLASS_EVENT_NOTIFY_CHAT_ID = resolveChatTarget('围观群') ?? ''; // SeeDAO 围观群
 registerEvent({
   eventTypeId: 'class-event-notify',
   title: "【剩 {{remaining}} 名额】 {{event_name}}报名达 {{accept_num}} 人",
@@ -405,11 +405,11 @@ registerEvent({
 
 // Visitor-count milestone announcement — fired by the member-sync poll when the SeeDAO 2.0 社区围观群's
 // present member count newly crosses a multiple of 100, to welcome the growing crowd. Posted to the
-// SeeDAO 城邦快报 group, @-mentioning two fixed contacts (downgraded to plain text if either is not in
+// SeeDAO 围观群 group, @-mentioning two fixed contacts (downgraded to plain text if either is not in
 // the target group). visitor_num is the crossed milestone threshold (e.g. 400 — a round hundred, not the
 // exact live total such as 402), supplied by the poll via vars. Base image has no overlays and is resized
 // to 128px height.
-const VISITOR_NUM_NOTIFY_CHAT_ID = resolveChatTarget('城邦快报') ?? ''; // SeeDAO 城邦快报
+const VISITOR_NUM_NOTIFY_CHAT_ID = resolveChatTarget('围观群') ?? ''; // SeeDAO 围观群
 registerEvent({
   eventTypeId: 'visitor-num-notify',
   title: 'SeeDAO 访客人数达到 {{visitor_num}} 人',
