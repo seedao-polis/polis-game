@@ -120,6 +120,17 @@ agent tg-test [消息...]                       发一条测试消息到 Telegra
 
 要点：真人 @ 起头（真人消息不被过滤），整条链路的广播 / 发群 / 续播都由**框架确定性执行**（不依赖模型记得调工具），模型只决定"说什么、要不要说"。这是 serve/CLI 之外的**第三种对话场景** `peer`。开关是 `configs/agents.json` 的 `peerCast`（默认 false）；防失控靠链深度（≤6）、预算（8）、每群每小时上限（3）。这类协作群可在 `configs/chat-policies.json` 标 `excludeFromOpsReport:true` 从运营报告整群剔除。完整机制与踩坑详见 `workspaces/tudigong/memory/a2a-peer-broadcast-playbook.md`。
 
+## 心跳（后台主动巡检）与发送护栏
+
+每个 agent 与生俱来一个【心跳】：serve 起了 bot 身份后，worker 按固定节奏（per-soul `workspaces/<soul>/HEARTBEAT_CONFIG.json` 的 `cadenceMinutes`）自动醒来跑一轮 LLM，基于该 soul 的 `HEARTBEAT.md` 判断是否需要主动行动（招呼新人、推播活动、写知识库等），必要时直接发飞书。这是【主动代理 + 闸门】模型——能主动，但靠框架强制的闸门（静默时段、触发概率、每日上限）防刷版，不靠 LLM 自律。
+
+- 与 `--sup` 无关：裸跑 `serve <soul> --bot` 就有；`--quiet` 或纯 `--user` 采集器不挂。
+- 手动测试 `pnpm agent heartbeat <soul> --dry-run|--test`（**不带旗标 = 真触发、真发送**）。
+- tudigong 默认每 60 分钟；`_template` 默认停用（`enabled:false`），新 agent 配妥 `HEARTBEAT.md` 再开。
+- 详见 `workspaces/tudigong/memory/heartbeat-playbook.md`。
+
+**主动发送护栏（防「测试」群发）**：心跳让 LLM 自主决定发给谁，所以框架在 LLM 唯一的发送工具（MCP `feishu_send`）前加了两道**确定性**闸门，拦住模型「试工具能不能发」这类误发（`src/core/outbound-guard.ts`）——① 空白 / 纯标点 / 「测试·test·ping·123」这类占位内容一律不发；② 相同内容 120 秒内发往 ≥3 个不同群即拦下（真群发请走事件系统）。两道闸门对所有 agent 生效，返回提示让模型停手、不真发；改这层要 `pnpm build`。
+
 ## LP 是跨 agent 的共享经济
 
 积分（LP）、徽章、用户 profile 存在**共享库** `.agent/shared.db`，所有 agent 共用一套经济；对话记忆仍按 agent 隔离在各自 `.agent/<soul>.db`。
@@ -164,6 +175,18 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt   # matplotlib + netwo
 - **时间口径**：逻辑日 05:00 → 次日 05:00（排在 04:59 是为了在 05:00 翻转前抓完整当日）。
 - 细节见 `workspaces/tudigong/memory/ops-report-playbook.md`、群发送目标见 `chat-targets-playbook.md`。
 
+## 社区动态周报
+
+每周四 21:00 自动汇总【上周四 21:00 → 本周四 21:00】一周的社区动态，用 AI 写成【五个面向】的 Markdown 长文，在飞书知识库（wiki）里新建一个文档页面并发布——补足运营日报（发群图表）之外、可长期沉淀的周度回顾。
+
+五个面向：① 社区聊天主题 ② 成员分享与作品 ③ 社区运营动态（人数 / 活跃度 / 知识库浏览 / 治理）④ 招募与号召 ⑤ 本周与未来一周活动。数据优先取自本地采集库（成员 / 活动 / 文档访问）；无结构化来源的面向（分享、治理、招募）由 AI 从聊天记录萃取，无数据则标「本周暂无」。
+
+- **写回 wiki**：以 **user 身份**走 lark-cli 原生 API 建 docx 节点 + 写内容（bot 加不进 wiki）；内容用 Markdown（多级标题 + 列点 + emoji + 链接，由飞书转成原生文档区块）。目标知识库坐标在 `configs/lark.json` 的 `weeklyReportWiki`。
+- **手动**：`agent report weekly`（`--dry-run` 只预览不写、`--no-notify` 只建页不群发、`--reuse-doc <docId>` 把内容写进既有页、`--space-id` / `--wiki-token` 覆盖目标）。
+- **自动**：监督者每周四 **21:00** 触发（时区须 `Asia/Shanghai`），触发前先检查 user token 是否临近到期。改报告代码需重新编译并重启 serve 才生效。
+- **首次授权**：写 wiki 需 user token 具备 6 个写入相关 scope（wiki 节点创建、docx 创建 / 读 / 写、媒体 / drive 上传），一次性重新授权即可（`auth login --scope` 是覆盖式，要传现有 + 新增的并集）。
+- 细节见 `workspaces/tudigong/memory/weekly-report-playbook.md`。
+
 ## 记忆与分群
 
 土地神对【每个人、每个群】分别持有独立记忆，并做硬性记忆管制：
@@ -197,4 +220,4 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt   # matplotlib + netwo
 
 ## 知识库 / 开发约定
 
-项目的操作经验与踩坑沉淀在 **`workspaces/tudigong/memory/`**（默认 soul）。先读 `memories.md` 索引，再按需打开对应 playbook：lark-cli、执行器（agent-executor）、本地库、事件系统、LP（pt-gamification）、Telegram、**徽章系统（badge-system）**、**社区推播事件（community-notify-events）**、**运营数据报告（ops-report）**、**多人多群组记忆管理 + 群组三级分类（memory-access）**、**技能系统装载（agent-skill）**、**共用 skill 创作房规（skill-authoring）**。**改动飞书 / 数据 / 大脑相关代码前先读它。** 约定：日志用简体中文 + 大陆用语、不带 emoji；代码注释用英文。
+项目的操作经验与踩坑沉淀在 **`workspaces/tudigong/memory/`**（默认 soul）。先读 `memories.md` 索引，再按需打开对应 playbook：lark-cli、执行器（agent-executor）、本地库、事件系统、LP（pt-gamification）、Telegram、**徽章系统（badge-system）**、**社区推播事件（community-notify-events）**、**运营数据报告（ops-report）**、**社区动态周报（weekly-report）**、**点赞封神方案草案（like-ascension-proposal，点赞狂魔升级 · 未开发）**、**多人多群组记忆管理 + 群组三级分类（memory-access）**、**技能系统装载（agent-skill）**、**共用 skill 创作房规（skill-authoring）**。**改动飞书 / 数据 / 大脑相关代码前先读它。** 约定：日志用简体中文 + 大陆用语、不带 emoji；代码注释用英文。

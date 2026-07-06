@@ -97,6 +97,23 @@ heartbeatTick
 
 `src/core/heartbeat.ts`（新，核心：config / 闸门 / LLM 管线 + `startHeartbeat` 排程）、`src/core/paths.ts`（新增共用 `buildAgentMcpConfig`）、`src/core/agent.ts`（`buildMcpConfig` 改委派共用函数）、`src/bin/agent.ts`（`runWorker` 末尾挂 `startHeartbeat`（bot 身份 + 非 quiet 才挂）+ `heartbeat` 子命令）、`workspaces/{tudigong,profile-writer-yihan,_template}/HEARTBEAT.md`（改写主动语境）、`workspaces/{tudigong,profile-writer-yihan,_template}/HEARTBEAT_CONFIG.json`（新）、`workspaces/_shared/skills/create-agent/workflows/{gather-requirements,copy-and-customize,verify-agent}.md`。**`src/core/supervisor.ts` 不再涉及心跳**（早期版本曾挂在这、已移除）。**无 DB migration**（dailyLimit 走内存）。
 
+## 发送闸门：拦「测试」占位 + 群发刷屏（2026-07-01 加，事故驱动）
+
+- **事故**：2026-07-01 09:32–09:33 tudigong 心跳跑一轮时，LLM 为「试工具能不能发」把 `测试` 群发到 5 个群（运营小天地 / 城邦快报 / 城邦游戏中 / AgentNotify / AgentTasks，共 9 条）。同类事故 2026-06-29 17:16 也发过一次（城邦快报）。根因：心跳给 LLM 飞书发送工具且**无固定 target**（主动代理设计），HEARTBEAT.md 的「无意义不发 / 不群发」只是 prompt 提醒、LLM 不可靠地遵守。
+- **修法（框架确定性拦截，别只靠 prompt）**：LLM 唯一的发消息工具是 MCP `feishu_send`（`src/tools/mcp-server.ts`），在它的发送前加两道确定性闸门，逻辑抽在纯函数模块 `src/core/outbound-guard.ts`（含 `outbound-guard.test.ts`）：
+  1. `isMeaninglessMessage(text)`：空白 / 纯标点 / 归一化后命中占位词表（`测试`/`測試`/`test`/`ping`/`123`/`aaaa` 等）→ 拦截，回一句中文告诉 LLM「别用发送测试工具」，**不真发**。CJK 叠字（如「哈哈哈」）故意不拦（合法）。
+  2. `isFanoutFlood(...)`：**相同内容** 120 秒内发到 **≥3 个不同群** → 第 3 个之后拦截（真·群发走事件系统，不该用本工具逐群转发）；重发到同一个群不算群发。进程内 state，重启归零（可接受）。
+- 两道闸门都是**返回错误文案、不抛异常**，LLM 收到就停、不会重试。改动要 `pnpm build`（心跳读 `dist/tools/mcp-server.js`）。因为 MCP server 是所有 soul 共用，这层对**所有 agent（含未来新建）都生效**。
+- **prompt 第二层**：tudigong 与 `_template` 的 HEARTBEAT.md「节制原则」各加一条「不要测发」。改 HEARTBEAT.md 会触发该 soul 会话指纹重置（预期，见 `agent-skill-playbook.md`）。
+- **善后**：事故里已发出去的「测试」可撤回 `pnpm agent unsend <message_id> --as bot --yes`（message_id 从 DB `messages` 查 `text='测试'` 且 `sender_type='app'`）。
+
+## feishu_send 必须以 bot 身份发（2026-07-03 修，access denied 事故）
+
+- **事故**：心跳巡查到围观群新成员，想发欢迎消息，飞书回 **access denied**。根因不是权限也不是 scope，而是**身份默认值**：MCP `feishu_send`（`src/tools/mcp-server.ts`，心跳里 LLM 唯一的发消息工具）当初调 `sendText` **漏传 `as: 'bot'`**；`larkExec` 省略 `--as` 不注入默认，lark-cli 发消息命令默认回退 **`--as user`（操作者本人 impersonation）**；**操作者本人不在外部围观群** `oc_example_public_group`，所以被拒——但 **bot 在群**（`visitor-num-notify` 事件以 bot 身份发进去过、能成功），缺的只是身份。
+- **对照**：`feishu-bot.ts` 所有回复、事件系统 `sendPost` 都显式 `--as bot`，唯独这个 MCP 工具漏了。心跳本就是「bot 主动说话」，proactive 发送一律 bot 身份。
+- **修法**：`feishu_send` 里 `sendText(..., { as: 'bot', profile })`，并把「发送失败」从抛异常改成 `try/catch` 回一句可操作回执（告诉 LLM 若 access denied 就是 bot 未在该群 / 该群禁言，别重试同群）。改动要 `pnpm build`（心跳读 `dist/tools/mcp-server.js`）；**每轮心跳新起 MCP 子进程读 dist，下一轮自动生效、无需重启 serve**。
+- **给新工具的通用教训**：任何以 agent/bot 名义发飞书的封装，`sendText/sendPost/replyText` 都要显式 `as: 'bot'`，别依赖 lark-cli 的 `--as` 默认（会变成 user 身份、只能发操作者所在的群）。
+
 ## 关联
 
 - 抛弃式 LLM 触发的范本：`ops-report-playbook.md` 末节（ops-narrative 04:59）。

@@ -8,6 +8,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { REPO_ROOT } from '../core/paths.js';
 import { listPeersInChat } from '../core/configs.js';
+import { isMeaninglessMessage, isFanoutFlood, newFanoutState } from '../core/outbound-guard.js';
+
+// Tracks identical content fanned across chats, to block broadcast-spam.
+const _fanoutState = newFanoutState();
 
 const PEER_BUS_DIR = path.join(REPO_ROOT, 'data', 'peer-bus');
 
@@ -69,8 +73,34 @@ server.registerTool(
   async ({ text, chatId }) => {
     const target = chatId || DEFAULT_CHAT;
     if (!target) return textResult('✗ 没有可用的 chatId（未设置默认群）');
-    const res = sendText({ chatId: target }, text, { profile: LARK_PROFILE });
-    return textResult(res.ok ? `已发送（message_id=${res.messageId}）` : '✗ 发送失败');
+    // Deterministic outbound guards: never let the model probe its tools by
+    // blasting a placeholder like "测试" to real community chats.
+    if (isMeaninglessMessage(text)) {
+      process.stderr.write(
+        `[feishu_send] blocked meaningless/test content (soul=${SOUL}, chat=${target}): ${JSON.stringify(text).slice(0, 80)}\n`
+      );
+      return textResult('✗ 已拦截：这条内容像是测试或空白消息，未发送。请只在有真实、具体内容时才发到群里；不要用发送消息来测试工具是否可用。');
+    }
+    if (isFanoutFlood(_fanoutState, text, target, Date.now())) {
+      process.stderr.write(
+        `[feishu_send] blocked fan-out spam (soul=${SOUL}, chat=${target}): identical content already sent to multiple chats\n`
+      );
+      return textResult('✗ 已拦截：相同内容已在短时间内发往多个群，疑似群发刷屏，未发送。群发请走事件系统，不要用本工具逐群转发同一条消息。');
+    }
+    // Always send as the bot: heartbeat / proactive sends are "the bot speaking",
+    // and omitting --as makes lark-cli fall back to the operator (user) identity,
+    // which is not a member of external groups (e.g. the public 围观群) and gets
+    // rejected with access-denied even though the bot itself is in the chat.
+    try {
+      const res = sendText({ chatId: target }, text, { as: 'bot', profile: LARK_PROFILE });
+      return textResult(`已发送（message_id=${res.messageId}）`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`[feishu_send] send failed (soul=${SOUL}, chat=${target}): ${msg}\n`);
+      return textResult(
+        `✗ 发送失败：${msg}。若是权限 / 不在群（access denied），说明本 bot 尚未被拉进该群或该群不允许发言，请不要重试同一个群。`
+      );
+    }
   }
 );
 
