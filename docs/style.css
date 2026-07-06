@@ -1,0 +1,450 @@
+/* Custom styles complementing Tailwind for the tudigong Agent profile page. */
+
+/* ======================================================
+   Base & Reset
+   ====================================================== */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: #150f1c;
+  color: #F5F7FA;
+  font-family: 'Poppins', 'Noto Sans SC', sans-serif;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ======================================================
+   Background mesh gradient
+   ====================================================== */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 80% 50% at 20% 10%, rgba(82, 0, 255, 0.12) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 80%, rgba(190, 121, 244, 0.10) 0%, transparent 60%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ======================================================
+   Glass card — the primary card style used throughout
+   ====================================================== */
+.glass-card {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.glass-card:hover {
+  transform: translateY(-3px);
+  border-color: rgba(82, 0, 255, 0.35);
+  box-shadow: 0 8px 32px rgba(82, 0, 255, 0.15);
+}
+
+/* ======================================================
+   Gradient text used for headings and key labels
+   ====================================================== */
+.gradient-text {
+  background: linear-gradient(135deg, #5200ff 0%, #BE79F4 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ======================================================
+   Avatar — circular gradient ring with emoji inside
+   ====================================================== */
+.avatar-ring {
+  background: linear-gradient(135deg, #5200ff 0%, #BE79F4 100%);
+  border-radius: 50%;
+  padding: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.avatar-inner {
+  background: #150f1c;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+}
+
+/* ======================================================
+   Section heading — left accent bar decoration
+   ====================================================== */
+.section-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.section-heading::before {
+  content: '';
+  display: block;
+  width: 4px;
+  height: 1.4em;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #5200ff 0%, #BE79F4 100%);
+  flex-shrink: 0;
+}
+
+/* ======================================================
+   Status chip / badge used in the hero and elsewhere
+   ====================================================== */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 12px;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  background: rgba(82, 0, 255, 0.12);
+  border: 1px solid rgba(82, 0, 255, 0.28);
+  color: #A89BFF;
+  white-space: nowrap;
+}
+
+.chip-blue {
+  background: rgba(190, 121, 244, 0.10);
+  border-color: rgba(190, 121, 244, 0.25);
+  color: #7DC5FF;
+}
+
+.chip-green {
+  background: rgba(52, 211, 153, 0.10);
+  border-color: rgba(52, 211, 153, 0.25);
+  color: #6EE7B7;
+}
+
+/* "草案" status chip */
+.chip-draft {
+  background: rgba(251, 191, 36, 0.10);
+  border-color: rgba(251, 191, 36, 0.30);
+  color: #FCD34D;
+}
+
+/* "停用" status chip */
+.chip-inactive {
+  background: rgba(156, 163, 175, 0.08);
+  border-color: rgba(156, 163, 175, 0.20);
+  color: #9CA3AF;
+}
+
+/* ======================================================
+   Plus button — circular icon button for the wish form
+   ====================================================== */
+.plus-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #5200ff 0%, #BE79F4 100%);
+  color: #fff;
+  font-size: 1rem;
+  font-weight: 700;
+  border: none;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: opacity 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+  line-height: 1;
+}
+
+.plus-btn:hover {
+  opacity: 0.88;
+  transform: scale(1.08);
+  box-shadow: 0 4px 16px rgba(82, 0, 255, 0.45);
+}
+
+/* ======================================================
+   Primary CTA button in the hero section
+   ====================================================== */
+.cta-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 24px;
+  border-radius: 9999px;
+  background: linear-gradient(135deg, #5200ff 0%, #BE79F4 100%);
+  color: #fff;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  border: none;
+  cursor: pointer;
+  transition: opacity 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+  text-decoration: none;
+}
+
+.cta-btn:hover {
+  opacity: 0.88;
+  transform: translateY(-1px);
+  box-shadow: 0 6px 24px rgba(82, 0, 255, 0.40);
+}
+
+/* ======================================================
+   Database badge — indicates which db a table belongs to
+   ====================================================== */
+.db-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.db-badge-tudigong {
+  background: rgba(82, 0, 255, 0.14);
+  color: #A89BFF;
+}
+
+.db-badge-shared {
+  background: rgba(190, 121, 244, 0.14);
+  color: #7DC5FF;
+}
+
+/* ======================================================
+   MCP tool chip list
+   ====================================================== */
+.tool-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 0.8125rem;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #A89BFF;
+  cursor: default;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.tool-chip:hover {
+  background: rgba(82, 0, 255, 0.12);
+  border-color: rgba(82, 0, 255, 0.30);
+}
+
+/* ======================================================
+   Field list inside database table cards
+   ====================================================== */
+.field-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 0.8125rem;
+  color: #9CA3AF;
+  line-height: 1.5;
+}
+
+.field-item::before {
+  content: '·';
+  color: #4B5563;
+  flex-shrink: 0;
+}
+
+/* ======================================================
+   Section fade-in animation applied via JS after render
+   ====================================================== */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in {
+  animation: fadeInUp 0.5s ease forwards;
+}
+
+/* Staggered delay helpers */
+.delay-100 { animation-delay: 0.1s; }
+.delay-200 { animation-delay: 0.2s; }
+.delay-300 { animation-delay: 0.3s; }
+
+/* ======================================================
+   Modal overlay for the form placeholder notice
+   ====================================================== */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+.modal-overlay.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.modal-box {
+  background: rgba(18, 14, 36, 0.92);
+  border: 1px solid rgba(82, 0, 255, 0.30);
+  border-radius: 20px;
+  padding: 32px;
+  max-width: 420px;
+  width: 100%;
+  position: relative;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.60);
+  transform: scale(0.95);
+  transition: transform 0.2s ease;
+}
+
+.modal-overlay.open .modal-box {
+  transform: scale(1);
+}
+
+.modal-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: #9CA3AF;
+  font-size: 1rem;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.modal-close:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #F5F7FA;
+}
+
+/* ======================================================
+   Tooltip on MCP tool chips — shows description on hover
+   ====================================================== */
+.tool-tooltip {
+  position: relative;
+}
+
+.tool-tooltip .tooltip-text {
+  visibility: hidden;
+  opacity: 0;
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(18, 14, 36, 0.96);
+  border: 1px solid rgba(82, 0, 255, 0.25);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 0.75rem;
+  color: #D1D5DB;
+  white-space: nowrap;
+  max-width: 240px;
+  white-space: normal;
+  text-align: center;
+  z-index: 50;
+  transition: opacity 0.15s ease;
+  pointer-events: none;
+}
+
+.tool-tooltip:hover .tooltip-text {
+  visibility: visible;
+  opacity: 1;
+}
+
+/* ======================================================
+   Scrollbar styling (WebKit)
+   ====================================================== */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(82, 0, 255, 0.25);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(82, 0, 255, 0.45);
+}
+
+/* ======================================================
+   Divider
+   ====================================================== */
+.section-divider {
+  border: none;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+  margin: 0;
+}
+
+/* ======================================================
+   Outbound guard diagram cards
+   ====================================================== */
+.gate-card {
+  border-left: 3px solid;
+  border-radius: 0 12px 12px 0;
+  padding: 14px 16px;
+}
+
+.gate-card-1 {
+  border-color: #5200ff;
+  background: rgba(82, 0, 255, 0.06);
+}
+
+.gate-card-2 {
+  border-color: #BE79F4;
+  background: rgba(190, 121, 244, 0.06);
+}
+
+/* ======================================================
+   Footer link style
+   ====================================================== */
+.footer-link {
+  color: #5200ff;
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+
+.footer-link:hover {
+  color: #BE79F4;
+  text-decoration: underline;
+}
+
+/* ======================================================
+   Responsive helper — hide on small screens
+   ====================================================== */
+@media (max-width: 640px) {
+  .modal-box {
+    padding: 24px 20px;
+  }
+}

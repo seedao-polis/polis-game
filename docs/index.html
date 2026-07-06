@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>城邦土地神 · Agent 档案</title>
+  <meta name="description" content="SeeDAO 城邦土地神（tudigong）Agent 个人档案 — 权限、数据库、技能清单，由社区共同维护。" />
+
+  <!-- Open Graph / social preview -->
+  <meta property="og:type"        content="website" />
+  <meta property="og:title"       content="城邦土地神 · Agent 档案" />
+  <meta property="og:description" content="SeeDAO 城邦土地神（tudigong）Agent 个人档案 — 权限、数据库、技能清单，由社区共同维护。" />
+  <meta name="twitter:card"       content="summary" />
+
+  <!-- Google Fonts: Poppins (Latin, SeeDAO brand face) + Noto Sans SC (CJK) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
+
+  <!-- Tailwind CSS via CDN — production play CDN (v3) -->
+  <script>
+    // Extends Tailwind with SeeDAO brand tokens so utility classes can reference them.
+    tailwind = {
+      config: {
+        theme: {
+          extend: {
+            colors: {
+              // SeeDAO brand tokens sampled from app.seedao.xyz
+              'brand-primary':       '#5200ff',
+              'brand-primary-hover': '#6014ff',
+              'brand-purple':        '#5200ff',
+              'brand-blue':          '#be79f4',
+              'ink':                 '#150f1c',
+              'ink-light':           '#1a1323',
+              'muted':               '#9ca3af',
+              'surface':             'rgba(255,255,255,0.04)'
+            },
+            fontFamily: {
+              sans: ['Poppins', 'Noto Sans SC', 'sans-serif']
+            }
+          }
+        }
+      }
+    };
+  </script>
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Custom styles (glass cards, gradients, animations) -->
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- Profile data — must load before app.js -->
+  <script src="data.js"></script>
+</head>
+
+<body class="relative z-10">
+
+  <!-- ================================================================
+       Navigation bar
+       ================================================================ -->
+  <nav class="sticky top-0 z-50 border-b border-white border-opacity-5"
+       style="background:rgba(21,15,28,0.80);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);">
+    <div class="max-w-6xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between">
+      <span class="text-sm font-semibold text-white flex items-center gap-2">
+        <span>🏯</span>
+        <span class="gradient-text">tudigong</span>
+        <span class="text-gray-500 font-normal hidden sm:inline">· Agent 档案</span>
+      </span>
+      <a href="#" id="nav-cta"
+         class="cta-btn text-sm px-4 py-2 cursor-pointer">
+        许愿 / 提建议
+      </a>
+    </div>
+  </nav>
+
+  <!-- ================================================================
+       Section A — Hero / Identity
+       ================================================================ -->
+  <section id="hero-section" class="max-w-6xl mx-auto px-4 sm:px-6 pt-16 pb-12">
+    <div class="flex flex-col items-center text-center">
+
+      <!-- Avatar ring -->
+      <div class="avatar-ring mb-6" style="width:96px;height:96px;">
+        <div class="avatar-inner" style="width:88px;height:88px;">
+          <span id="hero-avatar" style="font-size:2.75rem;line-height:1;">🏯</span>
+        </div>
+      </div>
+
+      <!-- Name -->
+      <h1 class="text-3xl sm:text-4xl font-bold text-white mb-1">
+        <span id="hero-name">城邦土地神 · 土地公</span>
+      </h1>
+      <p class="text-sm text-gray-500 font-mono mb-5">
+        <span id="hero-name-en">tudigong</span>
+      </p>
+
+      <!-- Status chips -->
+      <div id="hero-chips" class="flex flex-wrap justify-center gap-2 mb-6">
+        <!-- Populated by app.js -->
+      </div>
+
+      <!-- Tagline -->
+      <p id="hero-tagline"
+         class="max-w-2xl text-base sm:text-lg text-gray-300 leading-relaxed mb-4">
+      </p>
+
+      <!-- Subtitle -->
+      <p id="hero-subtitle"
+         class="max-w-xl text-sm text-gray-500 mb-8">
+      </p>
+
+      <!-- CTA button -->
+      <button id="hero-cta" class="cta-btn text-base">
+        <span>🌟</span>
+        <span>许愿 / 提建议</span>
+      </button>
+    </div>
+  </section>
+
+  <hr class="section-divider max-w-6xl mx-auto" />
+
+  <!-- ================================================================
+       Section B — Permissions & Identity
+       ================================================================ -->
+  <section id="section-permissions" class="max-w-6xl mx-auto px-4 sm:px-6 py-14">
+    <!-- Heading replaced by app.js (id="heading-permissions") -->
+    <div id="heading-permissions"></div>
+
+    <!-- Permissions sub-sections rendered by app.js -->
+    <div id="permissions-content"></div>
+  </section>
+
+  <hr class="section-divider max-w-6xl mx-auto" />
+
+  <!-- ================================================================
+       Section C — Database
+       ================================================================ -->
+  <section id="section-database" class="max-w-6xl mx-auto px-4 sm:px-6 py-14">
+    <!-- Heading replaced by app.js (id="heading-database") -->
+    <div id="heading-database"></div>
+
+    <!-- Database table cards rendered by app.js -->
+    <div id="database-content"></div>
+  </section>
+
+  <hr class="section-divider max-w-6xl mx-auto" />
+
+  <!-- ================================================================
+       Section D — Skills
+       ================================================================ -->
+  <section id="section-skills" class="max-w-6xl mx-auto px-4 sm:px-6 py-14">
+    <!-- Heading replaced by app.js (id="heading-skills") -->
+    <div id="heading-skills"></div>
+
+    <!-- Skills cards rendered by app.js -->
+    <div id="skills-content"></div>
+  </section>
+
+  <hr class="section-divider max-w-6xl mx-auto" />
+
+  <!-- ================================================================
+       Section E — Footer
+       ================================================================ -->
+  <footer id="site-footer"
+          class="max-w-6xl mx-auto px-4 sm:px-6 py-10 text-center space-y-2">
+    <p class="text-sm text-gray-400">
+      这是一个由 SeeDAO 社区共同维护的 Agent 档案页面
+    </p>
+    <p class="text-xs text-gray-600">
+      页面数据为静态快照，手动维护于 data.js
+    </p>
+    <p class="text-xs text-gray-600">
+      <a href="" id="footer-repo-link" class="footer-link" target="_blank" rel="noopener noreferrer">
+        查看源代码仓库
+      </a>
+    </p>
+  </footer>
+
+  <!-- ================================================================
+       Modal (form placeholder notice) — injected by app.js
+       ================================================================ -->
+
+  <!-- App logic -->
+  <script src="app.js"></script>
+
+  <!-- Sets repo link in footer and wires nav CTA after PROFILE_DATA is available -->
+  <script>
+    (function () {
+      // Wire the nav CTA button to the same wish form opener.
+      // app.js exposes openWishForm indirectly through the modal build;
+      // the nav button re-uses the hero CTA pattern via PROFILE_DATA.config.
+      var navCta = document.getElementById('nav-cta');
+      if (navCta) {
+        navCta.addEventListener('click', function (e) {
+          e.preventDefault();
+          var heroBtn = document.getElementById('hero-cta');
+          if (heroBtn) heroBtn.click();
+        });
+      }
+
+      // Populate footer repo link.
+      var repoLink = document.getElementById('footer-repo-link');
+      if (repoLink && window.PROFILE_DATA && window.PROFILE_DATA.config) {
+        repoLink.href = window.PROFILE_DATA.config.repoUrl;
+      }
+    })();
+  </script>
+
+</body>
+</html>
