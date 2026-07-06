@@ -19,6 +19,7 @@ import {
   type MessageRow,
 } from './store.js';
 import { runKimiAsync } from './kimi.js';
+import { applyNameOverride } from './name-overrides.js';
 import { log } from './log.js';
 import { localDateFromEpochSec, localDateTimeFromEpochSec } from './time.js';
 
@@ -136,7 +137,7 @@ export function gatherDayData(range: { from: number; to: number }, opts: GatherO
           .filter((r) => r.msgType === 'text' && r.text.trim() !== '')
           .slice(-maxLines)
           .map((r) => ({
-            name: r.senderName || memberName(r.senderOpenId) || '匿名',
+            name: applyNameOverride(r.senderOpenId, r.senderName || memberName(r.senderOpenId) || '匿名'),
             text: r.text.trim(),
             threadId: r.threadId,
           }))

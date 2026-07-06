@@ -1,5 +1,6 @@
 import { getDb, tx, getLpDb } from '../db.js';
 import { canonicalId } from './gamification.js';
+import { applyNameOverride } from '../name-overrides.js';
 
 export interface SilentMember {
   openId: string;
@@ -265,7 +266,7 @@ export function memberName(openId: string): string {
     const row = getDb()
       .prepare("SELECT name FROM chat_members WHERE open_id = ? AND name <> '' ORDER BY last_seen DESC LIMIT 1")
       .get(openId) as { name: string } | undefined;
-    return row?.name ?? '';
+    return applyNameOverride(openId, row?.name ?? '');
   } catch {
     return '';
   }

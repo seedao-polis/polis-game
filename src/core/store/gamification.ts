@@ -1,5 +1,6 @@
 import { getDb, tx, getLpDb, lpTx } from '../db.js';
 import { localDate } from '../time.js';
+import { applyNameOverride } from '../name-overrides.js';
 
 const FIRST_CONTACT_PT = 120;
 
@@ -33,7 +34,8 @@ export function getProfile(
   if (!row) return null;
   return {
     openId: row['open_id'] as string,
-    name: (row['name'] as string) ?? '',
+    // Apply the preferred-name display override (raw captured name stays in the DB).
+    name: applyNameOverride(row['open_id'] as string, (row['name'] as string) ?? ''),
     ptBalance: (row['pt_balance'] as number) ?? 0,
     level: (row['level'] as number) ?? 1,
     firstSeen: (row['first_seen'] as number) ?? 0,
