@@ -24,8 +24,12 @@ import {
   LarkApiError,
   isChatGoneError,
   isChatInaccessibleError,
+  pinMessage,
+  unpinMessage,
+  downloadMessageResource,
   type LarkMessage,
 } from '../core/lark.js';
+import { renderMessageBody } from '../core/attachments.js';
 import { fireEvent } from '../core/events.js';
 import { loadCursor, saveCursor } from '../core/state.js';
 import { append as appendTranscript, upsertChat } from '../core/transcript.js';
@@ -747,19 +751,33 @@ export class FeishuUserChannel implements Channel {
       log.info(`[${chatName || chatId}] 接续进度，从 position ${cursor.lastPosition} 之后监听`);
     }
 
+    // Download a message's file attachment on demand (cached), so the context can inline its content.
+    const fetchFile = (messageId: string, fileKey: string, fileName: string): string | null =>
+      downloadMessageResource(messageId, fileKey, { type: 'file', profile, fileName });
+
+    // Message types the model should see in the conversation context: text, plus file/image/video
+    // attachments (rendered as a marker, with text-file content inlined). Everything else (system,
+    // interactive cards, shares, ...) stays out of the context as before.
+    const CONTEXT_MSG_TYPES = new Set(['text', 'file', 'image', 'media']);
+
     const buildContext = (descMessages: LarkMessage[], upto: number): string =>
       descMessages
-        .filter((m) => m.position <= upto && m.msgType === 'text')
+        .filter((m) => m.position <= upto && CONTEXT_MSG_TYPES.has(m.msgType))
         .slice(0, cfg.contextSize)
         .reverse()
         .map((m) => {
           const agentMsg = isAgentMessage(m.content);
           const who = agentMsg ? agent.name : '使用者';
-          const text = agentMsg
-            ? m.content.replace(/^🤖\s*[^:：]*[:：]\s*/, '')
-            : m.content;
-          return `${who}: ${text}`;
+          let text: string;
+          if (m.msgType === 'text') {
+            text = agentMsg ? m.content.replace(/^🤖\s*[^:：]*[:：]\s*/, '') : m.content;
+          } else {
+            // File/image/video attachment: render a marker and inline text-file content when possible.
+            text = renderMessageBody(m, { fetchFile, maxInlineChars: 2000 });
+          }
+          return text ? `${who}: ${text}` : '';
         })
+        .filter(Boolean)
         .join('\n');
 
     // Self-identification: if the sender open_id equals our own open_id, the message was sent by us.

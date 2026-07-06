@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import readline from 'node:readline';
+import fs from 'node:fs';
 import path from 'node:path';
-import { resolveLarkRun } from './paths.js';
+import { resolveLarkRun, RUNTIME_DIR } from './paths.js';
 import { runFileSync } from './subprocess.js';
 
 // ── lark-cli wrapper (Feishu official CLI, dual user/bot identity) ─────────────────
@@ -984,6 +985,52 @@ export function uploadImage(filePath: string, opts: { profile?: string } = {}): 
   );
   if (res?.code === 0 && res.data?.image_key) return res.data.image_key as string;
   return null;
+}
+
+/**
+ * Download a file/image resource attached to a message and return the absolute local path (or null on
+ * failure). Cached under the repo-local `.agent/attachments/` runtime dir, keyed by file_key, so each
+ * resource is fetched at most once. Uses the user identity (the poller reads as the user). lark-cli's
+ * `--output` must be a cwd-relative path with no `..` traversal, so the cache dir lives under the repo
+ * root (the process cwd for the running agent); if a safe relative path cannot be expressed, returns null.
+ */
+export function downloadMessageResource(
+  messageId: string,
+  fileKey: string,
+  opts: { type?: 'file' | 'image'; profile?: string; fileName?: string; as?: 'user' | 'bot' } = {}
+): string | null {
+  if (!messageId || !fileKey) return null;
+  const type = opts.type ?? 'file';
+  const as = opts.as ?? 'user';
+  const ext = opts.fileName ? path.extname(opts.fileName) : '';
+  const cacheDir = path.join(RUNTIME_DIR, 'attachments');
+  const abs = path.join(cacheDir, `${fileKey}${ext}`);
+  try {
+    // Cache hit: a non-empty file already downloaded.
+    if (fs.existsSync(abs) && fs.statSync(abs).size > 0) return abs;
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const rel = path.relative(process.cwd(), abs);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) return null; // outside cwd → can't pass a safe relative --output
+    const res = larkExec(
+      [
+        'im',
+        '+messages-resources-download',
+        '--message-id', messageId,
+        '--file-key', fileKey,
+        '--type', type,
+        '--output', rel,
+        '--as', as,
+        '--format', 'json',
+      ],
+      { profile: opts.profile }
+    );
+    // Accept when the CLI reports success OR the file simply materialized (older CLI envelopes vary).
+    if ((res?.code === 0 || res == null) && fs.existsSync(abs) && fs.statSync(abs).size > 0) return abs;
+    if (fs.existsSync(abs) && fs.statSync(abs).size > 0) return abs;
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /** A single element inside a Feishu "post" (rich-text) paragraph. */

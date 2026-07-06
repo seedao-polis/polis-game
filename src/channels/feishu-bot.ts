@@ -8,8 +8,11 @@ import {
   removeReaction,
   consumeEvents,
   getUserName,
+  downloadMessageResource,
+  listMessages,
   type EventConsumer,
 } from '../core/lark.js';
+import { renderMessageBody, attachmentMarker } from '../core/attachments.js';
 import { log, preview } from '../core/log.js';
 import { flushTelegramSync } from '../core/telegram.js';
 import { dispatchCommand } from '../core/commands.js';
@@ -83,6 +86,18 @@ export class FeishuBotChannel implements Channel {
     const seen = new Set<string>(); // deduplicate by event_id
     const startedAtMs = Date.now(); // startup time: only respond to messages sent after it
     const channelName = this.name;
+
+    // Message types this channel acts on: text plus file/image/video attachments. In groups the bot
+    // platform only delivers messages that @-mentioned it, so an attachment that reaches us is already
+    // mention-triggered — "just a file + @我" gets a real reply. Other types (cards/shares/system) skip.
+    const HANDLED_MSG_TYPES = new Set(['text', 'file', 'image', 'media']);
+    // Download a message's file attachment on demand (cached) so its content can be inlined for the LLM.
+    // 'bot' for files delivered to us as events (the bot was @-mentioned → can read its resources);
+    // 'user' for files pulled from chat history (never delivered to the bot, only the user token sees them).
+    const fetchFile = (messageId: string, fileKey: string, fileName: string): string | null =>
+      downloadMessageResource(messageId, fileKey, { type: 'file', profile, fileName, as: 'bot' });
+    const fetchFileFromHistory = (messageId: string, fileKey: string, fileName: string): string | null =>
+      downloadMessageResource(messageId, fileKey, { type: 'file', profile, fileName, as: 'user' });
     // 静默模式（serve --quiet → AGENT_QUIET）：照常采集消息、记录互动、触发同步等，但绝不回复任何
     // 飞书 p2p/群/@，也不调用 LLM（不耗 kimi、不扣 LP、不加表情）。CLI 频道是独立进程，不受影响。
     const quiet = process.env.AGENT_QUIET === '1';
@@ -295,8 +310,9 @@ export class FeishuBotChannel implements Channel {
 
     const handleEvent = (ev: Record<string, any>): void => {
       if (ev.type && ev.type !== 'im.message.receive_v1') return;
-      if (ev.message_type && ev.message_type !== 'text') {
-        log.info(`· 略过非文字消息（${ev.message_type}）`);
+      const msgType: string = ev.message_type ?? 'text';
+      if (!HANDLED_MSG_TYPES.has(msgType)) {
+        log.info(`· 略过不支持的消息类型（${msgType}）`);
         return;
       }
       const eventId: string | undefined = ev.event_id;
@@ -306,7 +322,19 @@ export class FeishuBotChannel implements Channel {
       }
       const chatId: string = ev.chat_id;
       const messageId: string | undefined = ev.message_id ?? ev.id;
-      const text: string = (ev.content || '').toString().trim();
+      const rawContent: string = (ev.content || '').toString();
+      // For attachments the transcript keeps a compact marker ("[文件：x]" / "[图片]" / "[视频：x]"),
+      // while the LLM is handed the full inlined content (text files downloaded + excerpted).
+      const text: string = msgType === 'text' ? rawContent.trim() : attachmentMarker(msgType, rawContent);
+      let llmText: string = text;
+      if (msgType !== 'text') {
+        try {
+          const rendered = renderMessageBody({ msgType, content: rawContent, messageId }, { fetchFile, maxInlineChars: 2000 });
+          if (rendered) llmText = rendered;
+        } catch (e) {
+          log.warn('附件解析失败（按标注处理）：', (e as Error).message);
+        }
+      }
       if (!chatId || !text) return;
 
       // Thread (topic) id: scopes both the session and the context window. The flat event-consume
@@ -418,11 +446,44 @@ export class FeishuBotChannel implements Channel {
         context = renderContext(rows);
       } catch { /* best-effort */ }
 
+      // Attachment backfill: a file sent as its own message carries no @mention, so the bot never
+      // receives it as an event. When someone then @-mentions us to "look at this", pull recent chat
+      // history from the API and inline any files shared **in this same chat** within a short window —
+      // regardless of who shared them, because the person asking ("看看这个") is often not the person
+      // who posted the file. Same-chat only (never cross-chat), so a private group's files never leak
+      // into another chat's reply. Best-effort: never block a reply on it.
+      if (msgType === 'text') {
+        try {
+          const triggerMs = Number(ev.create_time);
+          const RECENT_WINDOW_MS = 30 * 60 * 1000;
+          const recent = listMessages(chatId, { pageSize: 15, sort: 'desc', profile });
+          const inlined = recent
+            .filter((m) => m.messageId !== messageId)
+            .filter((m) => m.msgType === 'file' || m.msgType === 'image' || m.msgType === 'media')
+            .filter((m) => {
+              const t = Number(m.createTime);
+              if (!Number.isFinite(triggerMs) || !Number.isFinite(t)) return true; // best-effort when times are missing
+              return triggerMs - t < RECENT_WINDOW_MS && t - triggerMs < 2 * 60 * 1000; // within ~30min before (small skew after)
+            })
+            .slice(0, 3)
+            .reverse()
+            .map((m) => renderMessageBody({ msgType: m.msgType, content: m.content, messageId: m.messageId }, { fetchFile: fetchFileFromHistory, maxInlineChars: 2000 }))
+            .filter(Boolean)
+            .map((line) => `本群近期共享的材料：${line}`);
+          if (inlined.length) {
+            context = inlined.join('\n') + (context ? '\n' + context : '');
+            log.info(`已回填 ${inlined.length} 份近期附件到上下文`);
+          }
+        } catch (e) {
+          log.warn('拉取近期附件失败（忽略）：', (e as Error).message);
+        }
+      }
+
       const sessionKey = sessionKeyFor(chatId, senderOpenId, threadId);
 
       // LLM path → enqueue for the serial worker. React immediately so the sender knows they were
       // seen: "coffee" if they must wait behind another reply, "thinking" if they're up next.
-      const job: BotJob = { messageId, chatId, text, senderOpenId, threadId: threadId || undefined, context, sessionKey, reaction: null, reactionId: null, pendingId: 0, isFirstInteraction, isP2p };
+      const job: BotJob = { messageId, chatId, text: llmText, senderOpenId, threadId: threadId || undefined, context, sessionKey, reaction: null, reactionId: null, pendingId: 0, isFirstInteraction, isP2p };
       // Persist BEFORE reacting/answering, so a crash at any point is recoverable on restart.
       job.pendingId = store.addPendingReply({
         agentId: cfg.id,
@@ -431,7 +492,7 @@ export class FeishuBotChannel implements Channel {
         messageId: messageId ?? null,
         sessionKey,
         senderOpenId: senderOpenId || null,
-        text,
+        text: llmText, // recovery re-runs with the same (inlined) content the LLM was asked to answer
         reactionId: null,
         ptSpent: 0,
         attempts: 0,
