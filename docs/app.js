@@ -1,4 +1,4 @@
-// Renders the tudigong Agent profile page from window.PROFILE_DATA.
+// Renders the tudigong agent profile page from window.PROFILE_DATA.
 // Handles the wish-form button logic (pre-filled Google Form link or placeholder modal).
 
 (function () {
@@ -105,7 +105,7 @@
 
     var btn = document.createElement('button');
     btn.className = 'plus-btn';
-    btn.setAttribute('aria-label', '许愿 / 提建议 — ' + text);
+    btn.setAttribute('aria-label', '立刻许愿 — ' + text);
     btn.title = '对「' + text + '」提建议或许愿';
     btn.textContent = '+';
     btn.addEventListener('click', function () { openWishForm(sectionKey); });
@@ -139,8 +139,12 @@
     var nameEl = el.querySelector('#hero-name');
     if (nameEl) nameEl.textContent = hero.name;
 
+    // Name link — points at the project repository.
     var nameEnEl = el.querySelector('#hero-name-en');
-    if (nameEnEl) nameEnEl.textContent = hero.nameEn;
+    if (nameEnEl) {
+      nameEnEl.textContent = hero.nameEn;
+      nameEnEl.href = window.PROFILE_DATA.config.repoUrl;
+    }
 
     // Tagline.
     var taglineEl = el.querySelector('#hero-tagline');
@@ -170,225 +174,7 @@
   }
 
   // ===================================================================
-  // Section B — Permissions
-  // ===================================================================
-
-  function renderPermissions() {
-    var perms = window.PROFILE_DATA.permissions;
-    var container = document.getElementById('permissions-content');
-    if (!container) return;
-
-    // --- Dual identity cards ---
-    var identityBlock = buildBlock('双身份架构');
-    var identityGrid = document.createElement('div');
-    identityGrid.className = 'grid grid-cols-1 sm:grid-cols-2 gap-4 mb-8';
-    perms.identity.forEach(function (id) {
-      var card = document.createElement('div');
-      card.className = 'glass-card p-5';
-      var roleLabel = document.createElement('div');
-      roleLabel.className = 'flex items-center gap-3 mb-3';
-      var badge = document.createElement('span');
-      badge.className = 'chip';
-      badge.textContent = id.role;
-      var labelSpan = document.createElement('span');
-      labelSpan.className = 'font-mono text-sm font-semibold gradient-text';
-      labelSpan.textContent = id.label;
-      roleLabel.appendChild(badge);
-      roleLabel.appendChild(labelSpan);
-      var desc = document.createElement('p');
-      desc.className = 'text-sm text-gray-400 leading-relaxed';
-      desc.textContent = id.description;
-      card.appendChild(roleLabel);
-      card.appendChild(desc);
-      identityGrid.appendChild(card);
-    });
-    identityBlock.appendChild(identityGrid);
-    container.appendChild(identityBlock);
-
-    // --- Lark profile note ---
-    var profileBlock = buildBlock('飞书 Profile');
-    var profileCard = document.createElement('div');
-    profileCard.className = 'glass-card p-5 mb-8';
-    profileCard.innerHTML = '<p class="text-sm text-gray-300 leading-relaxed">' + escHtml(perms.larkProfile) + '</p>';
-    profileBlock.appendChild(profileCard);
-    container.appendChild(profileBlock);
-
-    // --- Group tier cards ---
-    var tierBlock = buildBlock('监听群分级');
-    var tierGrid = document.createElement('div');
-    tierGrid.className = 'grid grid-cols-1 sm:grid-cols-3 gap-4 mb-8';
-    perms.groupTiers.forEach(function (tier, i) {
-      var card = document.createElement('div');
-      card.className = 'glass-card p-5';
-      var header = document.createElement('div');
-      header.className = 'flex items-center gap-2 mb-3';
-      var tierBadge = document.createElement('span');
-      tierBadge.className = ['chip', 'chip chip-blue', 'chip chip-green'][i] || 'chip';
-      tierBadge.textContent = tier.tier;
-      var tierLabel = document.createElement('span');
-      tierLabel.className = 'font-semibold text-white text-sm';
-      tierLabel.textContent = tier.label;
-      header.appendChild(tierBadge);
-      header.appendChild(tierLabel);
-      var desc = document.createElement('p');
-      desc.className = 'text-sm text-gray-400 leading-relaxed';
-      desc.textContent = tier.description;
-      card.appendChild(header);
-      card.appendChild(desc);
-      tierGrid.appendChild(card);
-    });
-    tierBlock.appendChild(tierGrid);
-    container.appendChild(tierBlock);
-
-    // --- MCP tools ---
-    var mcpBlock = buildBlock('MCP 工具清单（11 个）');
-    var mcpGrid = document.createElement('div');
-    mcpGrid.className = 'flex flex-wrap gap-2 mb-2';
-    perms.mcpTools.forEach(function (tool) {
-      var wrapper = document.createElement('div');
-      wrapper.className = 'tool-tooltip';
-      var chip = document.createElement('span');
-      chip.className = 'tool-chip';
-      chip.textContent = tool.name;
-      var tip = document.createElement('span');
-      tip.className = 'tooltip-text';
-      tip.textContent = tool.desc;
-      wrapper.appendChild(chip);
-      wrapper.appendChild(tip);
-      mcpGrid.appendChild(wrapper);
-    });
-    var mcpNote = document.createElement('p');
-    mcpNote.className = 'text-xs text-gray-500 mt-2 mb-8';
-    mcpNote.textContent = '悬停工具名称可查看功能说明。';
-    mcpBlock.appendChild(mcpGrid);
-    mcpBlock.appendChild(mcpNote);
-    container.appendChild(mcpBlock);
-
-    // --- Outbound guard ---
-    var guardBlock = buildBlock('安全闸门（outbound-guard）');
-    var guardWrap = document.createElement('div');
-    guardWrap.className = 'space-y-3 mb-4';
-    var g = perms.outboundGuard;
-    [
-      { cls: 'gate-card gate-card-1', data: g.gate1 },
-      { cls: 'gate-card gate-card-2', data: g.gate2 }
-    ].forEach(function (item) {
-      var card = document.createElement('div');
-      card.className = item.cls;
-      var label = document.createElement('div');
-      label.className = 'font-semibold text-sm text-white mb-1';
-      label.textContent = item.data.label;
-      var desc = document.createElement('p');
-      desc.className = 'text-sm text-gray-400 leading-relaxed';
-      desc.textContent = item.data.desc;
-      card.appendChild(label);
-      card.appendChild(desc);
-      guardWrap.appendChild(card);
-    });
-    var guardNote = document.createElement('p');
-    guardNote.className = 'text-xs text-gray-500 mb-8';
-    guardNote.textContent = g.note;
-    guardBlock.appendChild(guardWrap);
-    guardBlock.appendChild(guardNote);
-    container.appendChild(guardBlock);
-
-    // --- Capability limits ---
-    var limitsBlock = buildBlock('能力边界');
-    var limitsGrid = document.createElement('div');
-    limitsGrid.className = 'grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 mb-8';
-    perms.limits.forEach(function (item) {
-      var card = document.createElement('div');
-      card.className = 'glass-card p-4';
-      var lbl = document.createElement('div');
-      lbl.className = 'text-xs text-gray-500 mb-1';
-      lbl.textContent = item.label;
-      var val = document.createElement('div');
-      val.className = 'text-sm font-medium text-gray-200';
-      val.textContent = item.value;
-      card.appendChild(lbl);
-      card.appendChild(val);
-      limitsGrid.appendChild(card);
-    });
-    limitsBlock.appendChild(limitsGrid);
-    container.appendChild(limitsBlock);
-  }
-
-  // ===================================================================
-  // Section C — Database
-  // ===================================================================
-
-  function renderDatabase() {
-    var db = window.PROFILE_DATA.database;
-    var container = document.getElementById('database-content');
-    if (!container) return;
-
-    // Intro card.
-    var introCard = document.createElement('div');
-    introCard.className = 'glass-card p-5 mb-8';
-    introCard.innerHTML =
-      '<p class="text-sm text-gray-300 leading-relaxed mb-2">' + escHtml(db.intro) + '</p>'
-      + '<div class="flex flex-wrap gap-2 mt-3">'
-      + '<span class="db-badge db-badge-tudigong">.agent/tudigong.db</span>'
-      + '<span class="db-badge db-badge-shared">.agent/shared.db</span>'
-      + '</div>';
-    container.appendChild(introCard);
-
-    // Table grid.
-    var grid = document.createElement('div');
-    grid.className = 'grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5 mb-4';
-
-    db.tables.forEach(function (tbl) {
-      var card = document.createElement('div');
-      card.className = 'glass-card p-5 flex flex-col';
-
-      // Table name + db badge.
-      var header = document.createElement('div');
-      header.className = 'flex items-start justify-between gap-2 mb-2';
-
-      var nameSpan = document.createElement('span');
-      nameSpan.className = 'font-mono font-semibold text-base gradient-text';
-      nameSpan.textContent = tbl.name;
-
-      var dbBadge = document.createElement('span');
-      dbBadge.className = 'db-badge ' + (tbl.db === 'shared.db' ? 'db-badge-shared' : 'db-badge-tudigong');
-      dbBadge.style.marginTop = '2px';
-      dbBadge.textContent = tbl.db;
-
-      header.appendChild(nameSpan);
-      header.appendChild(dbBadge);
-
-      // Description.
-      var desc = document.createElement('p');
-      desc.className = 'text-xs text-gray-400 leading-relaxed mb-3 flex-grow';
-      desc.textContent = tbl.desc;
-
-      // Key fields.
-      var fieldList = document.createElement('div');
-      fieldList.className = 'space-y-1 border-t border-white border-opacity-5 pt-3';
-      tbl.fields.forEach(function (field) {
-        var item = document.createElement('div');
-        item.className = 'field-item';
-        item.textContent = field;
-        fieldList.appendChild(item);
-      });
-
-      card.appendChild(header);
-      card.appendChild(desc);
-      card.appendChild(fieldList);
-      grid.appendChild(card);
-    });
-
-    container.appendChild(grid);
-
-    // Tech tables note.
-    var techNote = document.createElement('p');
-    techNote.className = 'text-xs text-gray-500 text-center mt-2 mb-2';
-    techNote.textContent = db.techNote;
-    container.appendChild(techNote);
-  }
-
-  // ===================================================================
-  // Section D — Skills
+  // Section — Skills
   // ===================================================================
 
   function renderSkills() {
@@ -445,7 +231,7 @@
     container.appendChild(sharedBlock);
 
     // --- Abilities / gameplay ---
-    var abilitiesBlock = buildBlock('现有玩法与能力（' + skills.abilities.length + ' 项）');
+    var abilitiesBlock = buildBlock('代理功能（' + skills.abilities.length + ' 项）');
     var abilitiesGrid = document.createElement('div');
     abilitiesGrid.className = 'grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 mb-8';
     skills.abilities.forEach(function (ab) {
@@ -472,6 +258,48 @@
     });
     abilitiesBlock.appendChild(abilitiesGrid);
     container.appendChild(abilitiesBlock);
+  }
+
+  // ===================================================================
+  // Section — Community activity (data snapshot)
+  // ===================================================================
+
+  function renderDatabase() {
+    var db = window.PROFILE_DATA.database;
+    var container = document.getElementById('database-content');
+    if (!container) return;
+
+    // Intro text.
+    var introCard = document.createElement('div');
+    introCard.className = 'glass-card p-5 mb-8';
+    introCard.innerHTML = '<p class="text-sm text-gray-300 leading-relaxed">' + escHtml(db.intro) + '</p>';
+    container.appendChild(introCard);
+
+    // Activity cards — one per kind of community record it keeps.
+    var grid = document.createElement('div');
+    grid.className = 'grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5 mb-4';
+    db.tables.forEach(function (item) {
+      var card = document.createElement('div');
+      card.className = 'glass-card p-5 flex flex-col';
+      var title = document.createElement('div');
+      title.className = 'font-semibold text-base text-white mb-2';
+      title.textContent = item.label;
+      var desc = document.createElement('p');
+      desc.className = 'text-sm text-gray-400 leading-relaxed';
+      desc.textContent = item.desc;
+      card.appendChild(title);
+      card.appendChild(desc);
+      grid.appendChild(card);
+    });
+    container.appendChild(grid);
+
+    // Closing note.
+    if (db.note) {
+      var note = document.createElement('p');
+      note.className = 'text-xs text-gray-500 text-center mt-2 mb-2';
+      note.textContent = db.note;
+      container.appendChild(note);
+    }
   }
 
   // ===================================================================
@@ -504,9 +332,8 @@
 
   function injectSectionHeadings() {
     var sections = [
-      { placeholderId: 'heading-permissions', label: '权限与身份', key: '权限' },
-      { placeholderId: 'heading-database',    label: '数据库',     key: '数据库' },
-      { placeholderId: 'heading-skills',      label: '技能',       key: '技能' }
+      { placeholderId: 'heading-skills',   label: '技能',     key: '技能' },
+      { placeholderId: 'heading-database', label: '社区动态', key: '社区动态' }
     ];
     sections.forEach(function (s) {
       var el = document.getElementById(s.placeholderId);
@@ -529,12 +356,11 @@
     buildModal();
     renderHero();
     injectSectionHeadings();
-    renderPermissions();
-    renderDatabase();
     renderSkills();
+    renderDatabase();
 
     // Trigger fade-in on each major section container.
-    var sectionIds = ['hero-section', 'section-permissions', 'section-database', 'section-skills', 'site-footer'];
+    var sectionIds = ['hero-section', 'section-skills', 'section-database', 'site-footer'];
     sectionIds.forEach(function (id, i) {
       var el = document.getElementById(id);
       if (!el) return;
