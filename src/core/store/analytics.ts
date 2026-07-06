@@ -364,6 +364,46 @@ export function docViewersBetween(fromSec: number, toSec: number): Map<string, s
 }
 
 /**
+ * Return all RSVP rounds for one event, oldest first — the full signup-to-start history. RSVP polling
+ * only records an event while it is still upcoming, so this naturally spans signup-open to just before
+ * the event start. Used by the monthly report to chart each held event's complete signup trend.
+ */
+export function calendarEventRsvpAll(eventId: string): CalendarEventRsvpRoundRow[] {
+  return calendarEventRsvpHistory(eventId, 0, Number.MAX_SAFE_INTEGER);
+}
+
+/**
+ * Return distinct events whose start_time falls in [fromSec, toSec) — events that OCCURRED in the
+ * window, regardless of whether they are now past. The monthly report uses this instead of
+ * upcomingTrackedEventIds (which only finds still-future events and therefore drops every event of a
+ * closed month). title is the most-recent non-empty title recorded for that event.
+ */
+export function eventsStartingBetween(
+  fromSec: number,
+  toSec: number,
+): Array<{ eventId: string; title: string; startTime: number }> {
+  try {
+    const rows = getDb().prepare(`
+      SELECT r.event_id AS event_id, MAX(r.start_time) AS start_time,
+             (SELECT r2.title FROM calendar_event_rsvp_rounds r2
+               WHERE r2.event_id = r.event_id AND r2.title <> ''
+               ORDER BY r2.synced_at DESC LIMIT 1) AS title
+      FROM calendar_event_rsvp_rounds r
+      WHERE r.start_time >= ? AND r.start_time < ?
+      GROUP BY r.event_id
+      ORDER BY start_time ASC
+    `).all(fromSec, toSec) as Array<{ event_id: string; title: string | null; start_time: number }>;
+    return rows.map((r) => ({
+      eventId: String(r.event_id),
+      title: String(r.title ?? ''),
+      startTime: Number(r.start_time),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Return distinct upcoming (not yet started) event ids that have appeared in calendar_event_rsvp_rounds
  * and whose start_time > nowSec. Used to enumerate active signup-tracking events for the report.
  */

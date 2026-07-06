@@ -12,6 +12,9 @@ import {
   localDate,
   localDateFromEpochSec,
   localDateTimeFromEpochSec,
+  MAX_TIMEOUT_MS,
+  safeSetTimeout,
+  weeklyReportRange,
 } from './time.js';
 
 test('parseHHMM parses valid times to minutes-from-midnight', () => {
@@ -107,4 +110,123 @@ test('localDateFromEpochSec / localDateTimeFromEpochSec round-trip a known local
   const sec = Math.floor(d.getTime() / 1000);
   assert.equal(localDateFromEpochSec(sec), '2026-06-20');
   assert.equal(localDateTimeFromEpochSec(sec), '2026-06-20 09:08');
+});
+
+test('MAX_TIMEOUT_MS is Node\'s 32-bit setTimeout ceiling', () => {
+  assert.equal(MAX_TIMEOUT_MS, 2 ** 31 - 1);
+});
+
+test('safeSetTimeout fires once, after the full delay, when delay is under the chunk', async () => {
+  let count = 0;
+  await new Promise<void>((resolve) => {
+    safeSetTimeout(() => {
+      count += 1;
+      resolve();
+    }, 20);
+  });
+  assert.equal(count, 1);
+});
+
+test('safeSetTimeout chains beyond the chunk without firing early (the overflow-loop regression)', async () => {
+  // With a plain setTimeout, a delay above the ceiling overflows to 1ms and fires almost immediately —
+  // exactly what made the monthly ops report loop. Here chunkMs stands in for MAX_TIMEOUT_MS so the
+  // chaining path (delay > chunk) runs fast. The callback must NOT fire until the whole delay elapses.
+  let count = 0;
+  const firedEarly = await new Promise<boolean>((resolve) => {
+    safeSetTimeout(() => { count += 1; }, 60, 20); // 60ms via 20ms chunks -> 3 hops
+    // One chunk in, it must not have fired yet (a naive overflow would already be at count=1).
+    setTimeout(() => resolve(count > 0), 25);
+  });
+  assert.equal(firedEarly, false, 'callback fired before the full delay elapsed');
+
+  // And it eventually fires exactly once (no loop, no double-fire).
+  await new Promise<void>((r) => setTimeout(r, 80));
+  assert.equal(count, 1);
+});
+
+// --- weeklyReportRange ---
+// All tests use 2026-07-02 as the reference Thursday (the date is given as Thursday in the project
+// context). Dates: 2026-07-01 = Wednesday, 2026-07-02 = Thursday, 2026-07-03 = Friday,
+// and the previous Thursday is 2026-06-25.
+
+test('weeklyReportRange window is always exactly 7 days', () => {
+  const cases = [
+    new Date(2026, 6, 3, 10, 0, 0, 0),   // Friday
+    new Date(2026, 6, 2, 21, 0, 0, 0),   // Thursday exactly at 21:00
+    new Date(2026, 6, 2, 21, 1, 0, 0),   // Thursday at 21:01
+    new Date(2026, 6, 2, 20, 59, 0, 0),  // Thursday before 21:00
+    new Date(2026, 6, 1, 12, 0, 0, 0),   // Wednesday
+  ];
+  for (const ref of cases) {
+    const r = weeklyReportRange(ref);
+    assert.equal(r.to - r.from, 7 * 24 * 3600, `window should be 7 days for ${ref}`);
+  }
+});
+
+test('weeklyReportRange: to is always <= ref', () => {
+  const cases = [
+    new Date(2026, 6, 2, 21, 0, 0, 0),   // Thursday exactly at 21:00
+    new Date(2026, 6, 2, 21, 1, 0, 0),   // Thursday at 21:01
+    new Date(2026, 6, 2, 20, 59, 0, 0),  // Thursday before 21:00
+    new Date(2026, 6, 3, 10, 0, 0, 0),   // Friday
+    new Date(2026, 6, 1, 12, 0, 0, 0),   // Wednesday
+  ];
+  for (const ref of cases) {
+    const r = weeklyReportRange(ref);
+    assert.ok(r.to * 1000 <= ref.getTime(), `to should be <= ref for ${ref}`);
+  }
+});
+
+test('weeklyReportRange: Thursday exactly at 21:00 anchors to that instant', () => {
+  const ref = new Date(2026, 6, 2, 21, 0, 0, 0); // 2026-07-02 Thursday 21:00
+  const r = weeklyReportRange(ref);
+  const d = new Date(r.to * 1000);
+  assert.equal(d.getDay(), 4);           // Thursday
+  assert.equal(d.getHours(), 21);
+  assert.equal(d.getMinutes(), 0);
+  assert.equal(d.getDate(), 2);          // July 2
+  assert.equal(d.getMonth(), 6);         // July (0-based)
+  assert.equal(d.getFullYear(), 2026);
+});
+
+test('weeklyReportRange: Thursday at 21:01 anchors to 21:00 of the same day', () => {
+  const ref = new Date(2026, 6, 2, 21, 1, 0, 0); // 2026-07-02 Thursday 21:01
+  const r = weeklyReportRange(ref);
+  const d = new Date(r.to * 1000);
+  assert.equal(d.getDay(), 4);
+  assert.equal(d.getHours(), 21);
+  assert.equal(d.getDate(), 2);
+  assert.equal(d.getMonth(), 6);
+});
+
+test('weeklyReportRange: Thursday before 21:00 steps back to the previous Thursday 21:00', () => {
+  const ref = new Date(2026, 6, 2, 20, 59, 0, 0); // 2026-07-02 Thursday 20:59
+  const r = weeklyReportRange(ref);
+  const d = new Date(r.to * 1000);
+  assert.equal(d.getDay(), 4);
+  assert.equal(d.getHours(), 21);
+  assert.equal(d.getDate(), 25);         // 2026-06-25 (previous Thursday)
+  assert.equal(d.getMonth(), 5);         // June
+  assert.equal(d.getFullYear(), 2026);
+});
+
+test('weeklyReportRange: Friday anchors to the Thursday 21:00 of the same week', () => {
+  const ref = new Date(2026, 6, 3, 10, 0, 0, 0); // 2026-07-03 Friday 10:00
+  const r = weeklyReportRange(ref);
+  const d = new Date(r.to * 1000);
+  assert.equal(d.getDay(), 4);
+  assert.equal(d.getHours(), 21);
+  assert.equal(d.getDate(), 2);          // 2026-07-02 Thursday
+  assert.equal(d.getMonth(), 6);
+});
+
+test('weeklyReportRange: Wednesday anchors to the previous Thursday 21:00', () => {
+  const ref = new Date(2026, 6, 1, 12, 0, 0, 0); // 2026-07-01 Wednesday 12:00
+  const r = weeklyReportRange(ref);
+  const d = new Date(r.to * 1000);
+  assert.equal(d.getDay(), 4);
+  assert.equal(d.getHours(), 21);
+  assert.equal(d.getDate(), 25);         // 2026-06-25 Thursday
+  assert.equal(d.getMonth(), 5);         // June
+  assert.equal(d.getFullYear(), 2026);
 });

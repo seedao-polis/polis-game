@@ -90,6 +90,8 @@ export interface LarkFile {
   notifyChat: string;
   discovery: { mode: string; refreshMinutes: number; refreshMs?: number; staggerMs?: number };
   event: { key: string };
+  /** Wiki coordinates for the weekly community ops report page. */
+  weeklyReportWiki?: { spaceId: string; parentNodeToken: string };
 }
 
 export interface KimiProfile {

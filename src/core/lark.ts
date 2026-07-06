@@ -453,6 +453,109 @@ export function listWikiNodesDeep(spaceId: string, opts: { profile?: string } = 
   return all;
 }
 
+/** Result of a successful wiki node creation. */
+export interface CreatedWikiNode {
+  nodeToken: string;
+  /** obj_token of the underlying docx document. */
+  documentId: string;
+}
+
+/**
+ * Create a new wiki node (docx type, origin ownership) as a child of `parentNodeToken` inside
+ * `spaceId`. Uses the native wiki/v2 API — success is code===0. The caller must supply a `profile`
+ * that holds a user identity with `wiki:node:create` and `docx:document:create` scopes.
+ *
+ * Throws {@link LarkApiError} on API rejection; returns the pair (nodeToken, documentId) on success.
+ */
+export function createWikiNode(
+  spaceId: string,
+  parentNodeToken: string,
+  title: string,
+  opts: { profile?: string } = {}
+): CreatedWikiNode {
+  const body = {
+    parent_node_token: parentNodeToken,
+    obj_type: 'docx',
+    node_type: 'origin',
+    title,
+  };
+  const res = larkExec(
+    ['api', 'POST', `/open-apis/wiki/v2/spaces/${spaceId}/nodes`,
+      '--data', JSON.stringify(body),
+      '--as', 'user',
+      '--format', 'json'],
+    { profile: opts.profile }
+  );
+  if (res?.code !== 0) {
+    throw new LarkApiError(`创建知识库节点失败（space=${spaceId}）`, res);
+  }
+  const node = res?.data?.node;
+  const nodeToken = typeof node?.node_token === 'string' ? node.node_token : '';
+  const documentId = typeof node?.obj_token === 'string' ? node.obj_token : '';
+  if (!nodeToken || !documentId) {
+    throw new LarkApiError('创建知识库节点：响应缺少 node_token / obj_token', res);
+  }
+  return { nodeToken, documentId };
+}
+
+/**
+ * Write content into an existing docx document: append to the end (default) or replace the whole
+ * body (opts.overwrite). Content is Feishu docx v2 block XML by default, or Markdown when
+ * opts.format is 'markdown' — Feishu renders Markdown headings, bullet lists, links, and network
+ * images into native docx blocks. Uses `docs +update --api-version v2`.
+ *
+ * Requires the profile to hold both `docx:document:write_only` and `docx:document:readonly` scopes
+ * as user identity: the shortcut reads the document to locate the end block before writing.
+ *
+ * Returns true when the shortcut reports ok; returns false when the API rejects the request, so the
+ * caller can degrade gracefully without crashing the pipeline.
+ */
+export function appendDocxContent(
+  documentId: string,
+  content: string,
+  opts: { profile?: string; overwrite?: boolean; format?: 'markdown' | 'xml' } = {}
+): boolean {
+  const args = ['docs', '+update',
+    '--api-version', 'v2',
+    '--doc', documentId,
+    '--command', opts.overwrite ? 'overwrite' : 'append',
+    '--content', content,
+    '--as', 'user',
+    '--format', 'json'];
+  if (opts.format === 'markdown') args.push('--doc-format', 'markdown');
+  const res = larkExec(args, { profile: opts.profile });
+  return res?.ok === true;
+}
+
+/**
+ * Insert an image into an existing docx document at a best-effort position using
+ * `docs +media-insert`. Handles the multi-step upload-and-embed orchestration transparently.
+ * Requires `docs:document.media:upload` scope as user identity.
+ *
+ * `filePath` must be either an absolute path or a path relative to the current working directory.
+ * Returns true on success, false on any failure; never throws so it can safely wrap optional steps.
+ */
+export function insertDocxImage(
+  documentId: string,
+  filePath: string,
+  opts: { profile?: string } = {}
+): boolean {
+  try {
+    const res = larkExec(
+      ['docs', '+media-insert',
+        '--doc', documentId,
+        '--file', filePath,
+        '--type', 'image',
+        '--as', 'user',
+        '--format', 'json'],
+      { profile: opts.profile }
+    );
+    return res?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * List the files and folders directly under a Drive folder (the user's root when folderToken is
  * empty), paging until exhausted. Native command — success is code===0, entries in data.files.

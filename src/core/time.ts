@@ -11,6 +11,28 @@ export const LOGICAL_DAY_START_HOUR = 5;
 /** Milliseconds in a 24h day. */
 export const DAY_MS = 86_400_000;
 
+/** Node's setTimeout ceiling: 2^31-1 ms (~24.8 days). Larger delays silently overflow. */
+export const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * setTimeout that tolerates delays beyond Node's ~24.8-day (2^31-1 ms) ceiling. Node clamps an
+ * out-of-range delay to 1ms and fires almost immediately (emitting a TimeoutOverflowWarning) — which
+ * turns any self-rescheduling monthly/yearly timer into a tight infinite loop. This chains
+ * intermediate timeouts so the callback only runs once the full delay has actually elapsed.
+ * `chunkMs` is injectable for testing; production callers should leave it at the default.
+ */
+export function safeSetTimeout(
+  cb: () => void,
+  delayMs: number,
+  chunkMs: number = MAX_TIMEOUT_MS
+): ReturnType<typeof setTimeout> {
+  const remaining = Math.max(0, delayMs);
+  if (remaining <= chunkMs) return setTimeout(cb, remaining);
+  return setTimeout(() => {
+    safeSetTimeout(cb, remaining - chunkMs, chunkMs);
+  }, chunkMs);
+}
+
 function pad2(n: number): string {
   return String(n).padStart(2, '0');
 }
@@ -77,4 +99,27 @@ export function localDateFromEpochSec(sec: number): string {
 export function localDateTimeFromEpochSec(sec: number): string {
   const d = new Date(sec * 1000);
   return `${localDate(d)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/**
+ * Compute the weekly report window anchored at the most-recent Thursday 21:00 local time at or
+ * before `ref`. `to` is that Thursday's 21:00 in epoch seconds; `from` is exactly 7 days prior.
+ *
+ * Uses local time throughout — never toISOString() — so the anchor is stable in the server
+ * timezone (expected: Asia/Shanghai, UTC+8). Edge cases:
+ *   - Thursday exactly at 21:00 → `to` = that instant (inclusive).
+ *   - Thursday before 21:00   → `to` = the *previous* Thursday 21:00.
+ *   - Any other weekday        → `to` = the most recent past Thursday 21:00.
+ */
+export function weeklyReportRange(ref: Date): { from: number; to: number } {
+  const day = ref.getDay(); // 0 = Sun, 4 = Thu, 6 = Sat
+  // Number of calendar days since the most recent Thursday.
+  const daysBack = (day - 4 + 7) % 7;
+  const thursday = new Date(
+    ref.getFullYear(), ref.getMonth(), ref.getDate() - daysBack, 21, 0, 0, 0
+  );
+  // When today IS Thursday but the clock is still before 21:00, step back one week so to <= ref.
+  if (thursday > ref) thursday.setDate(thursday.getDate() - 7);
+  const to = Math.floor(thursday.getTime() / 1000);
+  return { from: to - 7 * 24 * 3600, to };
 }

@@ -10,6 +10,8 @@ import { sendText } from './lark.js';
 import { flushTelegramSync } from './telegram.js';
 import { listScheduledEvents, rollScheduledEvent, type EventSchedule } from './events.js';
 import { generateAndSendDailyReport, generateAndSendMonthlyReport } from './ops-report.js';
+import { generateAndSendWeeklyReport } from './weekly-report.js';
+import { checkUserTokenExpiry } from './token-watch.js';
 import { purgeExpiredMemories, listKnownChatIds } from './store/memory.js';
 import { aggregateGroupTopics } from './group-intel.js';
 import {
@@ -19,6 +21,8 @@ import {
   parseHHMM,
   formatHHMM,
   clampDayOfMonth,
+  safeSetTimeout,
+  localDateTimeFromEpochSec,
 } from './time.js';
 
 // ── serve supervisor (hot reload) ─────────────────────────────
@@ -131,7 +135,10 @@ function scheduleMonthlyOpsReport(): void {
   const now = new Date();
   let next = new Date(now.getFullYear(), now.getMonth(), 1, 4, 59, 0, 0);
   if (next <= now) next = new Date(now.getFullYear(), now.getMonth() + 1, 1, 4, 59, 0, 0);
-  setTimeout(async () => {
+  // The re-anchor delay is always ~28-31 days, which exceeds setTimeout's 2^31-1 ms (~24.8-day)
+  // ceiling. A plain setTimeout would overflow that to 1ms and fire almost immediately, re-generating
+  // the report in a tight loop; safeSetTimeout chains the wait so it fires once, on the 1st at 04:59.
+  safeSetTimeout(async () => {
     try {
       // At 04:59 on the 1st "now" still sits inside the closing logical month.
       await generateAndSendMonthlyReport(new Date(), opsReportTargets());
@@ -140,6 +147,43 @@ function scheduleMonthlyOpsReport(): void {
     }
     setTimeout(scheduleMonthlyOpsReport, 0); // re-anchor to the next month's 1st 04:59
   }, next.getTime() - now.getTime());
+}
+
+/**
+ * Schedule the weekly community ops report at every Thursday 21:00 local time. Self-reschedules
+ * after each run so the cadence continues indefinitely. Weekly delay (7 days = 604,800,000 ms)
+ * is below Node's 2^31-1 ms ceiling (~24.8 days), so a plain setTimeout is safe.
+ */
+function scheduleWeeklyOpsReport(): void {
+  const now = new Date();
+  const day = now.getDay(); // 0=Sun, 4=Thu
+  const daysToThursday = (4 - day + 7) % 7;
+  const next = new Date(
+    now.getFullYear(), now.getMonth(), now.getDate() + daysToThursday, 21, 0, 0, 0
+  );
+  // If today is Thursday and we're already at or past 21:00, advance to next Thursday.
+  if (next <= now) next.setDate(next.getDate() + 7);
+
+  const msUntilNext = next.getTime() - now.getTime();
+  log.info(`周报排程：下次触发 ${localDateTimeFromEpochSec(Math.floor(next.getTime() / 1000))}`);
+
+  setTimeout(async () => {
+    // Proactively check user token expiry before the report run so auth issues surface early.
+    try {
+      const profile = eventSendProfile();
+      if (profile) await checkUserTokenExpiry(profile);
+    } catch (e) {
+      log.warn('周报 token 检查失败：', (e as Error).message);
+    }
+    try {
+      await generateAndSendWeeklyReport(new Date(), {
+        notifyChatId: opsReportTargets().larkChat,
+      });
+    } catch (e) {
+      log.error('每周社区动态周报生成失败：', (e as Error).message);
+    }
+    setTimeout(scheduleWeeklyOpsReport, 0); // re-anchor to the next Thursday 21:00
+  }, msUntilNext);
 }
 
 // A "logical day" runs from DAY_START_HOUR (05:00) local to the next day's 04:59 — the same anchor as
@@ -563,6 +607,7 @@ export function runSupervisor(opts: SupervisorOptions): Promise<void> {
   scheduleDailyMemoryMaintenance(); // daily 04:50 memory TTL purge + group topic aggregation
   scheduleDailyOpsReport();    // daily 04:55 ops report (closing logical day) -> 运营小天地 + Telegram
   scheduleMonthlyOpsReport();  // monthly on 1st at 04:55 ops report (closing logical month)
+  scheduleWeeklyOpsReport();   // weekly Thursday 21:00 community ops report -> wiki + 运营小天地
   scheduleEventDayPlanner(); // daily 05:00 logical-day planner
   planAndArmEvents();        // and plan/arm today's day-based events now (covers a mid-day start)
   armMinuteEvents();         // start recurring ticks for minute-cadence events

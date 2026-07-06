@@ -33,6 +33,7 @@ import { enableLogSink, flushTelegramSync, isTelegramConfigured, sendTelegramMes
 import { checkUserTokenExpiry, describeTokenExpiry } from '../core/token-watch.js';
 import { startHeartbeat } from '../core/heartbeat.js';
 import { generateAndSendDailyReport, generateAndSendMonthlyReport } from '../core/ops-report.js';
+import { generateAndSendWeeklyReport } from '../core/weekly-report.js';
 import { getFlag, hasFlag } from '../core/argv.js';
 
 // Load .env (Node >=20.12 built-in) so secrets like TELEGRAM_* reach process.env without a dotenv
@@ -1142,8 +1143,12 @@ async function cmd_run(argv: string[]): Promise<void> {
 
 async function cmd_report(argv: string[]): Promise<void> {
   const period = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
-  if (period !== 'daily' && period !== 'monthly') {
-    log.error('用法: agent report daily|monthly [--date YYYY-MM-DD] [--lark-user <open_id>] [--lark-chat <chat_id>]');
+  if (period !== 'daily' && period !== 'monthly' && period !== 'weekly') {
+    log.error(
+      '用法: agent report daily|monthly|weekly [--date YYYY-MM-DD] [...options]\n' +
+        '      daily/monthly: [--lark-user <open_id>] [--lark-chat <chat_id>] [--no-narrative]\n' +
+        '      weekly: [--dry-run] [--no-narrative] [--space-id <id>] [--wiki-token <token>]',
+    );
     process.exit(1);
   }
   const dateArg = getFlag(argv, 'date');
@@ -1152,21 +1157,39 @@ async function cmd_report(argv: string[]): Promise<void> {
     log.error(`无效日期【${dateArg}】，请使用 YYYY-MM-DD 格式。`);
     process.exit(1);
   }
-  // Optional Feishu delivery: --lark-user <open_id> for a P2P preview, --lark-chat <chat_id> for a group.
-  // --no-narrative skips the AI community-ops narrative (daily only) for a fast charts-only run.
-  const targets = {
-    larkUser: getFlag(argv, 'lark-user'),
-    larkChat: getFlag(argv, 'lark-chat'),
-    narrative: hasFlag(argv, 'no-narrative') ? false : undefined,
-  };
   // Mirror logs to Telegram so this one-shot CLI's activity appears in the log channel.
   enableLogSink();
   process.on('exit', () => { try { flushTelegramSync(); } catch { /* best-effort */ } });
   try {
     if (period === 'daily') {
+      // Optional Feishu delivery: --lark-user for P2P preview, --lark-chat for group post.
+      const targets = {
+        larkUser: getFlag(argv, 'lark-user'),
+        larkChat: getFlag(argv, 'lark-chat'),
+        narrative: hasFlag(argv, 'no-narrative') ? false : undefined,
+      };
       await generateAndSendDailyReport(ref, targets);
-    } else {
+    } else if (period === 'monthly') {
+      const targets = {
+        larkUser: getFlag(argv, 'lark-user'),
+        larkChat: getFlag(argv, 'lark-chat'),
+        narrative: hasFlag(argv, 'no-narrative') ? false : undefined,
+      };
       await generateAndSendMonthlyReport(ref, targets);
+    } else {
+      // weekly: --dry-run skips all wiki writes and notification; --no-narrative omits AI section;
+      // --no-notify creates the wiki page but skips the group notification.
+      // --space-id and --wiki-token override the configured wiki coordinates for testing.
+      const weeklyOpts = {
+        dryRun: hasFlag(argv, 'dry-run'),
+        narrative: hasFlag(argv, 'no-narrative') ? false : undefined,
+        notify: hasFlag(argv, 'no-notify') ? false : undefined,
+        spaceId: getFlag(argv, 'space-id'),
+        parentNodeToken: getFlag(argv, 'wiki-token'),
+        reuseDocumentId: getFlag(argv, 'reuse-doc'),
+        reuseNodeToken: getFlag(argv, 'reuse-node'),
+      };
+      await generateAndSendWeeklyReport(ref, weeklyOpts);
     }
     console.log('运营报告已生成并发送。');
   } catch (e) {
