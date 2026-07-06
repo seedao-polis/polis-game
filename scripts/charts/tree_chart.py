@@ -69,15 +69,16 @@ def draw_tree_chart(chart: dict, out_png: str, dpi: int = 200) -> None:
     """Render a knowledge-base browsing-hotspot tree.
 
     The canvas grows with the tree's breadth and depth so labels never crowd. Each circle's radius
-    scales linearly between the chart's minimum and maximum browse counts, so small differences in
-    reader count are visible. Folder nodes with no browses render as a uniform small dot.
+    scales linearly between the chart's minimum and maximum distinct-reader counts, so small
+    differences in reader count are visible. Folder nodes with no readers render as a uniform small dot.
 
     chart keys:
       title    - chart title
       subtitle - optional line under the title (e.g. statistics time range)
       nodes    - list of {token, parent (token or null), title, readers, nonstaff}
+                 readers/nonstaff are DISTINCT reader counts (deduplicated per person), not raw views.
     Node color fades from staff blue to non-staff red by the non-staff share (nonstaff / readers).
-    Each browsed node shows "(non-staff) total" browse counts at the top-left of its circle.
+    Each read node shows "(non-staff readers) distinct readers" at the top-left of its circle.
     """
     G: nx.DiGraph = nx.DiGraph()
     for n in chart.get("nodes", []):
@@ -135,7 +136,7 @@ def draw_tree_chart(chart: dict, out_png: str, dpi: int = 200) -> None:
                            node_color=node_colors, alpha=1.0, linewidths=0)
     nx.draw_networkx_labels(G, pos, labels, ax=ax, font_size=8, font_color="#e9ecef")
 
-    # "(non-staff) total" browse counts printed at the top-left of each browsed circle.
+    # "(non-staff readers) distinct readers" printed at the top-left of each read circle.
     for t in G.nodes:
         if readers[t] <= 0:
             continue
