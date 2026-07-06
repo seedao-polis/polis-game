@@ -13,6 +13,8 @@ import {
 import {
   memberSyncRoundsBetween,
   calendarEventRsvpHistory,
+  calendarEventRsvpAll,
+  eventsStartingBetween,
   wikiSpacesBetween,
   docViewersBetween,
   chatMemberOpenIds,
@@ -184,26 +186,73 @@ function buildMemberLine(range: { from: number; to: number }): LineSeries {
   };
 }
 
-/**
- * Build per-event signup line series for events not yet started as of the current moment, as raw
- * 5-minute points across the whole range. Internal-meeting titles are excluded.
- */
-function buildSignupLines(range: { from: number; to: number }): LineSeries[] {
-  const nowSec = Math.floor(Date.now() / 1000);
-  const events = upcomingTrackedEventIds(nowSec).filter(
-    (ev) => !EXCLUDED_EVENT_KEYWORDS.some((kw) => ev.title.includes(kw)),
-  );
-  const lines: LineSeries[] = [];
+/** Monthly signup chart downsample bucket: one point per hour keeps a month-long, multi-event trend
+ *  readable instead of thousands of raw 5-minute points. */
+const SIGNUP_BUCKET_SEC = 3600;
 
+const isTrackedEventTitle = (title: string): boolean =>
+  !EXCLUDED_EVENT_KEYWORDS.some((kw) => title.includes(kw));
+
+/**
+ * Downsample a running-count series to one representative point per SIGNUP_BUCKET_SEC bucket, keeping
+ * the LAST value seen in each bucket (the accepted count as of that hour). A closing point is appended
+ * at endSec (the event start) so the line clearly terminates when signup closes. Points must be sorted
+ * ascending by t. Pure/exported for testing.
+ */
+export function bucketSignupPoints(points: ChartPoint[], endSec: number): ChartPoint[] {
+  if (points.length === 0) return [];
+  const out: ChartPoint[] = [];
+  let curBucket = Math.floor(points[0]!.t / SIGNUP_BUCKET_SEC);
+  let last = points[0]!;
+  for (const p of points) {
+    const b = Math.floor(p.t / SIGNUP_BUCKET_SEC);
+    if (b !== curBucket) {
+      out.push(last);
+      curBucket = b;
+    }
+    last = p;
+  }
+  out.push(last);
+  // Extend the line to the event start with the final count so it visibly ends at signup close.
+  if (endSec > last.t) out.push({ t: endSec, y: last.y });
+  return out;
+}
+
+/**
+ * Build per-event signup line series.
+ *  - daily: events still upcoming as of now, raw 5-minute points across the day (live tracking).
+ *  - monthly: every event whose start_time fell in the month, each drawn as its full signup-to-start
+ *    trend (from first recorded round up to the event start), downsampled to hourly points. This is a
+ *    retrospective of the closed month, so past events must be included — upcomingTrackedEventIds would
+ *    drop them all.
+ * Internal-meeting titles are excluded in both modes.
+ */
+function buildSignupLines(period: Period, range: { from: number; to: number }): LineSeries[] {
+  return period === 'monthly' ? buildMonthlySignupLines(range) : buildDailySignupLines(range);
+}
+
+function buildDailySignupLines(range: { from: number; to: number }): LineSeries[] {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const events = upcomingTrackedEventIds(nowSec).filter((ev) => isTrackedEventTitle(ev.title));
+  const lines: LineSeries[] = [];
   for (const ev of events) {
     const rounds = calendarEventRsvpHistory(ev.eventId, range.from, range.to);
     if (rounds.length === 0) continue;
-    lines.push({
-      name: ev.title,
-      points: rounds.map((r) => ({ t: r.syncedAt, y: r.accepted })),
-    });
+    lines.push({ name: ev.title, points: rounds.map((r) => ({ t: r.syncedAt, y: r.accepted })) });
   }
+  return lines;
+}
 
+function buildMonthlySignupLines(range: { from: number; to: number }): LineSeries[] {
+  const events = eventsStartingBetween(range.from, range.to).filter((ev) => isTrackedEventTitle(ev.title));
+  const lines: LineSeries[] = [];
+  for (const ev of events) {
+    // Full history up to the event start (RSVP polling already stops at start, so this is the whole curve).
+    const rounds = calendarEventRsvpAll(ev.eventId).filter((r) => r.syncedAt <= ev.startTime);
+    if (rounds.length === 0) continue;
+    const points = bucketSignupPoints(rounds.map((r) => ({ t: r.syncedAt, y: r.accepted })), ev.startTime);
+    lines.push({ name: ev.title, points });
+  }
   return lines;
 }
 
@@ -309,25 +358,30 @@ function buildTextSummary(
     lines.push('· 围观群人数：暂无数据');
   }
 
-  // Signup totals.
+  // Signup totals. Monthly is a retrospective of events held that month; daily tracks still-upcoming ones.
   if (signupLines.length === 0) {
-    lines.push('· 活动报名：无进行中追踪活动');
+    lines.push(period === 'monthly' ? '· 活动报名：本月无活动' : '· 活动报名：无进行中追踪活动');
   } else {
     let totalSignups = 0;
     for (const s of signupLines) {
       const last = s.points.at(-1);
       if (last) totalSignups += last.y;
     }
-    lines.push(`· 活动报名：追踪 ${signupLines.length} 场活动，累计报名 ${totalSignups} 人`);
+    lines.push(
+      period === 'monthly'
+        ? `· 活动报名：本月 ${signupLines.length} 场活动，累计报名 ${totalSignups} 人`
+        : `· 活动报名：追踪 ${signupLines.length} 场活动，累计报名 ${totalSignups} 人`,
+    );
   }
 
-  // Wiki readers and top docs.
+  // Wiki readers and top docs. Each doc's reader count is deduplicated per person; the total sums
+  // those per-doc counts, so it is reader-instances (a person reading N docs counts N), not distinct people.
   const readerDocs = wikiNodes.filter((n) => n.readers > 0);
   if (readerDocs.length === 0) {
-    lines.push('· 知识库浏览：暂无浏览数据');
+    lines.push('· 知识库阅读：暂无阅读数据');
   } else {
     const totalReaders = readerDocs.reduce((sum, n) => sum + n.readers, 0);
-    lines.push(`· 知识库浏览：${totalReaders} 位读者，覆盖 ${readerDocs.length} 份知识库文档`);
+    lines.push(`· 知识库阅读：累计 ${totalReaders} 读者人次（去重读者），覆盖 ${readerDocs.length} 份知识库文档`);
   }
 
   return lines.join('\n');
@@ -452,7 +506,7 @@ async function generateAndSendReport(period: Period, ref: Date, targets: ReportT
   log.info(`运营报告生成开始（period=${period}，date=${dateLabel}）`);
 
   const memberLine = buildMemberLine(range);
-  const signupLines = buildSignupLines(range);
+  const signupLines = buildSignupLines(period, range);
   const wikiNodes = await buildWikiTreeNodes(range);
 
   // Output under the repo so lark-cli's cwd-relative file sandbox can upload the images.
@@ -480,7 +534,9 @@ async function generateAndSendReport(period: Period, ref: Date, targets: ReportT
     charts.push({
       type: 'line',
       key: 'signup',
-      title: `${dateSlash} 活动报名人数趋势`,
+      title: period === 'monthly'
+        ? `${dateSlash} 各活动报名趋势（报名至活动开始）`
+        : `${dateSlash} 活动报名人数趋势`,
       y_label: '报名人数',
       x_format: xFmt,
       lines: signupLines,
@@ -492,8 +548,8 @@ async function generateAndSendReport(period: Period, ref: Date, targets: ReportT
     charts.push({
       type: 'tree',
       key: 'wiki',
-      title: '知识库浏览热点',
-      subtitle: `统计时间 ${localDateTimeFromEpochSec(range.from)} ~ ${localDateTimeFromEpochSec(range.to)}　偏红=非工作人员浏览越多　次数格式: (非工作人员浏览) 总浏览次数`,
+      title: '知识库阅读热点（去重读者数）',
+      subtitle: `统计时间 ${localDateTimeFromEpochSec(range.from)} ~ ${localDateTimeFromEpochSec(range.to)}　偏红=非工作人员读者占比越高　格式: (非工作人员读者数) 去重读者数`,
       nodes: wikiNodes,
     });
   }
@@ -560,7 +616,7 @@ async function generateAndSendReport(period: Period, ref: Date, targets: ReportT
   const captions: Record<string, string> = {
     member: `【${label}运营报告 ${dateLabel}】围观群人数`,
     signup: `【${label}运营报告 ${dateLabel}】活动报名人数`,
-    wiki: `【${label}运营报告 ${dateLabel}】知识库浏览热点`,
+    wiki: `【${label}运营报告 ${dateLabel}】知识库阅读热点（去重读者数）`,
   };
 
   for (const key of orderedKeys) {

@@ -16,8 +16,9 @@ Node 查 SQLite + 即时采集 wiki 节点树 → 组 JSON spec → `spawn` Pyth
 ## 三块数据来源（store.ts 末尾新增的辅助函数）
 
 - **入口群人数**：`member_sync_rounds.present_external` 代理唯一围观群（`oc_example_public_group`）。`memberSyncRoundsBetween(from,to)`。⚠️ 偶有**单点读取故障凹陷**（如 201 夹在 267/269 之间）→ `dropMemberDips()` 过滤（同时低于前后邻点 85% 即剔除）；那一条 v 也可直接从 DB 删（已删过 `synced_at=1781885438`）。
-- **活动报名**：`calendarEventRsvpHistory(eventId,from,to)` + `upcomingTrackedEventIds(now)`（只取 `start>now` 未开始的）。`EXCLUDED_EVENT_KEYWORDS` 排除内部会议（含 `市政厅每周二`——⚠️ 真实日历标题是【市政厅每周二**晚**七点工作会】，用子串匹配，别写全名漏【晚】）。`accepted` 为报名主指标。
+- **活动报名**：`EXCLUDED_EVENT_KEYWORDS` 排除内部会议（含 `市政厅每周二`——⚠️ 真实日历标题是【市政厅每周二**晚**七点工作会】，用子串匹配，别写全名漏【晚】）。`accepted` 为报名主指标。**日报**：`upcomingTrackedEventIds(now)`（只取 `start>now` 未开始的）+ `calendarEventRsvpHistory(eventId,from,to)`（当天原始 5 分钟点，实时追踪未开始活动）。**月报（2026-07-01 改，之前是错的）**：不能用 `upcomingTrackedEventIds`——月报在次月 1 号跑，当月活动全部已过 `start<now` 会被**全部漏掉**（图里空白）。改用 `eventsStartingBetween(from,to)`（按 `start_time` 落在报告月内选活动，含已过的）+ `calendarEventRsvpAll(eventId)`（整段报名史）；每条线画【从报名到活动开始】（`syncedAt<=startTime`、末尾补一个 `startTime` 收尾点让线止于开始），并用 `bucketSignupPoints()` 按 **`SIGNUP_BUCKET_SEC=3600`（每小时）降采样**（月尺度原始 5 分钟点太密不可读）。标题月报=【各活动报名趋势（报名至活动开始）】。`bucketSignupPoints` 是纯函数、有单测（`ops-report.test.ts`）。
 - **知识库浏览热点**：即时 `listWikiNodesDeep`（`WikiNode` 已加 `parentNodeToken`、`listWikiChildNodes` 已解析 `parent_node_token`）；space_id 从 `doc_view_events` distinct **动态取**（`wikiSpacesBetween`，无需配置 env）；`docViewersBetween(from,to)` 返回每文件 viewer open_id 列表。**剪枝**：只留 `readers>0` 的节点 + 其祖先路径（否则上千节点不可读）。**排除具体档案标题**（`.png/.gif/.jpg/.jpeg/.pdf/.md`，`isExcludedFileTitle`）。
+- ⚠️ **树上的数字是【去重读者数】不是浏览次数（2026-07-01 澄清）**：`docViewersBetween` 是 `SELECT DISTINCT file_token, viewer_id`，所以每个节点圆圈的数字 = 该文档**去重读者数**（一人看多次只算一），`nonstaff` = 其中非工作人员去重读者数；标签 `(非工作人员读者数) 去重读者数`。**曾经的坑**：值本来就是去重读者，但副标题 / 标题误写成【总浏览次数】，让人以为是浏览次数——已把标题改【知识库阅读热点（去重读者数）】、副标题改【格式: (非工作人员读者数) 去重读者数】、TG caption 同步。日报月报同一条码路（`buildWikiTreeNodes` 与 period 无关），两边都是去重。文字摘要 `totalReaders` 是各文档去重读者**相加**=读者人次（一人看 N 篇算 N），措辞已改【累计 N 读者人次（去重读者），覆盖 M 份文档】别当成去重人头。
 
 ## 工作人员归类（红蓝着色）
 
@@ -45,6 +46,7 @@ Node 查 SQLite + 即时采集 wiki 节点树 → 组 JSON spec → `spawn` Pyth
 - supervisor 挂 `scheduleDailyOpsReport`（每日 **04:59**，2026-06-26 从 04:55 改）+ `scheduleMonthlyOpsReport`（每月 1 日 04:59），都 `{ larkChat: 运营小天地 }`（经 `opsReportTargets()` 解析）+ Telegram。
 - ⚠️ **为什么 04:59 不是 05:00**：05:00 是逻辑日翻转点，**过了就翻到新（空）逻辑日**。04:59 用 `ref=new Date()`（现在）捕捉【即将收尾的当前逻辑日/月】。**别传 yesterday**（在 04:59 会 `logicalDayStart` 多退一天）。
 - ⚠️ 排程**在 serve 启动时才挂上** → 改了代码要 `pnpm build` + **重启 serve**（最新构建）才生效；serve 没跑就不触发。从 repo 目录起。
+- 🩹 **月报无限循环根因（2026-07-01 修）**：`setTimeout` 的延迟上限是 `2^31-1` ms（≈24.8 天）；超过就**溢出 32 位、被钳成 1ms 立即触发**（并打 `TimeoutOverflowWarning`）。`scheduleMonthlyOpsReport` 每次重挂的延迟是【下月 1 号 04:59】≈28~31 天 > 上限 → 首次 04:59 正常出报后立刻再触发 → 出报（约 5~7s）→ 再溢出立刻触发 → **死循环**（实测 04:59→08:09 空转 1708 次，把飞书刷成 429、跨过 05:00 后逻辑月翻成新空月故 date 从 2026-06 变 2026-07=看起来"月份也错了"，其实首跑那次 date=2026-06 是对的）。日报重挂只 ≤24h 不受影响，所以只有月报中招。**根治**：`src/core/time.ts` 加 `safeSetTimeout(cb, delayMs)`（延迟 > `MAX_TIMEOUT_MS` 就分段链式重挂），月报排程改用它；日/年任何 >24.8 天的定时都该走它。回归测试在 `time.test.ts`（"overflow-loop regression"）。**排查手法**：日志里同一条 INFO 每几秒重复上千次 + `sed 去时间戳 | uniq -c | sort -rn` 看模板频率，即可锁定循环源。
 - **CLI**：`pnpm agent report daily|monthly [--date YYYY-MM-DD] [--lark-user <open_id>] [--lark-chat <chat_id>]`。`--lark-user` 私聊预览（=群发格式，验收用）、`--lark-chat` 发群。一次性 CLI 已 `enableLogSink()`+退出 `flushTelegramSync()`。
 - **log**：serve 的 log→Telegram 镜像（`[sup]` 标签，`TELEGRAM_LOG_LEVEL=info`）会显示【运营报告生成开始 / 渲染完成 / 已发送到飞书 / 发送完成】+ 失败时的 error（`Python渲染失败` / `发送飞书失败` / `发送图表失败` / `每日运营报告生成失败`），便于定位哪步出问题。
 
