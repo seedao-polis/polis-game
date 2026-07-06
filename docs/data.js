@@ -5,8 +5,8 @@ window.PROFILE_DATA = {
 
   // Google Form configuration — replace placeholders before going live.
   config: {
-    googleFormBase: 'https://docs.google.com/forms/d/e/REPLACE_WITH_FORM_ID/viewform',
-    googleFormEntrySection: 'entry.REPLACE_WITH_ENTRY_ID',
+    googleFormBase: 'https://docs.google.com/forms/d/e/1FAIpQLSdL_fe5US9MrcXGxqGbmRbdNJHJs3CKjMZtN86_clfqjS5_qw/viewform',
+    googleFormEntrySection: 'entry.438915447',
     repoUrl: 'https://github.com/seedao-polis/polis-game'
   },
 
