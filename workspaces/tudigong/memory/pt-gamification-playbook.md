@@ -4,6 +4,7 @@
 > - **标签只写【LP】，不要写【LP 积分】**——【积分】一词留给未来系统里另一种东西。
 > - **每条 LLM 回复扣 0.1 LP**（原 -1），**回复尾部 footer 显示到小数第一位**（`toFixed(1)`，如 `120.0 → 119.9 (-0.1)`）。LP 余额因此是小数：DB 列 `ap_balance`/`ap_ledger.delta` 虽声明 INTEGER，但 SQLite 亲和性会把非整数存成 REAL，无需迁移。
 > - 代码内部标识符（`FIRST_CONTACT_AP`、`ap_balance`、`ap_ledger`、`grantAp`/`spendAp`、`LLM_AP_COST`、reason 码）仍沿用 `ap` 旧名，**只改了展示字符串**。
+> - **⚠️ 2026-07-07 更正**：上一条【内部标识符仍沿用 ap 旧名】**已过时**——DB 层后来把账本表 / 余额列 / 发放函数**迁移改名**成 `pt_ledger` / `pt_balance` / `grantPt`（`db.ts`：`ALTER TABLE ap_ledger RENAME TO pt_ledger` + `ALTER TABLE profiles RENAME COLUMN ap_balance TO pt_balance`；`store/gamification.ts` 现是 `pt_*` / `grantPt`）。**下文凡出现旧 `ap_ledger`/`ap_balance`/`grantAp` 一律读作对应 `pt_*`/`grantPt`**；查库认 `pt_ledger`/`pt_balance`（`ap_ledger` 表已不存在）。
 > - **DB 文件名不再写死**：改成按 soul 命名 `.agent/<soul>.db`（`db.ts` 读 `AGENT_SOUL`，默认 `tudigong`）；每个 entry point（serve worker / supervisor / cli·ask·run）都会 pin `AGENT_SOUL`，MCP server 经 `Agent.buildMcpConfig` 的 env 拿到同一值 → 同 soul 各进程共用一个库。tudigong 用 `.agent/tudigong.db`。
 > - **⚠️ LP / 游戏化已拆出共享库（2026-06-25，见 §9）**：积分 / 徽章 / profile 现在统一落 `.agent/shared.db`（`getLpDb()`），**所有 agent 共用一套 LP 经济**；`.agent/<soul>.db` 只剩对话记忆 / 消息 / 活动 / 名册等 per-agent 数据。下文凡说 LP 存在 `profiles`/`ap_ledger` 的，库已是 shared.db；命令也从 `reset-all-ap` 改名 `reset-all-pt`。
 > - 下文凡提到【AP】均指现在的 LP。
@@ -51,7 +52,7 @@
 
 ## 5. 每日签到（命令 sign）
 
-- 命令 `sign`，别名 `签` / `簽` / `签到` / `簽到` / `checkin`；纯 code 不走 LLM；触发是【整个 token 等于这些词】，不是【消息含『签』就触发】。
+- 命令 `sign`，别名 `签` / `簽` / `签到` / `簽到` / `checkin`；纯 code 不走 LLM。精确触发是【整个 token 等于这些词】；**2026-07-08 起额外加了模糊判定**（短消息结尾是 `签`/`签到` 也算，见 §11），不再是【消息含『签』就触发】那么死，但仍有 15 字长度闸门防误吞。
 - `store.checkIn(openId)`：以**本地日历日**（`YYYY-MM-DD`）为键，`checkins` 表 `UNIQUE(user_open_id, checkin_date)` 在 DB 层防重；`INSERT OR IGNORE` 判断是否当天第一次。第一次 +3（写 `ap_ledger` reason `daily_checkin`），重复不动余额。
 - 回复：第一次 `在 SeeDAO 数字城邦签到` + `🌱 LP : 119.9 → 122.9 (+3.0)`；重复 `今天 (MM/DD) 你已在 SeeDAO 数字城邦签到了` + `🌱 LP : 122.9`（不变时不带括号）。
 - ⚠️ 签到【换日】用 00:00 本地日历日，跟 05:00 floor reset 的界不同；且 `localDateString` 吃**服务器本地时区**，serve 要跑在 `Asia/Taipei` 否则换日点会偏。
@@ -107,3 +108,26 @@
   - `agent.ts prepare()`：**仅 serve 模式 + `judgeEnabled`** 才把 `buildJudgeInstruction` 接到 prompt 末尾（langRule 之后）；CLI 与 tudigong 得空串、prompt 不变。
 - **生效方式**：改 `agent.ts` / channel 要**重新编译 + 重启 serve worker**（`pnpm agent update` 需带 `--sup`，否则手动重启）。分类指令是**每条 prompt 即时注入**、不写进 `.kimi-code/AGENTS.md`，**不受 `--continue` 缓存影响**，重启后下条对话即套用、无需隔离会话。`LP_STRATEGY.json` 由 `loadLpStrategy` 行程级缓存，**改文件要重启 serve** 才重读。
 - **新建 agent**：`_template/LP_STRATEGY.json` 默认带停用版（行为 == 固定扣分）；要做「按交流评分 / 加分」的 agent，把它改成 `judgeEnabled:true` + 定义 categories（含 criteria）。`create-agent` skill 已能配置这块（见该 skill 的 references）。
+
+## 11. 模糊签到 + 自助改名（2026-07-08）
+
+两件事都落在 `src/core/commands.ts`（命令层，纯 code、不走 LLM）。**群里都要先 @ 土地神**（bot 只收 @ 事件）、私聊直接说；`dispatchCommand` 在 cli / feishu-bot / feishu-user 三频道通用。
+
+### 11.1 模糊签到（放宽签到判定）
+- **原规则保留**：`签`/`签到`（及 `簽`/`簽到`/`checkin`）作为精确命令别名照旧（§5）。
+- **新增**：消息（去掉 @ 前缀与 `/`!` 前缀后）**长度 < 15** 且**结尾正则 `/(签到|签)$/`** 也算签到 → 路由到 `sign`。例：`每日签到`、`8/12 签`、`打卡签到`。
+- **15 字闸门**（`CHECKIN_MAX_LEN`）防长句误吞（如"…结尾恰好是签"）。判定函数 `isFuzzyCheckIn(raw)`，导出可测。
+- 顺序：`dispatchCommand` 里先精确命令查表（保住 `签`/`签到`），miss 了再试模糊签到。
+
+### 11.2 自助改名（本人 @ 土地神即可改名）
+- 触发词 `改名`：`改名Vicky`（贴着）或 `改名 Vicky Huang`（空格分隔、名字本身可含空格）都行；取 `改名` 后字串、**去掉首尾半角/全角空白**（`trimEdgeSpaces`，正则含 U+3000）当新名。英文 `rename <名字>` 也行；`help` 里已列 `rename`（别名 `改名`）。
+- **为什么单独解析不走 token 分词**：因为名字可能贴着 `改名` 或含空格，`parseCommand` 的空白分词处理不了；所以 `parseRename(raw)` 在 `dispatchCommand` **最前面**拦 `改名…`（返回新名 / 空串=光"改名"给用法 / null=不是改名）。
+- **护栏**：空名→回用法；> 40 字或含换行→拒绝；**名字含问号 `?？`→当提问、返回 null 交给 LLM**（避免"改名怎么操作？"被改成名字）。
+- **关键设计——按 open_id 存 override、渲染时套用（不是改抓来的名字）**：直接改 DB 里的 `chat_members.name`/`profiles.name` **没用**——每 5 分钟名册同步会用飞书原名覆盖回去（`syncChatMembers` 的 `freshenProfile` + upsert）。所以改名写进**新表 `name_overrides`（schema v27，共享库 `.agent/shared.db`，`open_id PRIMARY KEY`）**，在**显示时**套用，跨 agent 生效、重启/重同步不丢。正好符合"内部用 id 匹配、别用 name"。
+  - `store.setPreferredName(openId, name)`（`store/gamification.ts`）：按 **raw open_id 和 canonical id 各写一行**（因为 `memberName` 用 raw、`getProfile`/`leaderboard` 用 `cid()` canonical，两条路都要命中）。
+  - `name-overrides.ts` 现在是**两层**：`configOverride`（运营 `configs/name-overrides.json`，如 Fivea，进程级缓存）→ `selfServiceName`（读 `name_overrides` 表，**不缓存**保证多进程即时可见）。**优先级：运营配置 > 自助改名 > 原始名**（运营的硬性称呼不被本人改掉）。`applyNameOverride` 仍是唯一收口。
+  - **旧名数据自动变新名**：凡走 `applyNameOverride` 的展示面都跟着变——`memberName`、`getProfile`、LP footer、订阅者名、ops 叙事、事件 `{{name}}` 与 @ 名字（`events.ts` 走 `memberName`/`getProfile`）。**顺手补了 `leaderboard` 原来漏套 override 的 bug**。
+  - **不改的**：历史留痕快照（`member_sync_rounds` 明细、`visitor_milestones.name`、`messages.sender_name`、transcript）按设计保留当时的名，不回写。
+- **测试**：`src/core/commands.test.ts`（模糊签到 + 改名端到端）、`name-overrides.test.ts` 补了自助层与优先级用例（都要 `AGENT_DB_PATH` 隔离，因 `applyNameOverride` 现在会读库）。
+- **上线**：改了 `db.ts`（+migration v27）与核心命令层 → **要完整重启 serve** 才生效（`pnpm agent update`；新 worker 开库自动迁移）。
+- **已知取舍**：模糊签到只看结尾是否 `签`/`签到`（`$` 锚定），所以带尾标点的"我要怎么签到？"**不会**被判成签到；但不带标点、结尾正好是"签到"的短句（如"我该怎么签到"）会——按操作者明确要求的启发式实现；如需再收紧告诉我。

@@ -6,6 +6,7 @@ import path from 'node:path';
 
 // Point the config dir at a throwaway folder BEFORE importing the module, so the test is
 // self-contained and does not depend on the operator's private configs/name-overrides.json.
+// Also pin the DB at a throwaway file (the resolver reads the shared name_overrides table).
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-name-overrides-test-'));
 fs.mkdirSync(TMP, { recursive: true });
 fs.writeFileSync(
@@ -19,10 +20,14 @@ fs.writeFileSync(
   })
 );
 process.env.AGENT_CONFIGS_DIR = TMP;
+process.env.AGENT_DB_PATH = path.join(TMP, 'test.db');
 
 const { preferredName, applyNameOverride } = await import('./name-overrides.js');
+const store = await import('./store.js');
+const { closeDb } = await import('./db.js');
 
 after(() => {
+  closeDb();
   fs.rmSync(TMP, { recursive: true, force: true });
 });
 
@@ -44,4 +49,15 @@ test('applyNameOverride prefers the override over the raw captured name', () => 
 test('applyNameOverride falls back to the raw name when there is no override', () => {
   assert.equal(applyNameOverride('ou_unknown', '张三'), '张三');
   assert.equal(applyNameOverride('ou_unknown', ''), '');
+});
+
+test('a self-service rename (name_overrides table) overrides the raw captured name', () => {
+  store.setPreferredName('ou_self', 'Vicky Huang');
+  assert.equal(preferredName('ou_self'), 'Vicky Huang');
+  assert.equal(applyNameOverride('ou_self', '用户560770'), 'Vicky Huang');
+});
+
+test('operator config takes precedence over a self-service rename', () => {
+  store.setPreferredName('ou_fivea', 'NotFivea');
+  assert.equal(applyNameOverride('ou_fivea', '李'), 'Fivea'); // config still wins
 });

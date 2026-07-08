@@ -294,9 +294,34 @@ export function leaderboard(limit = 10): Array<{ openId: string; name: string; p
   `).all(limit) as Record<string, unknown>[];
   return rows.map((r) => ({
     openId: r['open_id'] as string,
-    name: (r['name'] as string) ?? '',
+    // Apply the display-name override (operator config + self-service 改名) like every other surface.
+    name: applyNameOverride(r['open_id'] as string, (r['name'] as string) ?? ''),
     ptBalance: (r['pt_balance'] as number) ?? 0,
   }));
+}
+
+/**
+ * Persist a member's self-chosen display name (the "@我 改名 <名字>" command). Written to the shared
+ * name_overrides table keyed by open_id — under BOTH the raw open_id and its canonical LP identity — so
+ * that both the roster path (memberName, keyed by the raw open_id) and the LP path (getProfile /
+ * leaderboard, keyed by the canonical id) resolve it. The name is applied at render time on top of the
+ * raw captured Feishu name, which the 5-minute roster sync keeps overwriting; the override is what makes
+ * the rename stick. Empty / whitespace-only names are ignored. Returns the trimmed name that was stored.
+ */
+export function setPreferredName(openId: string, name: string): string {
+  const clean = (name ?? '').trim();
+  if (!openId || !clean) return '';
+  const canonical = cid(openId);
+  const ids = canonical === openId ? [openId] : [openId, canonical];
+  lpTx(() => {
+    const db = getLpDb();
+    const up = db.prepare(`
+      INSERT INTO name_overrides(open_id, name, updated_at) VALUES (?, ?, unixepoch())
+      ON CONFLICT(open_id) DO UPDATE SET name = excluded.name, updated_at = unixepoch()
+    `);
+    for (const id of ids) up.run(id, clean);
+  });
+  return clean;
 }
 
 /**

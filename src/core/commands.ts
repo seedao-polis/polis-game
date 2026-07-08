@@ -2,6 +2,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { REPO_ROOT } from './paths.js';
 import * as store from './store.js';
+import {
+  subscribeMeetupTag,
+  unsubscribeMeetupTag,
+  listMeetupSubscriptions,
+  getMeetupById,
+  cancelMeetup as storeCancelMeetup,
+} from './store/meetups.js';
+import { loadConfigs, resolveChatTarget, isAdmin } from './configs.js';
+import { cancelCalendarEvent } from './lark.js';
+import { refreshMeetupWiki } from './meetup-wiki.js';
 
 // ── command mode (pure code, no LLM / kimi) ───────────────────
 // After being triggered (@ or prefix), the message is passed here first: strip the leading @mention → split on whitespace,
@@ -62,6 +72,72 @@ export function parseCommand(raw: string): { name: string; args: string[] } | nu
   return { name: parts[0].toLowerCase(), args: parts.slice(1) };
 }
 
+/** Strip the leading @mention(s) and an optional / or ! prefix, returning the trimmed body. */
+function stripLead(raw: string): string {
+  let s = (raw ?? '').trim();
+  while (LEADING_MENTION.test(s)) s = s.replace(LEADING_MENTION, '');
+  return s.replace(/^[/!]/, '').trim();
+}
+
+/** Strip leading/trailing half-width AND full-width (U+3000) spaces — used for the 改名 argument. */
+function trimEdgeSpaces(s: string): string {
+  return s.replace(/^[\s　]+/, '').replace(/[\s　]+$/, '');
+}
+
+// ── fuzzy daily check-in ──────────────────────────────────────
+// The bare forms 签 / 签到 are already `sign` command aliases. On top of that, a SHORT message (under
+// CHECKIN_MAX_LEN characters) whose text ends in 签到 or 签 also counts as a daily check-in — so
+// "每日签到" or "8/12 签" work without being an exact command. The length cap keeps a longer sentence
+// that merely happens to end in 签 from being swallowed as a check-in.
+const CHECKIN_MAX_LEN = 15;
+
+export function isFuzzyCheckIn(raw: string): boolean {
+  const s = stripLead(raw);
+  if (!s || s.length >= CHECKIN_MAX_LEN) return false;
+  return /(签到|签)$/.test(s);
+}
+
+// ── self-service rename (改名) ─────────────────────────────────
+// "@我 改名 <名字>" lets a member rename themselves. The name may be glued to 改名 ("改名Vicky") or
+// separated by a half/full-width space ("改名 Vicky Huang"), and may itself contain spaces, so this is
+// parsed directly rather than through the whitespace-splitting command tokenizer. Only the head/tail
+// spaces of the name are trimmed. The new name is stored keyed by open_id (see store.setPreferredName),
+// so every display surface resolves it by identity and a future rename stays cheap.
+const RENAME_PREFIX = /^改名/;
+const MAX_NAME_LEN = 40;
+const RENAME_USAGE = '改名用法：@我 改名 <新名字>，例如「改名 Vicky」或「改名 Vicky Huang」。名字会自动去掉首尾空白。';
+
+/**
+ * Extract the requested new name from a "改名…" message. Returns the trimmed name, an empty string when
+ * the message is a bare "改名" with no name (caller shows usage), or null when it is not a rename at all.
+ */
+export function parseRename(raw: string): string | null {
+  const s = stripLead(raw);
+  if (!RENAME_PREFIX.test(s)) return null;
+  const rest = trimEdgeSpaces(s.slice(2)); // drop the 2-char 改名 prefix; '' = no name supplied
+  // A question ("改名怎么操作？") is not a rename — let the LLM answer it instead of renaming to it.
+  if (/[?？]/.test(rest)) return null;
+  return rest;
+}
+
+function applyRename(rawName: string, ctx: CommandContext): string {
+  if (!ctx.senderOpenId) {
+    return '无法确认你的身份（缺少 sender open_id），请在飞书群里 @ 我使用改名。';
+  }
+  const name = trimEdgeSpaces(rawName ?? '');
+  if (!name) return RENAME_USAGE;
+  if (name.includes('\n') || [...name].length > MAX_NAME_LEN) {
+    return `新名字不太合适（不能换行，且最多 ${MAX_NAME_LEN} 个字），请换一个短一点的再试。`;
+  }
+  // Resolve the current display name (already override-aware) before writing, so we can echo old → new.
+  const before = store.memberName(ctx.senderOpenId) || store.getProfile(ctx.senderOpenId)?.name || '';
+  const saved = store.setPreferredName(ctx.senderOpenId, name);
+  if (!saved) return RENAME_USAGE;
+  return before && before !== saved
+    ? `好的，已把你的名字从【${before}】改成【${saved}】，之后我在城邦里都会这样称呼你。`
+    : `好的，已把你的名字设为【${saved}】，之后我在城邦里都会这样称呼你。`;
+}
+
 function readVersion(): string {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
@@ -69,6 +145,25 @@ function readVersion(): string {
   } catch {
     return '0.0.0';
   }
+}
+
+/**
+ * Ownership gate for managing (cancel / edit) a meetup: only the original creator may manage it, with
+ * the operator (admin) allowed to override. Fail-closed — an empty / unknown sender is refused. This
+ * lives in the deterministic command layer, which is the single authoritative path: there is no
+ * LLM-callable calendar tool and no natural-language cancel / edit marker, so a serve user cannot
+ * reach calendar update / delete except through this gate.
+ */
+function canManageMeetup(senderOpenId: string | undefined, creatorOpenId: string): boolean {
+  const sender = senderOpenId ?? '';
+  if (!sender) return false;
+  if (sender === creatorOpenId) return true;
+  return isAdmin(sender);
+}
+
+/** Resolve a display name for a subscriber's open_id (roster → profile → fallback "你"). */
+function subscriberName(openId: string): string {
+  return store.memberName(openId) || store.getProfile(openId)?.name || '你';
 }
 
 // ── built-in commands ─────────────────────────────────────────
@@ -175,6 +270,106 @@ const COMMANDS: Command[] = [
       return `今天 (${mmdd}) 你已在 SeeDAO 数字城邦签到了` + store.buildStatusFooter(ctx.senderOpenId, 0);
     },
   },
+  {
+    name: 'rename',
+    aliases: ['改名'],
+    summary: '给自己改名（@我 改名 <新名字>）',
+    usage: 'rename <新名字>',
+    // "改名…" is normally intercepted by parseRename in dispatchCommand (to support the no-space and
+    // spaces-in-name forms); this entry lists it in help and also handles the English "rename <name>".
+    run: (args, ctx) => applyRename(args.join(' '), ctx),
+  },
+  {
+    name: 'follow',
+    aliases: ['订阅'],
+    summary: '订阅活动标签，有新会议时在群里收到 @ 提醒',
+    usage: 'follow <标签>',
+    run(args, ctx) {
+      if (!ctx.senderOpenId) return '无法确认你的身份，请在飞书群内使用此命令。';
+      const tag = args[0]?.trim();
+      if (!tag) return '请提供标签名，例如：follow 共学';
+      const who = subscriberName(ctx.senderOpenId);
+      const added = subscribeMeetupTag(ctx.senderOpenId, tag);
+      return added
+        ? `${who}，已为你订阅标签【${tag}】，有该标签的活动我会在群里 @ 你。`
+        : `${who}，你之前已经订阅过【${tag}】了，无需重复订阅。`;
+    },
+  },
+  {
+    name: 'unfollow',
+    aliases: ['取消订阅'],
+    summary: '取消订阅活动标签',
+    usage: 'unfollow <标签>',
+    run(args, ctx) {
+      if (!ctx.senderOpenId) return '无法确认你的身份，请在飞书群内使用此命令。';
+      const tag = args[0]?.trim();
+      if (!tag) return '请提供标签名，例如：unfollow 共学';
+      const who = subscriberName(ctx.senderOpenId);
+      const removed = unsubscribeMeetupTag(ctx.senderOpenId, tag);
+      return removed ? `${who}，已为你取消订阅【${tag}】。` : `${who}，你本来就没有订阅【${tag}】。`;
+    },
+  },
+  {
+    name: 'follows',
+    aliases: ['我的订阅'],
+    summary: '查看你当前订阅的活动标签',
+    usage: 'follows',
+    run(_args, ctx) {
+      if (!ctx.senderOpenId) return '无法确认你的身份，请在飞书群内使用此命令。';
+      const who = subscriberName(ctx.senderOpenId);
+      const tags = listMeetupSubscriptions(ctx.senderOpenId);
+      if (tags.length === 0) return `${who}，你还没有订阅任何活动标签。发送 follow <标签> 即可订阅。`;
+      return `${who}，你当前订阅的标签：${tags.map((t) => `【${t}】`).join('、')}`;
+    },
+  },
+  {
+    name: 'meetup',
+    summary: '管理活动会议（cancel / edit）',
+    usage: 'meetup cancel <id>  |  meetup edit <id> --title <新标题>',
+    run(args, ctx) {
+      const sub = args[0]?.toLowerCase();
+
+      // meetup cancel <id>: soft-cancel in DB and delete from Feishu calendar
+      if (sub === 'cancel' || sub === '取消') {
+        const id = Number(args[1]);
+        if (!id) return '用法：meetup cancel <会议编号>（整数 id，见 agent meetup 列表）';
+        const mtg = getMeetupById(id);
+        if (!mtg) return `找不到编号 ${id} 的会议。`;
+        if (mtg.status === 'cancelled') return `会议【${mtg.title}】已经是已取消状态。`;
+        if (!canManageMeetup(ctx.senderOpenId, mtg.createdBy)) {
+          return `只有活动发起人才能取消【${mtg.title}】。请用发起时的同一账号操作。`;
+        }
+
+        // Resolve the activity calendar id from lark.json.
+        let calendarId = mtg.calendarId;
+        try {
+          const cfg = loadConfigs();
+          calendarId = cfg.lark.activityCalendarId ?? calendarId;
+        } catch { /* use the stored calendar_id as fallback */ }
+
+        const larkOk = cancelCalendarEvent(calendarId, mtg.larkEventId);
+        storeCancelMeetup(id);
+        refreshMeetupWiki(); // mirror the cancellation to the "SeeDAO 活动日历" wiki page
+        return larkOk
+          ? `已取消会议【${mtg.title}】（飞书日历已删除，本地已标记取消）。`
+          : `本地已标记取消【${mtg.title}】，但飞书日历删除失败，请手动检查。`;
+      }
+
+      // meetup edit: in-group edit is not exposed (directs to the operator CLI). Still gate on
+      // ownership so a non-creator is told they cannot edit it, rather than pointed at a command
+      // that would not accept them anyway.
+      if (sub === 'edit' || sub === '编辑') {
+        const id = Number(args[1]);
+        const mtg = id ? getMeetupById(id) : null;
+        if (mtg && !canManageMeetup(ctx.senderOpenId, mtg.createdBy)) {
+          return `只有活动发起人才能编辑【${mtg.title}】。`;
+        }
+        return '活动编辑请使用管理员 CLI 命令：pnpm agent meetup edit <id> [--title ...] [--start ...] [--end ...]';
+      }
+
+      return `未知子命令【${sub}】。支持：meetup cancel <id> / meetup edit <id>`;
+    },
+  },
 ];
 
 // Index from name / alias → command.
@@ -193,18 +388,38 @@ export function listCommands(): Command[] {
   return [...COMMANDS];
 }
 
+/** Run a resolved command body, treating a throw as handled (returns an error reply, never falls to the LLM). */
+function handle(command: string, args: string[], run: () => string): DispatchResult {
+  try {
+    return { handled: true, command, args, reply: run() };
+  } catch (e) {
+    return { handled: true, command, args, reply: `命令【${command}】执行出错：${(e as Error).message}` };
+  }
+}
+
 /**
  * Try to handle the message as a command. Hit → { handled:true, reply }; miss → { handled:false }.
  * If the command itself throws, it is still treated as handled and returns an error message (does not fall back to the LLM).
  */
 export function dispatchCommand(raw: string, ctx: CommandContext): DispatchResult {
-  const parsed = parseCommand(raw);
-  if (!parsed) return { handled: false };
-  const cmd = lookup(parsed.name);
-  if (!cmd) return { handled: false };
-  try {
-    return { handled: true, command: cmd.name, args: parsed.args, reply: cmd.run(parsed.args, ctx) };
-  } catch (e) {
-    return { handled: true, command: cmd.name, args: parsed.args, reply: `命令【${cmd.name}】执行出错：${(e as Error).message}` };
+  // Self-service rename ("改名 <名字>") — checked before the tokenizer so the name may be glued to 改名
+  // or contain spaces. A bare "改名" (empty name) is still handled, replying with usage.
+  const renameName = parseRename(raw);
+  if (renameName !== null) {
+    return handle('rename', renameName ? [renameName] : [], () => applyRename(renameName, ctx));
   }
+
+  const parsed = parseCommand(raw);
+  const cmd = parsed ? lookup(parsed.name) : undefined;
+  if (parsed && cmd) {
+    return handle(cmd.name, parsed.args, () => cmd.run(parsed.args, ctx));
+  }
+
+  // Fuzzy daily check-in ("每日签到", "8/12 签") — layered on top of the exact 签 / 签到 aliases above.
+  if (isFuzzyCheckIn(raw)) {
+    const sign = lookup('sign');
+    if (sign) return handle(sign.name, [], () => sign.run([], ctx));
+  }
+
+  return { handled: false };
 }
