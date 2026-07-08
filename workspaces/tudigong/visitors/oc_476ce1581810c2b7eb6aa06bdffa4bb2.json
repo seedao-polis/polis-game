@@ -1,0 +1,25 @@
+{
+  "chatId": "oc_476ce1581810c2b7eb6aa06bdffa4bb2",
+  "milestones": {
+    "100": {
+      "openId": "ou_7eb1ff58e0fbeadf659d92fcb3327122",
+      "name": "李磊",
+      "reachedAt": 1781777787
+    },
+    "200": {
+      "openId": "ou_f118beb5e9039756013026260b89384a",
+      "name": "李绍杰",
+      "reachedAt": 1781877668
+    },
+    "300": {
+      "openId": "ou_8074c2853cec8cd48f61deb39212a514",
+      "name": "懿轩",
+      "reachedAt": 1781920769
+    },
+    "400": {
+      "openId": "ou_0c47963d0b194a3604a34fd32d28d61c",
+      "name": "hsiu",
+      "reachedAt": 1783444714
+    }
+  }
+}

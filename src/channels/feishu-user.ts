@@ -31,6 +31,7 @@ import {
 } from '../core/lark.js';
 import { renderMessageBody } from '../core/attachments.js';
 import { fireEvent } from '../core/events.js';
+import { isMilestoneRecorded, recordMilestone, refreshVisitorMilestonesWiki } from '../core/visitor-milestones.js';
 import { loadCursor, saveCursor } from '../core/state.js';
 import { append as appendTranscript, upsertChat } from '../core/transcript.js';
 import { log, preview } from '../core/log.js';
@@ -159,11 +160,6 @@ export class FeishuUserChannel implements Channel {
 
     startNew(cfg.chats);
 
-    // The watched 围观群's present count from the PREVIOUS sync round (the "倒数第二个" reading), kept across
-    // syncMembers calls so the visitor milestone can reject a transient dip-and-recover. A partial/failed
-    // roster fetch can briefly undercount the group (e.g. 363 → 99); the next full fetch (99 → 366) would
-    // otherwise "cross" thresholds it had already passed. -1 = no prior reading yet (e.g. just started).
-    let prevVisitorWatchCount = -1;
 
     // Sync the full member roster of every monitored chat into the directory (chat_members): captures
     // everyone (internal AND external), even people who never spoke; new joiners are imported, leavers
@@ -218,34 +214,30 @@ export class FeishuUserChannel implements Channel {
           if (r.added > 0 || r.left > 0 || r.renamed > 0) {
             log.info(`群成员同步【${chat.name || chat.chatId}】：在群 ${r.total} 人，新增 ${r.added}，离开 ${r.left}（已保留），改名 ${r.renamed}`);
           }
-          // Visitor-count milestone: fire a welcome announcement when the watched group's present count
-          // newly crosses a multiple of VISITOR_STEP vs the previous round (so each hundred fires once).
+          // Visitor-count milestone: announce exactly once per hundred, ever. The persistent ledger
+          // (visitor_milestones DB + visitors/<chatId>.json) is the idempotency gate; it survives
+          // restarts, unlike the old in-memory round-over-round baseline which re-announced after a
+          // restart. On a genuinely new milestone, freeze who the milestone-th visitor is (present-
+          // member arrival order — matching the present count that drives the milestone), record it,
+          // mirror to the wiki, then announce.
           if (watchPrev >= 0) {
             const visitorNum = r.total;
-            const crossed =
-              watchPrev > 0 && Math.floor(visitorNum / VISITOR_STEP) > Math.floor(watchPrev / VISITOR_STEP);
-            // Reject a dip-and-recover: only treat the crossing as real if the pre-sync count (watchPrev,
-            // the "上轮" reading) was not a transient drop below the round before it (prevVisitorWatchCount,
-            // the "上上轮"). A partial roster can briefly undercount the group (e.g. 363 → 99); the next full
-            // fetch (99 → 366) must NOT re-cross 100/200/300. == is allowed (a plateau is not a dip).
-            const notADip = prevVisitorWatchCount < 0 || watchPrev >= prevVisitorWatchCount;
             const milestone = Math.floor(visitorNum / VISITOR_STEP) * VISITOR_STEP;
-            if (crossed && notADip) {
-              log.info(`访客人数提醒触发【${chat.name || chat.chatId}】：${watchPrev} → ${visitorNum} 人，跨越 ${milestone}，发送通知`);
+            if (milestone >= VISITOR_STEP && !isMilestoneRecorded(cfg.soul, chat.chatId, milestone)) {
+              const person = store.nthPresentMemberByArrival(chat.chatId, milestone)
+                ?? { openId: '', name: '', firstSeen: Math.floor(Date.now() / 1000) };
+              recordMilestone(cfg.soul, chat.chatId, milestone, person, Math.floor(Date.now() / 1000));
+              refreshVisitorMilestonesWiki(chat.chatId, { profile });
+              log.info(`访客里程碑达成【${chat.name || chat.chatId}】：第 ${milestone} 人（${person.name || person.openId || '未知'}），记录并发送通知`);
               void fireEvent('visitor-num-notify', {
                 profile,
                 triggerReason: 'visitor_milestone',
                 // Announce the crossed threshold (e.g. 400), not the exact live total (e.g. 402).
                 vars: { visitor_num: milestone },
               });
-            } else if (crossed) {
-              log.info(`访客人数提醒抑制【${chat.name || chat.chatId}】：${watchPrev} → ${visitorNum} 人，疑似上轮临时掉档（上上轮 ${prevVisitorWatchCount} 人 → 上轮 ${watchPrev} 人下降），不发送通知`);
             } else {
-              log.debug(`访客人数监测【${chat.name || chat.chatId}】：当前 ${visitorNum} 人（上轮 ${watchPrev}），下一阈值 ${(Math.floor(visitorNum / VISITOR_STEP) + 1) * VISITOR_STEP}`);
+              log.debug(`访客人数监测【${chat.name || chat.chatId}】：当前 ${visitorNum} 人，里程碑 ${milestone}${milestone >= VISITOR_STEP ? ' 已记录' : ' 未达标'}，不发送`);
             }
-            // Remember this round's pre-sync count as next round's "上上轮" baseline (every round, incl.
-            // suppressed/non-crossing ones, so the dip check has a continuous history).
-            prevVisitorWatchCount = watchPrev;
           }
         } catch (e) {
           // A dissolved group (232009) is permanently gone: flag it (members→离开), stop syncing it,

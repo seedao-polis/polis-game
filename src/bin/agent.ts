@@ -1736,6 +1736,46 @@ async function cmd_memory(argv: string[]): Promise<void> {
 
 type CommandHandler = (argv: string[]) => void | Promise<void>;
 
+// Backfill / repair the visitor-count milestone ledger for a chat: for each hundred up to the current
+// present count, freeze the milestone-th present member (arrival order) into the DB + JSON ledger and
+// refresh the "访客里程碑" wiki page. Idempotent — already-recorded milestones are left untouched, so it
+// is safe to re-run. Records without re-announcing (no fire), which is exactly what backfill needs.
+async function cmd_visitors(argv: string[]): Promise<void> {
+  process.env.AGENT_SOUL = DEFAULT_SOUL;
+  const { resolveChatTarget } = await import('../core/configs.js');
+  const { isMilestoneRecorded, recordMilestone, refreshVisitorMilestonesWiki } = await import('../core/visitor-milestones.js');
+
+  const sub = argv[1] && !argv[1].startsWith('--') ? argv[1] : 'backfill';
+  const chatId = getFlag(argv, 'chat') ?? resolveChatTarget('围观群');
+  if (!chatId) { log.error('无法解析围观群 chat_id（configs/lark.json knownInternalChats 缺「围观群」）'); process.exit(1); }
+
+  let larkProfile: string | undefined;
+  try {
+    const cfg = loadConfigs();
+    for (const id of listAgents(cfg)) {
+      if (cfg.agents.agents[id]?.enabled) { larkProfile = resolveAgent(id, cfg).larkProfile; break; }
+    }
+  } catch { /* use default profile */ }
+
+  if (sub !== 'backfill') { log.error('用法: agent visitors backfill [--chat <oc_id>]'); process.exit(1); }
+
+  const present = store.presentMemberCount(chatId);
+  const top = Math.floor(present / 100) * 100;
+  console.log(`围观群在群人数 ${present}，回填里程碑至 ${top}…`);
+  let recorded = 0;
+  for (let m = 100; m <= top; m += 100) {
+    if (isMilestoneRecorded(DEFAULT_SOUL, chatId, m)) { console.log(`  第 ${m} 人：已记录，跳过`); continue; }
+    const person = store.nthPresentMemberByArrival(chatId, m);
+    if (!person) { console.log(`  第 ${m} 人：在群人数不足，跳过`); continue; }
+    // Use the visitor's first_seen as the reached-at time (≈ when the milestone was hit).
+    recordMilestone(DEFAULT_SOUL, chatId, m, person, person.firstSeen);
+    recorded += 1;
+    console.log(`  第 ${m} 人：${person.name || '(无名)'}（${person.openId}）已记录`);
+  }
+  const wikiOk = refreshVisitorMilestonesWiki(chatId, { profile: larkProfile });
+  console.log(`完成：新记录 ${recorded} 个里程碑；wiki【访客里程碑】${wikiOk ? '已更新' : '未更新（检查 visitorMilestoneWikiDocId / scope）'}`);
+}
+
 interface CliCommand {
   /** Command name plus any aliases. */
   names: string[];
@@ -1744,6 +1784,7 @@ interface CliCommand {
 
 const COMMANDS: CliCommand[] = [
   { names: ['agents'], run: cmd_agents },
+  { names: ['visitors'], run: cmd_visitors },
   { names: ['backfill'], run: cmd_backfill },
   { names: ['backfill-members'], run: cmd_backfill_members },
   { names: ['calendar-events'], run: cmd_calendar_events },

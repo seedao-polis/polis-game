@@ -513,3 +513,59 @@ export function chatMemberOpenIds(chatIds: string[]): Set<string> {
   }
   return set;
 }
+
+// ── visitor-count milestones ──────────────────────────────────
+// The visitor-num-notify announcement counts PRESENT members, so the "N-th visitor" is the N-th
+// still-present member by arrival (first_seen). These helpers freeze that identity and back the
+// restart-proof announcement ledger (visitor_milestones), replacing the previous in-memory dedup.
+
+/** A person occupying a visitor-count position. */
+export interface VisitorPerson { openId: string; name: string; firstSeen: number; }
+
+/**
+ * Return the n-th present member of a chat by arrival order (first_seen asc, then rowid), 1-based.
+ * This matches the semantics of the present-member count that drives the milestone, so the n-th
+ * present member is "第 n 位访客". Returns null when the chat has fewer than n present members.
+ */
+export function nthPresentMemberByArrival(chatId: string, n: number): VisitorPerson | null {
+  if (n < 1) return null;
+  const row = getDb().prepare(`
+    SELECT open_id, name, first_seen FROM chat_members
+    WHERE chat_id = ? AND present = 1
+    ORDER BY first_seen ASC, rowid ASC
+    LIMIT 1 OFFSET ?
+  `).get(chatId, n - 1) as { open_id: string; name: string; first_seen: number } | undefined;
+  if (!row) return null;
+  return { openId: String(row.open_id), name: String(row.name ?? ''), firstSeen: Number(row.first_seen) };
+}
+
+/** A frozen visitor-count milestone record. */
+export interface VisitorMilestone { milestone: number; openId: string; name: string; reachedAt: number; }
+
+/** True when the given milestone has already been recorded for the chat (announced-once ledger). */
+export function hasVisitorMilestone(chatId: string, milestone: number): boolean {
+  const row = getDb().prepare(
+    'SELECT 1 FROM visitor_milestones WHERE chat_id = ? AND milestone = ?'
+  ).get(chatId, milestone);
+  return Boolean(row);
+}
+
+/**
+ * Freeze a visitor-count milestone: who the milestone-th visitor was and when it was reached.
+ * Idempotent on (chat_id, milestone) — keeps the first record on repeat calls (INSERT OR IGNORE).
+ */
+export function recordVisitorMilestone(chatId: string, milestone: number, openId: string, name: string, reachedAt: number): void {
+  getDb().prepare(`
+    INSERT OR IGNORE INTO visitor_milestones(chat_id, milestone, open_id, name, reached_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(chatId, milestone, openId, name, reachedAt);
+}
+
+/** List all recorded milestones for a chat, ascending by milestone. */
+export function listVisitorMilestones(chatId: string): VisitorMilestone[] {
+  const rows = getDb().prepare(`
+    SELECT milestone, open_id, name, reached_at FROM visitor_milestones
+    WHERE chat_id = ? ORDER BY milestone ASC
+  `).all(chatId) as Array<{ milestone: number; open_id: string; name: string; reached_at: number }>;
+  return rows.map((r) => ({ milestone: Number(r.milestone), openId: String(r.open_id), name: String(r.name ?? ''), reachedAt: Number(r.reached_at) }));
+}
