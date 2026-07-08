@@ -39,7 +39,7 @@
 
 ## 5. 表结构与分阶段（要点）
 
-- 表：`chats`（含 external）、`messages`（`message_id` 主键 → `INSERT OR IGNORE` 原生去重，可删掉 `transcript.ts` 的内存 Set + 重启扫档）、`profiles`、`ap_ledger`（append-only 点数账本，余额 `SUM(delta)` 或快取）、`badges` + `user_badges`、`activities`；`messages.text` 建 FTS5。
+- 表：`chats`（含 external）、`messages`（`message_id` 主键 → `INSERT OR IGNORE` 原生去重，可删掉 `transcript.ts` 的内存 Set + 重启扫档）、`profiles`、`pt_ledger`（append-only 点数账本，余额 `SUM(delta)` 或快取；**⚠️ 2026-06 前叫 `ap_ledger`，`db.ts` 有 `ALTER TABLE ap_ledger RENAME TO pt_ledger` + `RENAME COLUMN ap_balance TO pt_balance`；旧文档写 `ap_ledger`/`ap_balance`/`grantAp` 一律读作 `pt_ledger`/`pt_balance`/`grantPt`**）、`badges` + `user_badges`、`activities`；`messages.text` 建 FTS5。**⚠️ 2026-06-25 拆库**：`profiles`/`pt_ledger`/`badges`/`user_badges`（积分·徽章·profile）现落**全局共享库 `.agent/shared.db`**（`getLpDb()`），`.agent/<soul>.db`（`getDb()`）只剩 `messages`/`activities`/`chat_members`/`event_dispatches` 等 per-agent 数据；查 LP / 改积分认准 shared.db，见 `pt-gamification-playbook §9`。
 - `@tudigong` 建 profile 的挂载点：`feishu-bot.ts:82`（`dispatchCommand` 之后、`agent.respond()` 之前）。游戏化工具仿照 `mcp-server.ts` 的 `registerTool` 加：`profile_get` / `ap_grant` / `badge_award`。
 - 分三阶段：Phase 1 消息落库取代 JSONL（含上面 thread_id + sender 修正 + 外部群）→ Phase 2 profiles + AP 账本 → Phase 3 badges + activities/quests。
 

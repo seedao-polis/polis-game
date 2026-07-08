@@ -93,14 +93,14 @@
 
 ## 5. 把某人重置成【新人】（测试触发用）
 
-外键顺序：先删子表再删 `profiles`（`foreign_keys=ON`）。**还要删 `event_dispatches`(actor)**，否则迎新闸门 `hasSuccessfulDispatch` 会挡住重发。
+外键顺序：先删子表再删 `profiles`（`foreign_keys=ON`）。**还要删 `event_dispatches`(actor)**，否则迎新闸门 `hasSuccessfulDispatch` 会挡住重发。⚠️ **2026-06-25 拆库后要分两个库删**：`profiles`/`pt_ledger`（旧 `ap_ledger`）/`user_badges`/`checkins`（积分·徽章·签到）在**共享库 `.agent/shared.db`**，`event_dispatches`/`activities`/`messages`/`chat_members` 在 **soul 库 `.agent/<soul>.db`**（见 `local-db-playbook §5`、`pt-gamification-playbook §9`）。
 ```
-DELETE FROM ap_ledger WHERE user_open_id=?;
-DELETE FROM user_badges WHERE user_open_id=?;
-DELETE FROM checkins WHERE user_open_id=?;
-DELETE FROM activities WHERE actor_open_id=?;
-DELETE FROM event_dispatches WHERE actor_open_id=?;
-DELETE FROM profiles WHERE open_id=?;
+DELETE FROM pt_ledger    WHERE user_open_id=?;  -- 账本表已由 ap_ledger 改名；此表在 shared.db
+DELETE FROM user_badges  WHERE user_open_id=?;  -- shared.db
+DELETE FROM checkins     WHERE user_open_id=?;  -- shared.db
+DELETE FROM activities   WHERE actor_open_id=?; -- soul.db
+DELETE FROM event_dispatches WHERE actor_open_id=?; -- soul.db
+DELETE FROM profiles     WHERE open_id=?;       -- shared.db
 ```
 
 ## 6. 日后统计表情回应（已预留）
