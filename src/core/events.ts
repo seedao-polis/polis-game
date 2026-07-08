@@ -498,6 +498,47 @@ registerEvent({
   },
 });
 
+// First-try announcement — celebrates the first community member to try a newly-launched feature.
+// Posted to the SeeDAO 围观群 group. Manual-only for now: the operator supplies member_name (the
+// discoverer) and function_name (the feature) — function_name is free text only the operator knows,
+// so this can't be auto-derived; the `agent event` CLI can't pass custom vars, so a real fire uses a
+// one-off fireEvent script carrying vars + actorOpenId (see community-notify-events-playbook §9).
+// member_name is rendered as bold text (not a tappable @) to keep the sentence the operator wrote.
+// prepare() wires the LP reward for the discoverer (opts.actorOpenId), granted only on a successful
+// send. Base image has no overlays and is resized to 128px height (aspect kept).
+const FIRST_TRY_NOTIFY_CHAT_ID = resolveChatTarget('围观群') ?? ''; // SeeDAO 围观群
+const FIRST_TRY_PT_REWARD = 10;
+registerEvent({
+  eventTypeId: 'first-try-notify',
+  title: '{{member_name}} 发现了新功能 {{function_name}}', // titles are plain text: no quotes, no bold
+  description: [
+    "社区成员 **{{member_name}}** 刚刚发现了一个新功能 '{{function_name}}'",
+    '一起来尝试玩玩看这个新功能，下次发现新功能的人可能就是你！',
+    '',
+    '> 此事件在社区成员首次使用新上线的功能时发生',
+  ].join('\n'),
+  scope: 'global',
+  targetChatId: FIRST_TRY_NOTIFY_CHAT_ID,
+  baseImage: 'assets/events/first-try-notify-bg.png',
+  overlays: [],
+  imageHeight: 128,
+  gapLines: 1,
+  prepare: (opts) => {
+    const actor = opts.actorOpenId;
+    return {
+      afterSend: () => {
+        if (!actor) return;
+        try {
+          store.grantPt(actor, FIRST_TRY_PT_REWARD, 'event:first-try-notify');
+          log.info(`首次尝新功能奖励：${actor} +${FIRST_TRY_PT_REWARD} LP`);
+        } catch (e) {
+          log.warn('首次尝新功能事件发 LP 失败：', (e as Error).message);
+        }
+      },
+    };
+  },
+});
+
 /**
  * Human-readable target label for logs: "群名（chat_id）" for a group / "用户名（open_id）" for a P2P,
  * falling back to the bare id when the name isn't known (e.g. chat not yet synced into the directory).

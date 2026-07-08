@@ -20,6 +20,7 @@
 | `visitor-num-notify` | 围观群人数每满 100 | 围观群 | 成员同步轮询触发，详见 §6（2026-07-01 由城邦快报改此） |
 | `cityhall-proposal-voted-notify` | 市政厅对提案做出决议 | 运营小天地 | 手动触发（未来接提案系统）；无 @、无奖励，详见 §10 |
 | `like-maniac-notify` | 成员累计点赞跨 6 的倍数 | 围观群 | 表情反应轮询触发，奖励 LP+20，详见 §11（2026-07-03） |
+| `first-try-notify` | 成员首次使用新上线功能 | 围观群 | 手动触发（operator 供 member_name/function_name/actorOpenId），奖励 LP+10，详见 §13（2026-07-07） |
 
 底图都从图床下载落地到 `assets/badges/`（徽章）或 `assets/events/`（其它）。
 
@@ -91,3 +92,31 @@
 - **首轮不 gate 置顶**：§11 的首轮基线 guard 只压【点赞里程碑】不发；**置顶在循环内、每轮都跑**，所以首次启动就会把当天已够 3 人的热门消息置顶（安静幂等、不像点赞事件会群发刷屏，可接受）。
 - **每群上限 5 条、超了取消最旧（2026-07-03）**：常量 `PIN_CAP=5`（feishu-user.ts）。每成功置顶一条后，`store.pinnedMessagesOldestBeyond(chatId, 5)` 取【我们自己置顶】里超过 5 条的最旧几条（按 `pinned_at DESC, rowid DESC` OFFSET 5、只算 `pinned_messages` 里的行 → **绝不动人工置顶**），逐条 `unpinMessage` + `removePinnedMessage`。**取消后无论 unpin 成功与否都移除追踪**——unpin 失败几乎都是【消息已删/被手动取消】即本就不在置顶里，留着会把上限逻辑卡死；代价是极偶发的临时网络失败会多留一条可见置顶，可接受。实测：运营小天地连置 6 条→自动取消最旧→恰好剩 5（已全部清理）。
 - **注意**：只按【条数】上限，没做【时间过期】取消（如隔天取消）；要的话在轮询里对 `pinned_messages` 按 `pinned_at` 加个 TTL 扫描即可。研究/实现：`src/core/{db,lark,configs}.ts`、`src/core/store/reactions.ts`（`recordPinnedMessage`/`isMessagePinned`/`pinnedMessagesOldestBeyond`/`removePinnedMessage`）、`src/channels/feishu-user.ts`；测试 `src/core/store.test.ts`（`pinned messages: record once...` + `...cap eviction...`）。
+
+## 13. 首次尝新功能 `first-try-notify`（2026-07-07）
+
+社区里有成员**首次使用新上线的功能**时，恭喜他并号召大家来玩，目标 = 围观群，奖励 **LP+10** 给发现者本人。**手动触发**、跟 `cityhall-proposal-voted-notify` 同型（静态 `scope:'global'`、`overlays:[]`、`imageHeight:128`、`gapLines:1`，无 `schedule`）。
+
+- **为什么手动**：`function_name`（新功能名）是**只有 operator 知道的自由文本**，无法从任何 DB 信号/表情累计自动推导；`member_name`（发现者）也由 operator 给。所以走手动 + 自定义 vars。⚠️ 创建单里【事件来源】写的【表情累计达 6 的倍数】是照 like-maniac 模板填的，与【触发方式=手动】矛盾——按【触发方式】字段实现为手动（`function_name` 决定了只能手动）。
+- **实发姿势**：`agent event` CLI 传不了自定义 vars（预览里 `member_name`/`function_name` 会空）。真发用 §9 的临时 `fireEvent` 脚本：`fireEvent('first-try-notify', { actorOpenId: 'ou_发现者', vars: { member_name, function_name } })`。`actorOpenId` 用来发 LP+10（`prepare().afterSend` 里 `store.grantPt(actor, 10, 'event:first-try-notify')`，发送成功才发奖）。
+- **文案**：标题 `{{member_name}} 发现了新功能 {{function_name}}`（遵 §3 标题纯文字：**去掉创建单里的引号**、不加粗体）；正文 `member_name` 作**粗体文字**（不是可点 @，@ 嵌不进 md 粗体，跟 like-maniac 同理），`function_name` 保留单引号（正文允许）。底图 `assets/events/first-try-notify-bg.png`（图床 `i.meee.com.tw/z9HEPWx.png` 落地，1254²，不叠字）。无 `@`、无 mentions。
+- **实现**：只在 `src/core/events.ts` 加一个 `registerEvent`（紧接 like-maniac 之后），复用现有框架，无新表/无轮询/无 supervisor 改动 → `agent update` 热重载即可，不必重启 serve。事件编号 `[11]`。
+- **实测手动触发（2026-07-07）**：给围观群里【用户560770】发了一次（`function_name=每日签到`、`actor=ou_42de8fa5…`、`message_id=om_x100b6bfd9edd5ca0c2334f86e07ea53`、LP+10 入账余额 132.9）。沉淀出【手动带自定义 vars 触发任一事件】的通用姿势：
+  - **反查 open_id（名字→ou_）**：`store.findOpenIdsByName(name)`（`src/core/store/gamification.ts`，从 `chat_members` 名册 `present=1`、`last_seen` 倒序、去重、exact→trim 回退）；临时脚本 / 直查 `SELECT open_id FROM chat_members WHERE name=?`，库在 `.agent/<soul>.db`（tudigong 用 `.agent/tudigong.db`；repo 根 `tudigong.db` 是 0 字节残留别查）。
+  - **真发脚本**：`AGENT_SOUL=tudigong node --env-file=.env` 跑临时 `import { fireEvent } from './dist/core/events.js'` + `fireEvent('first-try-notify', { triggerReason:'manual', actorOpenId:'ou_…', vars:{ member_name, function_name } })`。**必须带 `AGENT_SOUL` 否则 db 解析成默认 soul**；`.env` 才有密钥。`pnpm agent event <id>` CLI **传不了 vars**（预览里占位符会空），只能用脚本——同 §9、§10。
+  - **发奖副作用**：`prepare().afterSend` 里 `store.grantPt(actorOpenId, 10, 'event:first-try-notify')`，**只在发送成功后跑**（发失败不发奖）。
+  - ⚠️ **LP / profile / 账本在共享库 `.agent/shared.db`，不是 soul.db**：验账 `sqlite3 .agent/shared.db "SELECT delta,reason FROM pt_ledger WHERE user_open_id=? ORDER BY rowid DESC"`。**账本表 `pt_ledger`、余额列 `pt_balance`、发放函数 `grantPt`**——旧名 `ap_ledger`/`ap_balance`/`grantAp` 已由 `db.ts` 迁移改名（`ALTER TABLE ap_ledger RENAME TO pt_ledger`），别再用（详见 `local-db-playbook §5`、`pt-gamification-playbook` 抬头更正）。
+  - ⚠️ **`pnpm agent unsend <message_id>` 撤回只删群消息、不退已发的 LP**（撤回 ≠ 回滚副作用；真要退得手动补一笔负 delta 到 `pt_ledger`）。
+
+## 14. 访客里程碑防重发 + 记录第 100·N 位访客（2026-07-08）
+
+**事故**：`visitor-num-notify`（§6）重启后又把「400 人达到」发了一次（400 早已达标）。**根因**：去重是**内存里的上一轮计数**在做（`feishu-user.ts` 的 `prevVisitorWatchCount`、`watchPrev` 轮对轮比较），**重启即归零**——`notADip` guard 被绕过，DB 在群数一旦相对上轮跨过百位就重发。里程碑达标是「永远只发一次」的事，靠内存状态不可靠。
+
+**修法（持久化台账当闸门，重启不失效）**：
+- 新表 **`visitor_milestones`**（migration **v26**：`chat_id+milestone` 主键、`open_id`/`name`/`reached_at`）+ **JSON 台账** `workspaces/<soul>/visitors/<chatId>.json`（人可读，用户要的文件）。两者任一有记录 = 已发过。模块 `src/core/visitor-milestones.ts`（`isMilestoneRecorded`/`recordMilestone`/`refreshVisitorMilestonesWiki`）。
+- `feishu-user.ts` 里程碑块**改成台账闸门**：`milestone = floor(present/100)*100`；`milestone>=100 && !isMilestoneRecorded(...)` 才 record + 刷 wiki + `fireEvent`，否则跳过。删掉了 `prevVisitorWatchCount`/`crossed`/`notADip` 那套内存去重。
+- **「第 100·N 位访客」= 在群成员按 first_seen 升序的第 N 位**（`store.nthPresentMemberByArrival`）。**必须对齐 `visitor-num-notify` 数的是 present（在群）人数**——用「所有曾出现（含已离开）」排序会差开（实测 #400 差成 严玲，正解是 hsiu）。达成时间用该人的 `first_seen`。
+- **回填**：`pnpm agent visitors backfill [--chat oc_id]`（幂等、只 record 不 fire）。已回填围观群 100=李磊 / 200=李绍杰 / 300=懿轩 / 400=hsiu。
+- **wiki**：每次达标（及回填）**机械式覆写**知识库【访客里程碑】页（`configs/lark.json` 的 `visitorMilestoneWikiDocId`=`KTqsdp3bGo0sK1xHMGcc7b77nof`，node=`MDx4w9siFiAbvfk7mI4cvHGQntQ`），表格：里程碑 / 第 N 位访客 / 达成日期。
+- **通用教训重申**：「只做一次」的动作要用**持久化幂等台账**当闸门，别靠进程内存状态（重启就破）。同「别赖 LLM 调工具」一类的框架确定性原则。
+- 改了核心档（feishu-user/events 采集侧）+ 新增 v26 迁移，**要完整重启 serve 才生效**；旧 serve 在重启前仍是旧逻辑（在群数稳定时不会跨百位、暂不会重发）。
