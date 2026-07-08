@@ -19,7 +19,7 @@
       "capture": true,
       "trigger": "mention",
       "triggerPrefix": "",
-      "replyPrefix": "🏯 城邦土地神："
+      "replyPrefix": "🪐 城邦土地神："
     },
     "tudigong-bot": {
       "enabled": true,

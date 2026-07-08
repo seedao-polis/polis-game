@@ -153,7 +153,7 @@ registerEvent({
 // owner @-mentioned via the {{@contact}} token in the body.
 registerEvent({
   eventTypeId: 'welcome-party',
-  title: '🏯 {{name}}，欢迎来到 SeeDAO 数字城邦！',
+  title: '🪐 {{name}}，欢迎来到 SeeDAO 数字城邦！',
   description: [
     '我是城邦土地神，守护这座数字城邦的日常起居 🌱。很高兴见到你这位新市民！',
     '',

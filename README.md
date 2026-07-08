@@ -221,4 +221,4 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt   # matplotlib + netwo
 
 ## 知识库 / 开发约定
 
-项目的操作经验与踩坑沉淀在 **`workspaces/tudigong/memory/`**（默认 soul）。先读 `memories.md` 索引，再按需打开对应 playbook：lark-cli、执行器（agent-executor）、本地库、事件系统、LP（pt-gamification）、Telegram、**徽章系统（badge-system）**、**社区推播事件（community-notify-events）**、**运营数据报告（ops-report）**、**社区动态周报（weekly-report）**、**点赞封神方案草案（like-ascension-proposal，点赞狂魔升级 · 未开发）**、**多人多群组记忆管理 + 群组三级分类（memory-access）**、**技能系统装载（agent-skill）**、**共用 skill 创作房规（skill-authoring）**。**改动飞书 / 数据 / 大脑相关代码前先读它。** 约定：日志用简体中文 + 大陆用语、不带 emoji；代码注释用英文。
+项目的操作经验与踩坑沉淀在 **`workspaces/tudigong/memory/`**（默认 soul）。先读 `memories.md` 索引，再按需打开对应 playbook：lark-cli、执行器（agent-executor）、本地库、事件系统、LP（pt-gamification）、Telegram、**徽章系统（badge-system）**、**社区推播事件（community-notify-events）**、**运营数据报告（ops-report）**、**社区动态周报（weekly-report）**、**点赞封神方案草案（like-ascension-proposal，点赞狂魔升级 · 未开发）**、**多人多群组记忆管理 + 群组三级分类（memory-access）**、**技能系统装载（agent-skill）**、**共用 skill 创作房规（skill-authoring）**、**身份 / 品牌标识（identity-branding，改代表 emoji 等视觉标识：源头在 IDENTITY.md、部分硬编码在 events.ts / agents.json）**。**改动飞书 / 数据 / 大脑相关代码前先读它。** 约定：日志用简体中文 + 大陆用语、不带 emoji；代码注释用英文。
