@@ -11,7 +11,7 @@
 
 ---
 
-**城邦游戏 Polis Game** 是 SeeDAO 数字城邦的社区运营游戏化框架：结合**飞书**（社区身份与互动）、**Kimi CLI**（智能体大脑）与 **Telegram**（运维日志与提醒），把一个常驻 agent——城邦土地神——安置在飞书里：监听社区群、采集对话进知识库，被 @ 或符合触发条件时回应；同时持续采集运营数据（成员、活动报名、文档访问），并把日常的社区参与变成一套可玩的游戏化机制——生命点（LP）、徽章、等级、排行榜、里程碑推播，以及自动生成的运营数据报告。
+**城邦游戏 Polis Game** 是 SeeDAO 数字城邦的社区运营游戏化框架：结合**飞书**（社区身份与互动）、**Kimi CLI**（智能体大脑）与 **Telegram**（运维日志与提醒），把一个常驻 agent——城邦土地神——安置在飞书里：监听社区群、采集对话进知识库，被 @ 或符合触发条件时回应；同时持续采集运营数据（成员、活动报名、文档访问），并把日常的社区参与变成一套可玩的游戏化机制——生命点（LP）、徽章、等级、排行榜、里程碑推播、社区活动预约（@ 或自然语言预约飞书会议 + 视频会议、按标签订阅、每日播报），以及自动生成的运营数据报告。
 
 ## 快速开始
 
@@ -53,6 +53,7 @@ agent link <from_open_id> <to_open_id>       跨 app 同一人的身份归并：
 agent doctor [--fix]                          扫描损坏的执行器会话（--fix 隔离损坏会话）
 agent events                                  列出已定义的事件
 agent event <编号|id> [--test] [--to <oc/ou>] [--dry-run]   手动触发一个事件
+agent meetup create|edit|cancel|digest|list [...]   活动 / Meetup 模块：预约飞书会议（含视频会议 + 循环）、编辑 / 取消、手动播报今日活动、列表（社区成员也可 @ 或自然语言预约；详见 activity-meetup-playbook）
 agent badge import <json_file>               导入徽章定义（JSON 单对象或数组；模板见 create-badge skill）
 agent badge award <徽章> <对象...> [--note <文本>] [--dry-run]  给一个或多个成员发放徽章（对象=open_id 或飞书显示名）
 agent badge list [对象]                       列出全部徽章定义，或某成员持有的徽章

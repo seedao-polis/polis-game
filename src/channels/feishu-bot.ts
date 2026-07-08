@@ -10,6 +10,8 @@ import {
   getUserName,
   downloadMessageResource,
   listMessages,
+  createCalendarEvent,
+  recurringSeriesKey,
   type EventConsumer,
 } from '../core/lark.js';
 import { renderMessageBody, attachmentMarker } from '../core/attachments.js';
@@ -20,6 +22,9 @@ import * as store from '../core/store.js';
 import { append as appendTranscript } from '../core/transcript.js';
 import { checkAndFireTriggers } from '../core/events.js';
 import { loadLpStrategy, judgeReply } from '../core/lp-strategy.js';
+import { loadConfigs, userOpenIdForProfile } from '../core/configs.js';
+import { insertMeetup, setMeetupTags } from '../core/store/meetups.js';
+import { refreshMeetupWiki } from '../core/meetup-wiki.js';
 import fs from 'node:fs';
 import {
   ensureInbox,
@@ -270,6 +275,92 @@ export class FeishuBotChannel implements Channel {
           reply = '（抱歉，我这边出错了，请稍后再试。）';
         }
       }
+      // Parse deterministic MEETUP_CREATE marker from the LLM reply and execute calendar creation.
+      // The LLM appends [MEETUP_CREATE: {...}] when it detects a meetup scheduling intent.
+      // The framework intercepts it here, strips the marker from the visible reply, and calls
+      // createCalendarEvent() deterministically — the LLM never directly invokes any tool.
+      if (replyOk) {
+        const meetupMatch = /\[MEETUP_CREATE:\s*(\{[\s\S]*?\})\]/m.exec(reply);
+        if (meetupMatch) {
+          // Strip the marker line from the reply shown to the user before any processing.
+          reply = reply.replace(/\[MEETUP_CREATE:\s*\{[\s\S]*?\}\]/m, '').replace(/\n{3,}/g, '\n\n').trimEnd();
+          try {
+            const intent = JSON.parse(meetupMatch[1]!) as {
+              title?: string;
+              startTimeSec?: number;
+              endTimeSec?: number;
+              tags?: string[];
+              recur?: string;
+              description?: string;
+            };
+            if (intent.title && intent.startTimeSec && intent.endTimeSec) {
+              let activityCalendarId: string | undefined;
+              try {
+                activityCalendarId = loadConfigs().lark.activityCalendarId;
+              } catch { /* config unavailable */ }
+
+              if (activityCalendarId) {
+                const created = createCalendarEvent({
+                  calendarId: activityCalendarId,
+                  title: intent.title,
+                  startTimeSec: intent.startTimeSec,
+                  endTimeSec: intent.endTimeSec,
+                  description: intent.description,
+                  recurrence: intent.recur,
+                  withVc: true,
+                  profile,
+                  organizerOpenId: userOpenIdForProfile(profile),
+                });
+                if (created) {
+                  const meetupDbId = insertMeetup({
+                    larkEventId: created.eventId,
+                    title: intent.title,
+                    description: intent.description ?? '',
+                    recurrence: intent.recur ?? '',
+                    startTime: intent.startTimeSec,
+                    endTime: intent.endTimeSec,
+                    meetupUrl: created.meetupUrl,
+                    appLink: created.appLink,
+                    shareLink: created.shareLink,
+                    calendarId: activityCalendarId,
+                    createdBy: job.senderOpenId,
+                  });
+                  const tagList = Array.isArray(intent.tags) ? intent.tags.filter(Boolean) : [];
+                  if (tagList.length > 0) setMeetupTags(meetupDbId, tagList);
+
+                  // Append a deterministic footer to the LLM reply: calendar link, VC link, and a
+                  // tag/subscribe hint so other members know how to follow this activity's tag.
+                  const calUrl = created.shareLink || created.appLink;
+                  const footer: string[] = [];
+                  if (calUrl) footer.push(`📅 日历链接：${calUrl}`);
+                  if (created.meetupUrl) footer.push(`🎥 视频会议：${created.meetupUrl}`);
+                  if (tagList.length > 0) {
+                    footer.push(`🏷 标签：${tagList.join('、')}（其他人发【follow ${tagList[0]}】即可订阅，有新活动我在群里 @ ta）`);
+                  } else {
+                    footer.push('🏷 未设置标签。下次可以说【标签 xxx】，方便大家订阅这个系列的活动。');
+                  }
+                  // Always end with a fixed link to the full activity calendar wiki page.
+                  let activityWikiToken: string | undefined;
+                  try { activityWikiToken = loadConfigs().lark.activityWikiNodeToken; } catch { /* config unavailable */ }
+                  if (activityWikiToken) footer.push(`更多活动: https://seedao2049.feishu.cn/wiki/${activityWikiToken}`);
+                  if (footer.length > 0) reply = `${reply}\n\n${footer.join('\n')}`.trimEnd();
+
+                  // Mirror the change to the "SeeDAO 活动日历" wiki page immediately (deterministic, no LLM).
+                  refreshMeetupWiki({ profile });
+                  log.info(`活动会议已创建：id=${meetupDbId}  title=${intent.title}  vc=${created.meetupUrl}`);
+                } else {
+                  log.warn(`MEETUP_CREATE：飞书日历创建失败（title=${intent.title}）`);
+                }
+              } else {
+                log.warn('MEETUP_CREATE：configs 缺少 activityCalendarId，跳过日历创建。');
+              }
+            }
+          } catch (e) {
+            log.warn('MEETUP_CREATE 解析失败：', (e as Error).message);
+          }
+        }
+      }
+
       send(job.messageId, job.chatId, reply, job.isP2p);
       // Peer kickoff: after a genuine group reply, broadcast a cue so same-chat colleague agents can
       // opt into the conversation. Deterministic (not LLM-driven) so collaboration reliably appears.

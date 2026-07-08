@@ -12,6 +12,7 @@ import {
   loadConfigs,
   listAgents,
   resolveAgent,
+  userOpenIdForProfile,
   type ResolvedAgent,
   type WorkerTarget,
   type Identity,
@@ -20,7 +21,15 @@ import {
 /** Default workspace soul used when `serve` / `cli` is invoked without an explicit soul. */
 const DEFAULT_SOUL = 'tudigong';
 import { checkAndRecord } from '../core/auth.js';
-import { larkTimeToMs, recallMessage } from '../core/lark.js';
+import {
+  larkTimeToMs,
+  recallMessage,
+  createCalendarEvent,
+  cancelCalendarEvent,
+  updateCalendarEvent,
+  recurringSeriesKey as larkRecurringSeriesKey,
+  appendDocxContent,
+} from '../core/lark.js';
 import { runSupervisor, readServePid, isAlive } from '../core/supervisor.js';
 import { REPO_ROOT, RUNTIME_DIR } from '../core/paths.js';
 import { log } from '../core/log.js';
@@ -35,6 +44,16 @@ import { startHeartbeat } from '../core/heartbeat.js';
 import { generateAndSendDailyReport, generateAndSendMonthlyReport } from '../core/ops-report.js';
 import { generateAndSendWeeklyReport } from '../core/weekly-report.js';
 import { getFlag, hasFlag } from '../core/argv.js';
+import {
+  insertMeetup,
+  setMeetupTags,
+  getMeetupById,
+  getMeetupByEventId,
+  cancelMeetup as storeCancelMeetup,
+  updateMeetup,
+  listUpcomingMeetups,
+} from '../core/store/meetups.js';
+import { generateMeetupWikiMarkdown, refreshMeetupWiki } from '../core/meetup-wiki.js';
 
 // Load .env (Node >=20.12 built-in) so secrets like TELEGRAM_* reach process.env without a dotenv
 // dependency. Must run before anything reads the env; tolerant of a missing .env (env may come from
@@ -1271,6 +1290,269 @@ async function cmd_heartbeat(argv: string[]): Promise<void> {
   }
 }
 
+// ── activity meetup CLI ──────────────────────────────────────
+// Operator-facing subcommands for managing community activity meetups.
+// These run as one-shot CLI invocations; all Feishu calendar writes use --as user.
+
+/** Format unix seconds as "YYYY-MM-DD HH:mm" in local time. */
+function fmtSec(sec: number): string {
+  return new Date(sec * 1000).toLocaleString('sv-SE', { hour12: false }).slice(0, 16).replace('T', ' ');
+}
+
+/** Parse "YYYY-MM-DD HH:mm" or ISO 8601 into unix seconds. Returns NaN on failure. */
+function parseDateTimeArg(s: string): number {
+  const t = Date.parse(s.includes('T') ? s : s.replace(' ', 'T'));
+  return Number.isFinite(t) ? Math.floor(t / 1000) : NaN;
+}
+
+/** Return the BYDAY weekday token for a JS Date (0=Sun→SU … 6=Sat→SA). */
+function weekdayToken(d: Date): string {
+  return ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'][d.getDay()]!;
+}
+
+async function cmd_meetup(argv: string[]): Promise<void> {
+  const sub = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+
+  if (!sub || sub === 'help') {
+    console.log([
+      '用法:',
+      '  agent meetup create --title <标题> --start <YYYY-MM-DD HH:mm> --end <YYYY-MM-DD HH:mm>',
+      '                       [--tags <tag1,tag2>] [--recur <RRULE|false>] [--desc <说明>]',
+      '  agent meetup edit   <id> [--title <标题>] [--start <dt>] [--end <dt>] [--rrule <RRULE>] [--tags <t1,t2>]',
+      '  agent meetup cancel <id>',
+      '  agent meetup digest [--date <YYYY-MM-DD>] [--to <chat_id>]',
+      '  agent meetup list',
+    ].join('\n'));
+    return;
+  }
+
+  process.env.AGENT_SOUL = DEFAULT_SOUL;
+
+  // Resolve lark profile from the first enabled agent.
+  let larkProfile: string | undefined;
+  let activityCalendarId: string | undefined;
+  let activityWikiDocId: string | undefined;
+  try {
+    const cfg = loadConfigs();
+    activityCalendarId = cfg.lark.activityCalendarId;
+    activityWikiDocId = cfg.lark.activityWikiDocId;
+    for (const id of listAgents(cfg)) {
+      if (cfg.agents.agents[id]?.enabled) {
+        larkProfile = resolveAgent(id, cfg).larkProfile;
+        break;
+      }
+    }
+  } catch {
+    /* ignore config errors; some fields will fall back to defaults */
+  }
+
+  // ── meetup create ───────────────────────────────────────────
+  if (sub === 'create') {
+    const title = getFlag(argv, 'title');
+    const startStr = getFlag(argv, 'start');
+    const endStr = getFlag(argv, 'end');
+    if (!title || !startStr || !endStr) {
+      log.error('--title、--start、--end 均为必填项。示例：\n  agent meetup create --title 社区共学 --start "2026-07-09 20:00" --end "2026-07-09 21:00"');
+      process.exit(1);
+    }
+    const startSec = parseDateTimeArg(startStr);
+    const endSec = parseDateTimeArg(endStr);
+    if (isNaN(startSec) || isNaN(endSec)) {
+      log.error('日期格式无效，请使用 YYYY-MM-DD HH:mm 或 ISO 8601 格式。');
+      process.exit(1);
+    }
+
+    const tagsArg = getFlag(argv, 'tags');
+    const tags = tagsArg ? tagsArg.split(',').map((t) => t.trim()).filter(Boolean) : [];
+    const desc = getFlag(argv, 'desc') ?? '';
+
+    // Build RRULE: if --recur false → one-off; if --recur <RULE> → use it; else default weekly×10.
+    const recurArg = getFlag(argv, 'recur');
+    let recurrence = '';
+    if (!recurArg || recurArg.toLowerCase() === 'true') {
+      const byday = weekdayToken(new Date(startSec * 1000));
+      recurrence = `FREQ=WEEKLY;BYDAY=${byday};COUNT=10`;
+    } else if (recurArg.toLowerCase() !== 'false') {
+      recurrence = recurArg;
+    }
+
+    if (!activityCalendarId) {
+      log.error('configs/lark.json 缺少 activityCalendarId，请先填入 Ricky 的 primary calendar id。');
+      process.exit(1);
+    }
+
+    log.info(`创建会议【${title}】${fmtSec(startSec)} → ${fmtSec(endSec)}${recurrence ? `（循环：${recurrence}）` : '（单次）'}…`);
+    const result = createCalendarEvent({
+      calendarId: activityCalendarId,
+      title,
+      startTimeSec: startSec,
+      endTimeSec: endSec,
+      description: desc,
+      recurrence: recurrence || undefined,
+      withVc: true,
+      profile: larkProfile,
+      organizerOpenId: userOpenIdForProfile(larkProfile),
+    });
+
+    if (!result) {
+      log.error('飞书日历创建失败，请检查日志。');
+      process.exit(1);
+    }
+
+    const meetupId = insertMeetup({
+      larkEventId: result.eventId,
+      title,
+      description: desc,
+      recurrence,
+      startTime: startSec,
+      endTime: endSec,
+      meetupUrl: result.meetupUrl,
+      appLink: result.appLink,
+      shareLink: result.shareLink,
+      calendarId: activityCalendarId,
+      createdBy: larkProfile ?? '',
+    });
+    if (tags.length > 0) setMeetupTags(meetupId, tags);
+    refreshMeetupWiki({ profile: larkProfile }); // mirror to the "SeeDAO 活动日历" wiki page
+
+    console.log(`✅ 会议已创建：id=${meetupId}  event_id=${result.eventId}`);
+    if (result.shareLink) console.log(`   日历链接：${result.shareLink}`);
+    if (result.meetupUrl) console.log(`   VC 入会链接：${result.meetupUrl}`);
+    if (result.appLink) console.log(`   日程链接：${result.appLink}`);
+    if (tags.length > 0) console.log(`   标签：${tags.join('、')}`);
+    return;
+  }
+
+  // ── meetup edit ─────────────────────────────────────────────
+  if (sub === 'edit') {
+    const idStr = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
+    if (!idStr) { log.error('用法: agent meetup edit <id> [--title ...] [--start ...] [--end ...] [--rrule ...] [--tags ...]'); process.exit(1); }
+    const id = Number(idStr);
+    const mtg = getMeetupById(id);
+    if (!mtg) { log.error(`找不到会议：id=${id}`); process.exit(1); }
+    if (mtg.status === 'cancelled') { log.error(`会议【${mtg.title}】已取消，无法编辑。`); process.exit(1); }
+
+    const newTitle = getFlag(argv, 'title');
+    const newStart = getFlag(argv, 'start');
+    const newEnd = getFlag(argv, 'end');
+    const newRrule = getFlag(argv, 'rrule');
+    const newTagsArg = getFlag(argv, 'tags');
+
+    // Update Feishu calendar event.
+    const startIso = newStart ? new Date((parseDateTimeArg(newStart)) * 1000).toISOString() : undefined;
+    const endIso = newEnd ? new Date((parseDateTimeArg(newEnd ?? '')) * 1000).toISOString() : undefined;
+    const larkOk = updateCalendarEvent({
+      eventId: mtg.larkEventId,
+      summary: newTitle,
+      startIso,
+      endIso,
+      rrule: newRrule,
+      profile: larkProfile,
+    });
+
+    // Update local DB.
+    const dbUpdates: Parameters<typeof updateMeetup>[1] = {};
+    if (newTitle) dbUpdates.title = newTitle;
+    if (newStart) dbUpdates.startTime = parseDateTimeArg(newStart);
+    if (newEnd) dbUpdates.endTime = parseDateTimeArg(newEnd);
+    if (newRrule !== undefined) dbUpdates.recurrence = newRrule;
+    updateMeetup(id, dbUpdates);
+    if (newTagsArg !== undefined) {
+      setMeetupTags(id, newTagsArg.split(',').map((t) => t.trim()).filter(Boolean));
+    }
+    refreshMeetupWiki({ profile: larkProfile }); // mirror the edit to the "SeeDAO 活动日历" wiki page
+
+    console.log(larkOk ? `✅ 会议【${newTitle ?? mtg.title}】已更新。` : `⚠️  本地已更新，但飞书日历更新失败，请手动检查。`);
+    return;
+  }
+
+  // ── meetup cancel ───────────────────────────────────────────
+  if (sub === 'cancel') {
+    const idStr = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
+    if (!idStr) { log.error('用法: agent meetup cancel <id>'); process.exit(1); }
+    const id = Number(idStr);
+    const mtg = getMeetupById(id);
+    if (!mtg) { log.error(`找不到会议：id=${id}`); process.exit(1); }
+    if (mtg.status === 'cancelled') { console.log(`会议【${mtg.title}】已经是取消状态。`); return; }
+
+    let calId = mtg.calendarId || activityCalendarId || '';
+    const larkOk = calId ? cancelCalendarEvent(calId, mtg.larkEventId, { profile: larkProfile }) : false;
+    storeCancelMeetup(id);
+    refreshMeetupWiki({ profile: larkProfile }); // mirror the cancellation to the "SeeDAO 活动日历" wiki page
+    console.log(larkOk ? `✅ 已取消会议【${mtg.title}】（飞书日历已删除）。` : `⚠️  本地已标记取消，飞书日历删除${calId ? '失败' : '跳过（无 calendarId）'}，请手动检查。`);
+    return;
+  }
+
+  // ── meetup digest ───────────────────────────────────────────
+  if (sub === 'digest') {
+    const dateArg = getFlag(argv, 'date');
+    const toChatId = getFlag(argv, 'to');
+    const ref = dateArg ? new Date(dateArg) : new Date();
+    if (isNaN(ref.getTime())) { log.error(`无效日期：${dateArg}`); process.exit(1); }
+
+    const dayStart = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate(), 0, 0, 0, 0);
+    const dayEnd = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate() + 1, 0, 0, 0, 0);
+    const { meetupsOnDate } = await import('../core/store/meetups.js');
+    const meetups = meetupsOnDate(Math.floor(dayStart.getTime() / 1000), Math.floor(dayEnd.getTime() / 1000));
+
+    if (meetups.length === 0) {
+      console.log(`${fmtSec(Math.floor(dayStart.getTime() / 1000)).slice(0, 10)} 没有安排会议，不发送播报。`);
+      return;
+    }
+
+    const { sendPost } = await import('../core/lark.js');
+    const { resolveChatTarget } = await import('../core/configs.js');
+    const chatId = toChatId ?? resolveChatTarget('运营小天地');
+    if (!chatId) {
+      console.log('未指定目标群（--to <chat_id>），且 configs 中找不到运营小天地 chat_id，跳过发送。');
+      console.log('以下是播报内容预览：');
+    }
+
+    const lines: import('../core/lark.js').PostElement[][] = [];
+    const dateStr = fmtSec(Math.floor(dayStart.getTime() / 1000)).slice(0, 10);
+    lines.push([{ tag: 'text', text: `📅 今日活动播报（${dateStr}）` }]);
+    for (const m of meetups) {
+      const timeRange = `${fmtSec(m.startTime).slice(11, 16)}–${fmtSec(m.endTime).slice(11, 16)}`;
+      const tagsStr = m.tags.length ? `  #${m.tags.join(' #')}` : '';
+      const vcPart = m.meetupUrl ? `  [入会](${m.meetupUrl})` : '';
+      lines.push([{ tag: 'text', text: `• ${m.title}  ${timeRange}${tagsStr}${vcPart}` }]);
+    }
+
+    console.log('播报内容：');
+    for (const line of lines) console.log('  ' + line.map((e) => ('text' in e ? e.text : '')).join(''));
+
+    if (chatId) {
+      try {
+        const res = sendPost({ chatId }, { content: lines }, { as: 'bot', profile: larkProfile });
+        console.log(`✅ 已发送到群 ${chatId}（message_id=${res.messageId ?? '?'}）`);
+      } catch (e) {
+        log.error('发送失败：', (e as Error).message);
+        process.exit(1);
+      }
+    }
+    return;
+  }
+
+  // ── meetup list ─────────────────────────────────────────────
+  if (sub === 'list') {
+    const meetups = listUpcomingMeetups();
+    if (meetups.length === 0) {
+      console.log('（暂无即将举行的会议）');
+      return;
+    }
+    console.log(`即将举行的会议（共 ${meetups.length} 场）：`);
+    for (const m of meetups) {
+      const tagsStr = m.tags.length ? `  [${m.tags.join(', ')}]` : '';
+      console.log(`  [${m.id}] ${m.title}  ${fmtSec(m.startTime)}${tagsStr}`);
+      if (m.meetupUrl) console.log(`        VC: ${m.meetupUrl}`);
+    }
+    return;
+  }
+
+  log.error(`未知子命令：${sub}。用 agent meetup help 查看用法。`);
+  process.exit(1);
+}
+
 // ── memory management CLI ─────────────────────────────────────
 
 async function cmd_memory(argv: string[]): Promise<void> {
@@ -1486,6 +1768,7 @@ const COMMANDS: CliCommand[] = [
   { names: ['report'], run: cmd_report },
   { names: ['tg-test'], run: cmd_tg_test },
   { names: ['heartbeat'], run: cmd_heartbeat },
+  { names: ['meetup'], run: cmd_meetup },
 ];
 
 const COMMAND_INDEX = new Map<string, CliCommand>();

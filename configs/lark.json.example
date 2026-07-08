@@ -22,6 +22,16 @@
     "AgentNotify": "oc_example_agent_notify"
   },
   "notifyChat": "AgentNotify",
-  "discovery": { "mode": "all-internal", "refreshMinutes": 5 },
-  "event": { "key": "im.message.receive_v1" }
+  "discovery": {
+    "mode": "all-internal",
+    "refreshMinutes": 5
+  },
+  "event": {
+    "key": "im.message.receive_v1"
+  },
+  "activityCalendarId": "feishu.cn_example_calendar_id@group.calendar.feishu.cn",
+  "activityWikiNodeToken": "ExampleWikiNodeToken",
+  "activityWikiDocId": "ExampleWikiDocId",
+  "visitorMilestoneWikiNodeToken": "wikcnExampleVisitorNode",
+  "visitorMilestoneWikiDocId": "doxcnExampleVisitorDoc"
 }

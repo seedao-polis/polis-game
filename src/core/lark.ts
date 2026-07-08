@@ -1212,6 +1212,170 @@ export function unpinMessage(messageId: string, opts: { as?: 'user' | 'bot'; pro
   return res?.code === 0;
 }
 
+// ── calendar event write operations ──────────────────────────
+// Create / update / delete Feishu calendar events as the user identity (Ricky).
+// All three operations require --as user (bot tokens cannot manage calendar events).
+// Success is determined by code===0 in the native API response envelope.
+
+/** Result returned by a successful createCalendarEvent call. */
+export interface CreatedCalendarEvent {
+  /** Recurring-series UUID (bare, without the _0 or _<ts> suffix). */
+  eventId: string;
+  /** Feishu VC join URL; empty string when vc_type was not 'vc'. */
+  meetupUrl: string;
+  /** Feishu calendar deep-link (app_link). */
+  appLink: string;
+  /** Public calendar share link (feishu.cn/calendar/share?token=...); empty string if unavailable. */
+  shareLink: string;
+}
+
+/**
+ * Create a Feishu calendar event via the native events.create API, optionally including a VC
+ * room (vc_type:"vc"). Uses --as user so the event is owned by the configured user identity.
+ * Returns the bare series UUID, VC URL, and app deep-link on success; returns null on any failure.
+ *
+ * The native API is used instead of the +create shortcut because only native supports vc_type.
+ * recurrence must be an RFC 5545 RRULE string (e.g. "FREQ=WEEKLY;BYDAY=TH;COUNT=10"); omit
+ * or leave empty for a one-off event. Timestamps are Unix seconds (integer strings to the API).
+ */
+export function createCalendarEvent(opts: {
+  calendarId: string;
+  title: string;
+  startTimeSec: number;
+  endTimeSec: number;
+  description?: string;
+  recurrence?: string;
+  withVc?: boolean;
+  profile?: string;
+  /** open_id of the organizer to add as an accepted attendee (so they don't show as "not attending"). */
+  organizerOpenId?: string;
+}): CreatedCalendarEvent | null {
+  const data: Record<string, unknown> = {
+    summary: opts.title,
+    start_time: { timestamp: String(opts.startTimeSec) },
+    end_time: { timestamp: String(opts.endTimeSec) },
+    attendee_ability: 'can_see_others',
+  };
+  if (opts.description) data['description'] = opts.description;
+  if (opts.recurrence) data['recurrence'] = opts.recurrence;
+  if (opts.withVc !== false) data['vchat'] = { vc_type: 'vc' };
+
+  let res: any;
+  try {
+    res = larkExec(
+      ['calendar', 'events', 'create',
+        '--calendar-id', opts.calendarId,
+        '--data', JSON.stringify(data),
+        '--as', 'user',
+        '--format', 'json'],
+      { profile: opts.profile }
+    );
+  } catch {
+    return null;
+  }
+  if (res?.code !== 0) return null;
+
+  const ev = res.data?.event;
+  const rawEventId = typeof ev?.event_id === 'string' ? ev.event_id : '';
+  if (!rawEventId) return null;
+
+  // Add the organizer as an accepted attendee. Attendees can't be set in the create body, and an
+  // event with an empty attendee list shows the organizer as "not attending" in the Feishu UI.
+  if (opts.organizerOpenId) {
+    addEventAttendees(opts.calendarId, rawEventId, [opts.organizerOpenId], { profile: opts.profile });
+  }
+
+  const eventId = recurringSeriesKey(rawEventId);
+  const meetupUrl = typeof ev?.vchat?.meeting_url === 'string' ? ev.vchat.meeting_url : '';
+  const appLink = typeof ev?.app_link === 'string' ? ev.app_link : '';
+  // Fetch the public calendar share link for the created series (uses the raw _0 occurrence id).
+  const shareLink = getEventShareLink(opts.calendarId, rawEventId, { profile: opts.profile });
+  return { eventId, meetupUrl, appLink, shareLink };
+}
+
+/**
+ * Add user attendees (open_id) to a calendar event. Attendees cannot be set in the events.create
+ * body, so this is a separate call. Adding the organizer makes them appear as an accepted participant
+ * (an empty attendee list makes the Feishu UI show the organizer as "not attending"). Best-effort:
+ * returns true on code===0, false otherwise; never throws.
+ */
+export function addEventAttendees(calendarId: string, eventId: string, openIds: string[], opts: { profile?: string } = {}): boolean {
+  if (openIds.length === 0) return false;
+  const data = { attendees: openIds.map((id) => ({ type: 'user', user_id: id })), need_notification: false };
+  try {
+    const res = larkExec(
+      ['calendar', 'event.attendees', 'create',
+        '--calendar-id', calendarId, '--event-id', eventId,
+        '--user-id-type', 'open_id', '--data', JSON.stringify(data),
+        '--as', 'user', '--format', 'json'],
+      { profile: opts.profile }
+    );
+    return res?.code === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Update an existing Feishu calendar event via the +update convenience command.
+ * Only the provided fields are changed; absent fields leave the event unchanged.
+ * Uses --as user. Returns true on success (code===0 or ok===true), false on failure.
+ */
+/**
+ * Feishu calendar delete/update require an occurrence-suffixed event_id (e.g. <UUID>_0); the bare
+ * series UUID is rejected. Stored meetups keep the bare UUID (recurringSeriesKey), so append _0 when
+ * the id carries no occurrence suffix. For a recurring series, _0 targets the whole series.
+ */
+function occurrenceEventId(eventId: string): string {
+  return eventId.includes('_') ? eventId : `${eventId}_0`;
+}
+
+export function updateCalendarEvent(opts: {
+  eventId: string;
+  summary?: string;
+  startIso?: string;
+  endIso?: string;
+  rrule?: string;
+  profile?: string;
+}): boolean {
+  const args = ['calendar', '+update', '--event-id', occurrenceEventId(opts.eventId), '--as', 'user', '--format', 'json'];
+  if (opts.summary) { args.push('--summary', opts.summary); }
+  if (opts.startIso) { args.push('--start', opts.startIso); }
+  if (opts.endIso) { args.push('--end', opts.endIso); }
+  if (opts.rrule) { args.push('--rrule', opts.rrule); }
+  try {
+    const res = larkExec(args, { profile: opts.profile });
+    return res?.code === 0 || res?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Delete (cancel) a Feishu calendar event. The delete API needs an occurrence-suffixed event_id, so a
+ * bare stored series UUID is normalized to <UUID>_0, which removes the entire recurring series (a full
+ * occurrence id deletes only that instance). Uses --as user. Returns true on success (code===0).
+ */
+export function cancelCalendarEvent(
+  calendarId: string,
+  eventId: string,
+  opts: { profile?: string } = {}
+): boolean {
+  try {
+    const res = larkExec(
+      ['calendar', 'events', 'delete',
+        '--calendar-id', calendarId,
+        '--event-id', occurrenceEventId(eventId),
+        '--as', 'user',
+        '--format', 'json'],
+      { profile: opts.profile }
+    );
+    return res?.code === 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Control handle for consumeEvents: can shut down the long-lived connection subprocess. */
 export interface EventConsumer {
   /** End the long-lived connection */

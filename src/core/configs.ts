@@ -92,6 +92,16 @@ export interface LarkFile {
   event: { key: string };
   /** Wiki coordinates for the weekly community ops report page. */
   weeklyReportWiki?: { spaceId: string; parentNodeToken: string };
+  /** Ricky's primary Feishu calendar id; used by the activity module to create / delete events. */
+  activityCalendarId?: string;
+  /** Wiki node token for the "SeeDAO 活动日历" page (used to construct the wiki URL). */
+  activityWikiNodeToken?: string;
+  /** Docx obj_token for the "SeeDAO 活动日历" page; used by appendDocxContent to overwrite the page. */
+  activityWikiDocId?: string;
+  /** Wiki node token for the "访客里程碑" page (used to construct the wiki URL). */
+  visitorMilestoneWikiNodeToken?: string;
+  /** Docx obj_token for the "访客里程碑" page; used by appendDocxContent to overwrite the page. */
+  visitorMilestoneWikiDocId?: string;
 }
 
 export interface KimiProfile {
@@ -347,6 +357,24 @@ export function listAgents(cfg?: Configs): string[] {
 export function listAgentsBySoul(soul: string, cfg?: Configs): string[] {
   const c = cfg ?? loadConfigs();
   return Object.keys(c.agents.agents).filter((id) => c.agents.agents[id]?.soul === soul);
+}
+
+/**
+ * Resolve the user open_id behind a lark profile (the human who authorized `--as user` for it). Match
+ * the profile whose larkProfile equals `profile`; fall back to the `default` profile's user. Returns
+ * '' when unresolvable. Used to add the event organizer as an attendee so they show as attending.
+ */
+export function userOpenIdForProfile(profile?: string): string {
+  try {
+    const profiles = loadConfigs().lark.profiles;
+    if (profile) {
+      const match = Object.values(profiles).find((p) => p.larkProfile === profile);
+      if (match?.userOpenId) return match.userOpenId;
+    }
+    return profiles['default']?.userOpenId ?? '';
+  } catch {
+    return '';
+  }
 }
 
 /** Resolve an alias (or a raw oc_ value) into a chat_id; look up the alias in knownInternalChats, and if not found treat it as a chat_id as-is. */

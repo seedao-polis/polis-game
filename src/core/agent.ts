@@ -14,6 +14,7 @@ import { RUNTIME_DIR, SOULS_DIR, buildAgentMcpConfig } from './paths.js';
 import { isAdmin } from './configs.js';
 import type { KimiProfile } from './configs.js';
 import { loadLpStrategy, buildJudgeInstruction } from './lp-strategy.js';
+import { buildMeetupContextBlock } from './meetup-context.js';
 
 /** Block the current thread for ms milliseconds (respond() is synchronous end-to-end). */
 function sleepSync(ms: number): void {
@@ -221,7 +222,12 @@ export class Agent {
       `需要查阅本工作区的源文件时（例如 examples/ 历史范文、memory/ 各 *-playbook.md），` +
       `用文件读取工具按上面的绝对路径打开（如 ${workspaceDir}/examples/）。\n\n`;
 
-    const prompt = `${scene}${turnLine}${filesLine}${identity}${memBlock}${body}\n\n${langRule}${judge ? '\n\n' + judge : ''}`;
+    // Activity module context (serve only): inject current/upcoming community activities from the
+    // activity_meetups DB so the agent answers "what's on today / recently" from real data with
+    // links. Self-gates to '' when the soul has no activities, so non-activity souls are unaffected.
+    const meetupBlock = isServe ? buildMeetupContextBlock() : '';
+
+    const prompt = `${scene}${turnLine}${filesLine}${identity}${memBlock}${meetupBlock}${body}\n\n${langRule}${judge ? '\n\n' + judge : ''}`;
     return {
       prompt,
       workDir,

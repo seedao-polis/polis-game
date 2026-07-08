@@ -619,6 +619,87 @@ CREATE TABLE IF NOT EXISTS pinned_messages (
 );
 `;
 
+// Activity meetups: one row per Feishu calendar event managed by the activity module. lark_event_id
+// stores the recurring-series UUID (bare, without the _<ts> occurrence suffix) so queries span the
+// whole series. status 'cancelled' is a soft-delete that preserves history while hiding the event
+// from upcoming-digest and wiki queries. meetup_url and app_link are captured at creation time from
+// the Feishu events.create response so the bot never needs to re-fetch calendar data.
+const SCHEMA_V23 = `
+CREATE TABLE IF NOT EXISTS activity_meetups (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  lark_event_id  TEXT NOT NULL UNIQUE,
+  title          TEXT NOT NULL DEFAULT '',
+  description    TEXT NOT NULL DEFAULT '',
+  recurrence     TEXT NOT NULL DEFAULT '',
+  start_time     INTEGER NOT NULL DEFAULT 0,
+  end_time       INTEGER NOT NULL DEFAULT 0,
+  meetup_url    TEXT NOT NULL DEFAULT '',
+  app_link       TEXT NOT NULL DEFAULT '',
+  calendar_id    TEXT NOT NULL DEFAULT '',
+  created_by     TEXT NOT NULL DEFAULT '',
+  status         TEXT NOT NULL DEFAULT 'confirmed',
+  created_at     INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at     INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_activity_meetups_start ON activity_meetups(start_time);
+CREATE INDEX IF NOT EXISTS idx_activity_meetups_status ON activity_meetups(status);
+
+CREATE TABLE IF NOT EXISTS activity_meetup_tags (
+  meetup_id INTEGER NOT NULL REFERENCES activity_meetups(id) ON DELETE CASCADE,
+  tag        TEXT NOT NULL,
+  PRIMARY KEY (meetup_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_activity_meetup_tags_tag ON activity_meetup_tags(tag);
+`;
+
+// Meetup tag subscriptions: one row per (user, tag) pair. A subscriber receives an @-mention in the
+// daily 08:00 group digest when any confirmed meetup carrying that tag is scheduled for that day.
+const SCHEMA_V24 = `
+CREATE TABLE IF NOT EXISTS meetup_subscriptions (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_open_id TEXT NOT NULL,
+  tag          TEXT NOT NULL,
+  created_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE(user_open_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_meetup_subscriptions_tag  ON meetup_subscriptions(tag);
+CREATE INDEX IF NOT EXISTS idx_meetup_subscriptions_user ON meetup_subscriptions(user_open_id);
+`;
+
+// Public calendar share link (feishu.cn/calendar/share?token=...) captured at creation time,
+// surfaced in bot replies and the wiki calendar page so members can open and subscribe to the event.
+const SCHEMA_V25 = `
+ALTER TABLE activity_meetups ADD COLUMN share_link TEXT NOT NULL DEFAULT '';
+`;
+
+// Visitor-count milestones: one frozen row per (chat, hundred) recording who the milestone-th visitor
+// was (present-member arrival order). Serves as the persistent, restart-proof idempotency ledger for
+// the visitor-num-notify announcement so a milestone is announced exactly once, ever.
+const SCHEMA_V26 = `
+CREATE TABLE IF NOT EXISTS visitor_milestones (
+  chat_id    TEXT NOT NULL,
+  milestone  INTEGER NOT NULL,
+  open_id    TEXT NOT NULL DEFAULT '',
+  name       TEXT NOT NULL DEFAULT '',
+  reached_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (chat_id, milestone)
+);
+`;
+
+// Self-service display-name overrides: one row per open_id a member has renamed themselves to via the
+// "@我 改名 <名字>" command. Lives in the shared LP database (like identity_links) so a member's chosen
+// name follows them across every agent. Applied at render time by name-overrides.ts on top of the raw
+// captured Feishu name — which the 5-minute roster sync keeps overwriting — so the rename actually
+// sticks. The operator-curated configs/name-overrides.json still takes precedence over this self-service
+// layer. Keyed by open_id (not name) on purpose: display resolves by identity, so a later rename is free.
+const SCHEMA_V27 = `
+CREATE TABLE IF NOT EXISTS name_overrides (
+  open_id    TEXT PRIMARY KEY,
+  name       TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+`;
+
 /** Apply ordered, idempotent schema migrations tracked in schema_migrations. */
 function runMigrations(db: Db): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -652,6 +733,11 @@ function runMigrations(db: Db): void {
     { version: 20, description: 'identity links (alias per-app open_ids to one canonical LP identity)', sql: SCHEMA_V20 },
     { version: 21, description: 'chat reaction harvest (per-member cumulative like count for milestones)', sql: SCHEMA_V21 },
     { version: 22, description: 'pinned messages (auto-pin popular messages, idempotent)', sql: SCHEMA_V22 },
+    { version: 23, description: 'activity meetups + tags (tudigong activity module)', sql: SCHEMA_V23 },
+    { version: 24, description: 'meetup tag subscriptions (activity module digest mentions)', sql: SCHEMA_V24 },
+    { version: 25, description: 'activity_meetups.share_link (public calendar share link)', sql: SCHEMA_V25 },
+    { version: 26, description: 'visitor_milestones (restart-proof visitor-count announcement ledger)', sql: SCHEMA_V26 },
+    { version: 27, description: 'self-service display-name overrides (改名 command, keyed by open_id)', sql: SCHEMA_V27 },
   ];
   for (const m of migrations) {
     if (applied.has(m.version)) continue;

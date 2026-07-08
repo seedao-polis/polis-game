@@ -6,11 +6,14 @@ import { log } from './log.js';
 import * as store from './store.js';
 import { scanCorruptSessions, quarantineSession } from './kimi-session.js';
 import { loadConfigs, listAgents, resolveAgent, resolveChatTarget, loadChatPolicies, type WorkerTarget } from './configs.js';
-import { sendText } from './lark.js';
+import { sendText, sendPost, appendDocxContent, type PostElement } from './lark.js';
 import { flushTelegramSync } from './telegram.js';
 import { listScheduledEvents, rollScheduledEvent, type EventSchedule } from './events.js';
 import { generateAndSendDailyReport, generateAndSendMonthlyReport } from './ops-report.js';
 import { generateAndSendWeeklyReport } from './weekly-report.js';
+import { meetupsOnDate, subscribersForTag, listAllMeetupsForWiki } from './store/meetups.js';
+import { chatMemberOpenIds } from './store/members.js';
+import { generateMeetupWikiMarkdown } from './meetup-wiki.js';
 import { checkUserTokenExpiry } from './token-watch.js';
 import { purgeExpiredMemories, listKnownChatIds } from './store/memory.js';
 import { aggregateGroupTopics } from './group-intel.js';
@@ -491,6 +494,139 @@ function scheduleSessionJanitor(): void {
   setTimeout(run, JANITOR_FIRST_MS);
 }
 
+// ── daily meetup digest (08:00) ──────────────────────────────
+// Sends a rich-text summary of today's confirmed meetups to the configured broadcast group.
+// Appends an @-mention list for subscribers whose tags match any of today's meetups AND who
+// are present in the target group. Deterministic: no LLM involved, no outbound-guard gate.
+
+/** Format unix seconds as HH:mm (local time). */
+function fmtTime(sec: number): string {
+  return new Date(sec * 1000).toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+
+/** Format unix seconds as YYYY-MM-DD. */
+function fmtDate(sec: number): string {
+  return new Date(sec * 1000).toLocaleDateString('sv-SE');
+}
+
+/**
+ * Send the daily meetup digest to the broadcast group at 08:00. If no confirmed meetups
+ * are scheduled for today, the function returns silently without sending anything.
+ * Self-reschedules to 08:00 the next day.
+ */
+function scheduleDailyMeetupDigest(): void {
+  const now = new Date();
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 8, 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+
+  setTimeout(() => {
+    try {
+      const today = new Date();
+      const dayStart = Math.floor(new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0).getTime() / 1000);
+      const dayEnd = Math.floor(new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1, 0, 0, 0).getTime() / 1000);
+      const meetups = meetupsOnDate(dayStart, dayEnd);
+
+      if (meetups.length === 0) {
+        log.info('08:00 会议播报：今日无会议，静默。');
+        setTimeout(scheduleDailyMeetupDigest, 0);
+        return;
+      }
+
+      // Resolve the broadcast chat (prefer 围观群; fall back to 运营小天地 for testing).
+      const chatId = resolveChatTarget('围观群') ?? resolveChatTarget('运营小天地');
+      if (!chatId) {
+        log.warn('08:00 会议播报：未配置播报群（围观群 / 运营小天地），跳过。');
+        setTimeout(scheduleDailyMeetupDigest, 0);
+        return;
+      }
+
+      // Resolve the lark profile for sending.
+      const profile = eventSendProfile();
+
+      // Build post content (rich-text paragraphs).
+      const dateStr = fmtDate(dayStart);
+      const lines: PostElement[][] = [];
+      lines.push([{ tag: 'text', text: `📅 今日活动播报（${dateStr}）` }]);
+      for (const m of meetups) {
+        const timeRange = `${fmtTime(m.startTime)}–${fmtTime(m.endTime)}`;
+        const tagsStr = m.tags.length ? `  #${m.tags.join(' #')}` : '';
+        const vcPart = m.meetupUrl ? `  加入视频会议：${m.meetupUrl}` : '';
+        lines.push([{ tag: 'text', text: `• ${m.title}  ${timeRange}${tagsStr}${vcPart}` }]);
+      }
+
+      // Build @-mention list: collect subscribers for all today's meetup tags,
+      // then filter to those who are present in the broadcast group.
+      const groupMembers = chatMemberOpenIds([chatId]);
+      const mentionSet = new Set<string>();
+      for (const m of meetups) {
+        for (const tag of m.tags) {
+          for (const uid of subscribersForTag(tag)) {
+            if (groupMembers.has(uid)) mentionSet.add(uid);
+          }
+        }
+      }
+      if (mentionSet.size > 0) {
+        const atElements: PostElement[] = [];
+        for (const uid of mentionSet) {
+          atElements.push({ tag: 'at', user_id: uid });
+          atElements.push({ tag: 'text', text: ' ' });
+        }
+        lines.push(atElements);
+      }
+
+      sendPost({ chatId }, { content: lines }, { as: 'bot', profile });
+      log.info(`08:00 会议播报已发送（${meetups.length} 场会议，@${mentionSet.size} 人）→ ${chatId}`);
+    } catch (e) {
+      log.error('08:00 会议播报失败：', (e as Error).message);
+    }
+    setTimeout(scheduleDailyMeetupDigest, 0); // re-anchor to the next 08:00
+  }, next.getTime() - now.getTime());
+}
+
+// ── daily meetup wiki update (08:01) ────────────────────────
+// Overwrites the "SeeDAO 活动日历" wiki docx page with a freshly rendered Markdown table.
+// Purely deterministic data formatting; no LLM, no outbound-guard gate.
+// Runs one minute after the digest to let any late DB writes from the digest settle.
+
+/**
+ * Overwrite the activity calendar wiki page at 08:01 each day. Reads all meetups from
+ * the DB, renders two Markdown table sections (upcoming / past), and pushes to the docx.
+ * Self-reschedules to 08:01 the next day.
+ */
+function scheduleDailyMeetupWikiUpdate(): void {
+  const now = new Date();
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 8, 1, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+
+  setTimeout(() => {
+    try {
+      let docId: string | undefined;
+      try {
+        docId = loadConfigs().lark.activityWikiDocId;
+      } catch { /* config unavailable */ }
+
+      if (!docId) {
+        log.warn('08:01 wiki 更新：configs 缺少 activityWikiDocId，跳过。');
+        setTimeout(scheduleDailyMeetupWikiUpdate, 0);
+        return;
+      }
+
+      const profile = eventSendProfile();
+      const meetups = listAllMeetupsForWiki();
+      const markdown = generateMeetupWikiMarkdown(meetups);
+      const ok = appendDocxContent(docId, markdown, { profile, overwrite: true, format: 'markdown' });
+      if (ok) {
+        log.info(`08:01 SeeDAO 活动日历 wiki 已更新（${meetups.length} 条记录）`);
+      } else {
+        log.warn('08:01 SeeDAO 活动日历 wiki 更新失败（appendDocxContent 返回 false）');
+      }
+    } catch (e) {
+      log.error('08:01 wiki 更新失败：', (e as Error).message);
+    }
+    setTimeout(scheduleDailyMeetupWikiUpdate, 0); // re-anchor to the next 08:01
+  }, next.getTime() - now.getTime());
+}
+
 /** Start the supervisor: stays resident, watches over the worker child process, and SIGHUP triggers a graceful restart. */
 export function runSupervisor(opts: SupervisorOptions): Promise<void> {
   const existing = readServePid();
@@ -612,6 +748,8 @@ export function runSupervisor(opts: SupervisorOptions): Promise<void> {
   planAndArmEvents();        // and plan/arm today's day-based events now (covers a mid-day start)
   armMinuteEvents();         // start recurring ticks for minute-cadence events
   scheduleSessionJanitor();
+  scheduleDailyMeetupDigest();     // daily 08:00 today's meetup broadcast → 围观群
+  scheduleDailyMeetupWikiUpdate(); // daily 08:01 overwrite "SeeDAO 活动日历" wiki page
   startChild();
 
   return new Promise(() => {
