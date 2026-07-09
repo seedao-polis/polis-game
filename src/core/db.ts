@@ -591,9 +591,10 @@ CREATE INDEX IF NOT EXISTS idx_identity_links_canonical ON identity_links(canoni
 
 // Chat reaction harvest: one row per (message, reactor, emoji) reaction observed by the reaction-sync
 // poll on non-work groups. Deduped by the composite PK so re-seeing the same reaction on later polls is
-// a no-op (INSERT OR IGNORE), letting a member's cumulative "like" count = COUNT(*) by reactor drive the
-// like-maniac milestone event. Lives in the per-soul db (like chat_members / doc_view_events); the shared
-// LP db gets the (empty, unused) table too since both dbs share one migration set.
+// a no-op (INSERT OR IGNORE). Each row keeps the reaction's action_time so a member's like count within a
+// logical week (a windowed COUNT(*) by reactor) can drive the like-maniac milestone. Lives in the per-soul
+// db (like chat_members / doc_view_events); the shared LP db gets the (empty, unused) table too since both
+// dbs share one migration set.
 const SCHEMA_V21 = `
 CREATE TABLE IF NOT EXISTS chat_reactions (
   message_id      TEXT NOT NULL,
@@ -700,6 +701,22 @@ CREATE TABLE IF NOT EXISTS name_overrides (
 );
 `;
 
+// Like-maniac weekly announcement ledger: one row per (logical week, member) the like-maniac milestone
+// has already fired for. week_start is the epoch-second start of the logical week (Monday 05:00 local).
+// The PK makes the announcement fire at most once per member per week — a restart-proof gate (same
+// pattern as visitor_milestones), so the weekly 66-reaction milestone never re-fires after a restart or
+// on a later poll in the same week. Lives in the per-soul db alongside chat_reactions.
+const SCHEMA_V28 = `
+CREATE TABLE IF NOT EXISTS like_maniac_weeks (
+  week_start     INTEGER NOT NULL,
+  open_id        TEXT NOT NULL,
+  name           TEXT NOT NULL DEFAULT '',
+  reaction_count INTEGER NOT NULL DEFAULT 0,
+  reached_at     INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (week_start, open_id)
+);
+`;
+
 /** Apply ordered, idempotent schema migrations tracked in schema_migrations. */
 function runMigrations(db: Db): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -738,6 +755,7 @@ function runMigrations(db: Db): void {
     { version: 25, description: 'activity_meetups.share_link (public calendar share link)', sql: SCHEMA_V25 },
     { version: 26, description: 'visitor_milestones (restart-proof visitor-count announcement ledger)', sql: SCHEMA_V26 },
     { version: 27, description: 'self-service display-name overrides (改名 command, keyed by open_id)', sql: SCHEMA_V27 },
+    { version: 28, description: 'like_maniac_weeks (per-week like-maniac announcement ledger, weekly 66-reaction milestone)', sql: SCHEMA_V28 },
   ];
   for (const m of migrations) {
     if (applied.has(m.version)) continue;

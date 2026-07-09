@@ -138,6 +138,37 @@ test('chat reactions: dedupe by (message, reactor, emoji) and count per reactor'
   assert.equal(store.recordChatReaction({ messageId: 'om_x', chatId: 'oc_r', reactorOpenId: '', emojiType: 'PARTY' }), false);
 });
 
+test('weeklyMemberReactionCount counts only reactions whose action_time is inside the window', () => {
+  const a = uid();
+  const weekStart = 1_000_000; // arbitrary epoch-second window [1_000_000, 1_000_000 + 7d)
+  const weekEnd = weekStart + 7 * 24 * 3600;
+  // Three reactions inside the week, one before it, one after it, one with unknown time (0).
+  store.recordChatReaction({ messageId: 'om_w1', chatId: 'oc_w', reactorOpenId: a, emojiType: 'PARTY', actionTime: weekStart });
+  store.recordChatReaction({ messageId: 'om_w2', chatId: 'oc_w', reactorOpenId: a, emojiType: 'PARTY', actionTime: weekStart + 100 });
+  store.recordChatReaction({ messageId: 'om_w3', chatId: 'oc_w', reactorOpenId: a, emojiType: 'PARTY', actionTime: weekEnd - 1 });
+  store.recordChatReaction({ messageId: 'om_before', chatId: 'oc_w', reactorOpenId: a, emojiType: 'PARTY', actionTime: weekStart - 1 });
+  store.recordChatReaction({ messageId: 'om_after', chatId: 'oc_w', reactorOpenId: a, emojiType: 'PARTY', actionTime: weekEnd });
+  store.recordChatReaction({ messageId: 'om_unknown', chatId: 'oc_w', reactorOpenId: a, emojiType: 'PARTY', actionTime: 0 });
+
+  assert.equal(store.weeklyMemberReactionCount(a, weekStart, weekEnd), 3, 'only the 3 in-window reactions count');
+  assert.equal(store.weeklyMemberReactionCount(uid(), weekStart, weekEnd), 0, 'unknown reactor has none');
+});
+
+test('like-maniac weekly ledger fires once per member per week (idempotent, week-scoped)', () => {
+  const a = uid();
+  const wk = 2_000_000;
+  assert.equal(store.isLikeManiacWeekRecorded(wk, a), false, 'not recorded yet');
+  assert.equal(store.recordLikeManiacWeek(wk, a, 'A', 66), true, 'first record for the week is newly inserted');
+  assert.equal(store.isLikeManiacWeekRecorded(wk, a), true, 'now reported as recorded');
+  assert.equal(store.recordLikeManiacWeek(wk, a, 'A', 80), false, 'a second record for the same week is ignored');
+  // A different week for the same member is a distinct milestone.
+  const nextWk = wk + 7 * 24 * 3600;
+  assert.equal(store.isLikeManiacWeekRecorded(nextWk, a), false, 'the next week starts fresh');
+  assert.equal(store.recordLikeManiacWeek(nextWk, a, 'A', 66), true, 'the next week fires again');
+  // Blank open_id is rejected.
+  assert.equal(store.recordLikeManiacWeek(wk, '', 'X', 66), false);
+});
+
 test('pinned messages: record once (idempotent) and query', () => {
   const m = 'om_pin_1';
   assert.equal(store.isMessagePinned(m), false, 'unknown message is not pinned');

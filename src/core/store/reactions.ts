@@ -1,8 +1,10 @@
 import { getDb } from '../db.js';
 
 // Chat reaction harvest store. The reaction-sync poll observes emoji reactions on the last N messages of
-// each non-work group and records each (message, reactor, emoji) here, deduped by the composite PK. A
-// member's cumulative "like" count is simply COUNT(*) by reactor, which drives the like-maniac milestone.
+// each non-work group and records each (message, reactor, emoji) here, deduped by the composite PK. Each
+// row carries the reaction's action_time, so a member's like count within a *logical week* is a windowed
+// COUNT(*) by reactor — this drives the like-maniac milestone (fires once when a member reaches 66
+// reactions inside the current logical week). The like_maniac_weeks ledger gates it to once per week.
 
 /** One observed reaction to record (from lark MessageReaction + its message/chat context). */
 export interface ChatReactionRow {
@@ -47,6 +49,27 @@ export function memberReactionCount(openId: string): number {
   }
 }
 
+/**
+ * Count of distinct reactions this member made within a time window [startSec, endSec) — matched on the
+ * reaction's action_time (unix seconds). Used to drive the like-maniac milestone off the *current logical
+ * week* instead of an all-time total. Rows with an unknown action_time (0) fall outside any real week and
+ * are naturally excluded.
+ */
+export function weeklyMemberReactionCount(openId: string, startSec: number, endSec: number): number {
+  if (!openId) return 0;
+  try {
+    const row = getDb()
+      .prepare(
+        `SELECT COUNT(*) AS n FROM chat_reactions
+         WHERE reactor_open_id = ? AND action_time >= ? AND action_time < ?`
+      )
+      .get(openId, startSec, endSec) as { n: number } | undefined;
+    return row?.n ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 /** Total reactions recorded so far (used to tell a first-ever seed round from a steady-state one). */
 export function chatReactionCount(): number {
   try {
@@ -54,6 +77,41 @@ export function chatReactionCount(): number {
     return row?.n ?? 0;
   } catch {
     return 0;
+  }
+}
+
+// ── like-maniac weekly announcement ledger ────────────────────────────────────
+
+/**
+ * Record that the like-maniac milestone has fired for a member in a given logical week (keyed by the
+ * week's start epoch-seconds). Idempotent: returns true only when this (week, member) was NEWLY recorded,
+ * so the caller announces exactly once per member per week. Best-effort — never throws into the poll.
+ */
+export function recordLikeManiacWeek(weekStart: number, openId: string, name: string, count: number): boolean {
+  if (!openId || !Number.isFinite(weekStart)) return false;
+  try {
+    const res = getDb()
+      .prepare(
+        `INSERT OR IGNORE INTO like_maniac_weeks(week_start, open_id, name, reaction_count)
+         VALUES (?, ?, ?, ?)`
+      )
+      .run(weekStart, openId, name ?? '', count);
+    return (res.changes as number) > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether the like-maniac milestone has already fired for this member in the given logical week. */
+export function isLikeManiacWeekRecorded(weekStart: number, openId: string): boolean {
+  if (!openId || !Number.isFinite(weekStart)) return false;
+  try {
+    const row = getDb()
+      .prepare('SELECT 1 FROM like_maniac_weeks WHERE week_start = ? AND open_id = ?')
+      .get(weekStart, openId);
+    return !!row;
+  } catch {
+    return false;
   }
 }
 

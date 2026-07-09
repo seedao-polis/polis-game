@@ -459,7 +459,8 @@ registerEvent({
 });
 
 // Like-maniac milestone announcement — fired by the reaction-harvest poll when a community member's
-// cumulative emoji-reaction count (across the monitored non-work groups) newly crosses a multiple of 6.
+// emoji-reaction count within the current logical week (Mon 05:00 → next Mon 04:59, across the monitored
+// non-work groups) reaches 66, at most once per member per week.
 // Posted to the SeeDAO 围观群 group. member_name comes from the poll via vars; the rewarded member's
 // open_id comes via actorOpenId, and prepare() grants them LP after a successful send. Base image has no
 // overlays and is resized to 128px height (aspect kept).
@@ -472,7 +473,7 @@ registerEvent({
     '社区成员 **{{member_name}}** 近期对社区动态疯狂点赞',
     'SeeDAO 是不是做对什么事，让人会如此疯狂的按赞呢？让我们继续看下去',
     '',
-    '> 此事件在社区成员累计点赞达 6 的倍数时发生',
+    '> 此事件在社区成员一周内点赞达 66 次时发生',
   ].join('\n'),
   scope: 'global',
   targetChatId: LIKE_MANIAC_NOTIFY_CHAT_ID,

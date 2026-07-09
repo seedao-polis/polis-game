@@ -2,7 +2,7 @@ import type { Agent } from '../core/agent.js';
 import type { Channel } from './channel.js';
 import type { ResolvedAgent } from '../core/configs.js';
 import { resolveChatTarget, getChatTier, getAutoPinThreshold } from '../core/configs.js';
-import { logicalDayStart } from '../core/time.js';
+import { logicalDayStart, logicalWeekStart, DAY_MS } from '../core/time.js';
 import {
   listMessages,
   sendText,
@@ -285,15 +285,16 @@ export class FeishuUserChannel implements Channel {
     // Reaction poll: for each group, fetch the last N messages WITH their reactions once and drive two
     // separate concerns off that single fetch:
     //   (1) like-maniac harvest — NON-WORK groups only: record each (message, reactor, emoji) into
-    //       chat_reactions (deduped); when a member's cumulative like count crosses a multiple of
-    //       LIKE_STEP, fire the like-maniac milestone once. The first round only seeds the backlog.
+    //       chat_reactions (deduped); when a member's reaction count *within the current logical week*
+    //       reaches LIKE_MANIAC_WEEKLY_THRESHOLD, fire the like-maniac milestone once (gated to once per
+    //       member per week by the like_maniac_weeks ledger). The first round only seeds the backlog.
     //   (2) auto-pin popular messages — any group with autoPinMinReactors configured (config-driven, see
     //       chat-policies.json): when TODAY's message has been reacted to by >= that many distinct people,
     //       pin it (once, idempotent via pinned_messages).
     // A group is scanned if it needs EITHER concern. Runs on the discovery cadence alongside member sync
     // (which populates reactor display names first).
     const REACTION_SCAN_MESSAGES = 18; // "近 18 则讯息" per the event spec
-    const LIKE_STEP = 6; // fire when cumulative likes crosses a multiple of 6
+    const LIKE_MANIAC_WEEKLY_THRESHOLD = 66; // fire when a member reaches 66 reactions within one logical week
     const PIN_CAP = 5; // keep at most this many of OUR auto-pins per chat; unpin the oldest beyond it
     const REACTION_SEED_KEY = `feishu-reactions-seed-${profile}`;
     // Processing-indicator reactions the bot/operator add while replying (added→removed) are NOT genuine
@@ -305,7 +306,8 @@ export class FeishuUserChannel implements Channel {
       const seeded = loadCursor(REACTION_SEED_KEY).lastPosition === 1;
       // Only TODAY's (current logical day) messages are eligible for auto-pin.
       const todayStartMs = logicalDayStart(new Date()).getTime();
-      // New (first-seen) reactions per reactor this round → drives the cumulative-crossing check.
+      // Reactors with at least one new (first-seen) reaction this round → only these members can have
+      // newly reached the weekly threshold, so only they are re-checked below.
       const newByMember = new Map<string, number>();
       let scannedChats = 0;
       let totalNew = 0;
@@ -406,20 +408,28 @@ export class FeishuUserChannel implements Channel {
         return;
       }
 
-      // Steady state: for each member with new reactions, fire once if their cumulative count newly
-      // crossed a multiple of LIKE_STEP. fire-and-forget — fireEvent never throws into this poll.
+      // Steady state: for each member with new reactions this round, fire once if their reaction count
+      // within the CURRENT logical week has reached the threshold and the milestone hasn't already fired
+      // for them this week. The like_maniac_weeks ledger is the restart-proof once-per-week gate — a plain
+      // in-memory crossing check would re-fire after a restart or on late-arriving out-of-week reactions.
+      // fire-and-forget — fireEvent never throws into this poll.
+      const weekStart = logicalWeekStart(new Date());
+      const weekStartSec = Math.floor(weekStart.getTime() / 1000);
+      const weekEndSec = weekStartSec + Math.floor((7 * DAY_MS) / 1000);
       for (const [openId, delta] of newByMember) {
         if (delta <= 0) continue;
-        const now = store.memberReactionCount(openId);
-        const prev = now - delta;
-        const crossed = Math.floor(now / LIKE_STEP) > Math.floor(prev / LIKE_STEP);
+        const weeklyCount = store.weeklyMemberReactionCount(openId, weekStartSec, weekEndSec);
         const name = store.memberName(openId) || openId;
-        if (!crossed) {
-          log.debug(`点赞监测【${name}】：累计 ${now}（本轮 +${delta}），下一阈值 ${(Math.floor(now / LIKE_STEP) + 1) * LIKE_STEP}`);
+        if (weeklyCount < LIKE_MANIAC_WEEKLY_THRESHOLD) {
+          log.debug(`点赞监测【${name}】：本周 ${weeklyCount}（本轮 +${delta}），阈值 ${LIKE_MANIAC_WEEKLY_THRESHOLD}`);
           continue;
         }
-        const milestone = Math.floor(now / LIKE_STEP) * LIKE_STEP;
-        log.info(`点赞狂魔提醒触发【${name}】：累计点赞 ${prev} → ${now}，跨越 ${milestone}，发送通知`);
+        if (store.isLikeManiacWeekRecorded(weekStartSec, openId)) {
+          log.debug(`点赞监测【${name}】：本周 ${weeklyCount}，已触发过点赞狂魔，跳过`);
+          continue;
+        }
+        if (!store.recordLikeManiacWeek(weekStartSec, openId, name, weeklyCount)) continue; // lost the race
+        log.info(`点赞狂魔提醒触发【${name}】：本周点赞 ${weeklyCount}（本轮 +${delta}）达 ${LIKE_MANIAC_WEEKLY_THRESHOLD}，发送通知`);
         void fireEvent('like-maniac-notify', {
           profile,
           triggerReason: 'like_milestone',
