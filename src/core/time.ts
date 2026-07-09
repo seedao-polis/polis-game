@@ -52,6 +52,20 @@ export function logicalMonthStart(d: Date): Date {
   return new Date(ld.getFullYear(), ld.getMonth(), 1, LOGICAL_DAY_START_HOUR, 0, 0, 0);
 }
 
+/**
+ * Anchor a moment to the start (Monday 05:00 local) of the logical week it belongs to. A logical week
+ * runs Monday 05:00 → the next Monday 04:59, aligned to the same 05:00 boundary as the logical day — so
+ * e.g. Monday 03:00 still belongs to the *previous* week (it is logically still Sunday). Used by the
+ * like-maniac milestone, which counts a member's reactions within the current logical week.
+ */
+export function logicalWeekStart(d: Date): Date {
+  const ld = logicalDayStart(d); // this moment's logical-day anchor (its 05:00)
+  const daysSinceMonday = (ld.getDay() + 6) % 7; // Mon→0, Tue→1, … Sun→6
+  const wk = new Date(ld);
+  wk.setDate(wk.getDate() - daysSinceMonday);
+  return wk;
+}
+
 /** Local midnight of the calendar date that the logical day containing `d` belongs to. */
 export function logicalDayCalendarDate(d: Date): Date {
   const shifted = new Date(d.getTime() - LOGICAL_DAY_START_HOUR * 3600 * 1000);

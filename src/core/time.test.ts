@@ -4,6 +4,7 @@ import {
   LOGICAL_DAY_START_HOUR,
   logicalDayStart,
   logicalMonthStart,
+  logicalWeekStart,
   logicalDayCalendarDate,
   logicalDayIndex,
   parseHHMM,
@@ -79,6 +80,29 @@ test('logicalMonthStart anchors to the 1st at 05:00 of the logical month', () =>
   assert.equal(m.getMonth(), 5); // June
   assert.equal(m.getDate(), 1);
   assert.equal(m.getHours(), LOGICAL_DAY_START_HOUR);
+});
+
+test('logicalWeekStart anchors to Monday 05:00 of the logical week (Mon→Sun)', () => {
+  // 2026-07-06 is a Monday (2026-07-02 is a Thursday per project context).
+  const assertWeek = (d: Date, year: number, month: number, date: number) => {
+    const w = logicalWeekStart(d);
+    assert.equal(w.getDay(), 1, 'week starts on a Monday');
+    assert.equal(w.getHours(), LOGICAL_DAY_START_HOUR);
+    assert.equal(w.getFullYear(), year);
+    assert.equal(w.getMonth(), month);
+    assert.equal(w.getDate(), date);
+  };
+
+  // Monday 06:00 → this Monday 05:00 opens the week.
+  assertWeek(new Date(2026, 6, 6, 6, 0, 0, 0), 2026, 6, 6);
+  // Monday exactly at 05:00 → the new week starts.
+  assertWeek(new Date(2026, 6, 6, 5, 0, 0, 0), 2026, 6, 6);
+  // Thursday mid-week → still the Monday 2026-07-06 week.
+  assertWeek(new Date(2026, 6, 9, 15, 0, 0, 0), 2026, 6, 6);
+  // Monday 03:00 (before 05:00) is logically still Sunday → the PREVIOUS week (Mon 2026-06-29).
+  assertWeek(new Date(2026, 6, 6, 3, 0, 0, 0), 2026, 5, 29);
+  // Sunday 23:00 is the last day of the week that opened Monday 2026-06-29.
+  assertWeek(new Date(2026, 6, 5, 23, 0, 0, 0), 2026, 5, 29);
 });
 
 test('logicalDayCalendarDate returns local midnight of the logical day date', () => {
