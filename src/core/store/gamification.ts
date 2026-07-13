@@ -127,6 +127,19 @@ export function grantPt(openId: string, delta: number, reason: string, refMessag
 }
 
 /**
+ * Whether an LP ledger entry already exists for a given (reason, ref_message_id) pair. Used as an
+ * idempotency gate so a one-off reward keyed to a specific message (e.g. 收录自介 → +60 LP for that
+ * self-intro) is granted at most once, no matter how many times the trigger is repeated.
+ */
+export function hasPtGrantForRef(reason: string, refMessageId: string): boolean {
+  if (!reason || !refMessageId) return false;
+  const row = getLpDb()
+    .prepare('SELECT 1 FROM pt_ledger WHERE reason = ? AND ref_message_id = ? LIMIT 1')
+    .get(reason, refMessageId);
+  return row != null;
+}
+
+/**
  * Award a badge to a user.
  * Returns true when newly granted; false when the user already holds the badge.
  */

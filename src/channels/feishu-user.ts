@@ -239,6 +239,21 @@ export class FeishuUserChannel implements Channel {
               log.debug(`访客人数监测【${chat.name || chat.chatId}】：当前 ${visitorNum} 人，里程碑 ${milestone}${milestone >= VISITOR_STEP ? ' 已记录' : ' 未达标'}，不发送`);
             }
           }
+          // Deterministic newcomer welcome (batched): when members join the watched visitor group, queue
+          // them for the next welcome digest instead of welcoming right away — the digest (08:30/14:30/
+          // 20:30, supervisor.ts) drains the queue and @-mentions the whole window's arrivals in ONE
+          // message, so a poll every 5 minutes doesn't trickle out lots of tiny welcomes. Gated on
+          // watchPrev > 0 so a chat's very first sync — which flags its whole existing roster as "joined"
+          // — never enqueues a bulk welcome; only genuine post-baseline joiners are queued. Each person
+          // appears in joinedMembers only the first time they show up, so nobody is queued twice.
+          if (chat.chatId === VISITOR_WATCH_CHAT_ID && watchPrev > 0 && r.joinedMembers.length > 0) {
+            try {
+              store.enqueuePendingWelcome(chat.chatId, r.joinedMembers);
+              log.info(`迎新：已把 ${r.joinedMembers.length} 位新成员加入迎新队列【${chat.name || chat.chatId}】，待下次播报（08:30/14:30/20:30）统一欢迎`);
+            } catch (e) {
+              log.warn(`迎新入队失败【${chat.name || chat.chatId}】：${(e as Error).message}`);
+            }
+          }
         } catch (e) {
           // A dissolved group (232009) is permanently gone: flag it (members→离开), stop syncing it,
           // and don't treat it as a sync failure worth a warning every 5 minutes.

@@ -569,3 +569,39 @@ export function listVisitorMilestones(chatId: string): VisitorMilestone[] {
   `).all(chatId) as Array<{ milestone: number; open_id: string; name: string; reached_at: number }>;
   return rows.map((r) => ({ milestone: Number(r.milestone), openId: String(r.open_id), name: String(r.name ?? ''), reachedAt: Number(r.reached_at) }));
 }
+
+// ── pending newcomer-welcome queue ────────────────────────────────────────────
+// The roster sync enqueues genuinely new members here; a scheduled digest (08:30/14:30/20:30) drains
+// them into ONE batched welcome. See db.ts SCHEMA_V33.
+
+/**
+ * Queue members for the next welcome digest. INSERT OR IGNORE on (chat_id, open_id) keeps the first
+ * enqueue (so a member seen as "joined" more than once before a digest is welcomed only once), and a
+ * later name refresh is not needed — the digest resolves a live display name anyway. No-op on empty.
+ */
+export function enqueuePendingWelcome(chatId: string, members: MemberRef[]): void {
+  if (!chatId || members.length === 0) return;
+  tx(() => {
+    const stmt = getDb().prepare(`
+      INSERT OR IGNORE INTO pending_welcome(chat_id, open_id, name)
+      VALUES (?, ?, ?)
+    `);
+    for (const m of members) {
+      if (m.openId) stmt.run(chatId, m.openId, m.name ?? '');
+    }
+  });
+}
+
+/** Members currently queued for a chat's next welcome digest, oldest first. */
+export function listPendingWelcome(chatId: string): MemberRef[] {
+  const rows = getDb().prepare(
+    'SELECT open_id, name FROM pending_welcome WHERE chat_id = ? ORDER BY queued_at ASC, rowid ASC'
+  ).all(chatId) as Array<{ open_id: string; name: string }>;
+  return rows.map((r) => ({ openId: String(r.open_id), name: String(r.name ?? '') }));
+}
+
+/** Drop every queued member for a chat (called after a digest sends, whether or not anyone was welcomed). */
+export function clearPendingWelcome(chatId: string): void {
+  if (!chatId) return;
+  getDb().prepare('DELETE FROM pending_welcome WHERE chat_id = ?').run(chatId);
+}
