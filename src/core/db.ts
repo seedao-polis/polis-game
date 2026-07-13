@@ -717,6 +717,127 @@ CREATE TABLE IF NOT EXISTS like_maniac_weeks (
 );
 `;
 
+// TC (Temperature Check) module — per-soul db tables.
+// v29: proposal counter + proposal metadata; v30: individual bet records.
+// LP ledger operations (debit/credit/refund) use the shared pt_ledger in shared.db — no new table needed there.
+
+// Atomic proposal counter (single row, id=1 enforced by CHECK) for monotonically increasing TC numbers.
+// Proposal table stores the full lifecycle: active → settled | cancelled.
+// settled_option TEXT accommodates discrete winners as a JSON array (single or tie), since REAL cannot store strings.
+const SCHEMA_V29 = `
+CREATE TABLE IF NOT EXISTS tc_counter (
+  id       INTEGER PRIMARY KEY CHECK (id = 1),
+  next_num INTEGER NOT NULL DEFAULT 1
+);
+INSERT OR IGNORE INTO tc_counter(id, next_num) VALUES (1, 1);
+
+CREATE TABLE IF NOT EXISTS tc_proposals (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  num             INTEGER NOT NULL UNIQUE,
+  title           TEXT    NOT NULL DEFAULT '',
+  option_type     TEXT    NOT NULL DEFAULT 'discrete',
+  options         TEXT    NOT NULL DEFAULT '[]',
+  end_time        INTEGER NOT NULL,
+  min_bet_lp      REAL    NOT NULL DEFAULT 1.0,
+  max_bet_lp      REAL    NOT NULL DEFAULT 10.0,
+  status          TEXT    NOT NULL DEFAULT 'active',
+  created_by      TEXT    NOT NULL DEFAULT '',
+  chat_id         TEXT    NOT NULL DEFAULT '',
+  top_message_id  TEXT    NOT NULL DEFAULT '',
+  thread_id       TEXT,
+  settled_value   REAL,
+  settled_option  TEXT,
+  settled_at      INTEGER,
+  created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at      INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_tc_proposals_num
+  ON tc_proposals(num);
+CREATE INDEX IF NOT EXISTS idx_tc_proposals_status
+  ON tc_proposals(status);
+CREATE INDEX IF NOT EXISTS idx_tc_proposals_end_time
+  ON tc_proposals(end_time);
+CREATE INDEX IF NOT EXISTS idx_tc_proposals_thread
+  ON tc_proposals(thread_id) WHERE thread_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tc_proposals_top_msg
+  ON tc_proposals(top_message_id);
+`;
+
+// Bet records: no UNIQUE(proposal_id, user_open_id) — each user may bet multiple times on different options,
+// and each bet on the same option accumulates toward the per-user max_bet_lp ceiling.
+const SCHEMA_V30 = `
+CREATE TABLE IF NOT EXISTS tc_bets (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  proposal_id   INTEGER NOT NULL REFERENCES tc_proposals(id),
+  user_open_id  TEXT    NOT NULL,
+  option_value  TEXT    NOT NULL,
+  lp_amount     REAL    NOT NULL,
+  message_id    TEXT    NOT NULL DEFAULT '',
+  is_refunded   INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_tc_bets_proposal
+  ON tc_bets(proposal_id);
+CREATE INDEX IF NOT EXISTS idx_tc_bets_user
+  ON tc_bets(user_open_id, proposal_id);
+CREATE INDEX IF NOT EXISTS idx_tc_bets_refund
+  ON tc_bets(proposal_id, is_refunded);
+`;
+
+// The module was originally shipped under the name CVP (cvp_* tables). It was renamed to TC
+// (Temperature Check). This migration drops the disposable legacy tables and ensures the tc_* tables
+// exist, so a database created before the rename converges on the new schema. Bets drop first because
+// they reference the proposals table.
+const SCHEMA_V31 = `
+DROP TABLE IF EXISTS cvp_bets;
+DROP TABLE IF EXISTS cvp_proposals;
+DROP TABLE IF EXISTS cvp_counter;
+` + SCHEMA_V29 + SCHEMA_V30;
+
+// SeeDAO community history "memory fragments": short (~15-30 char) trivia lines harvested from the SeeDAO
+// Notion history pages, drawn at random to greet or educate members. Written and read through the shared
+// LP database (getLpDb) because this is cross-agent, cross-module community knowledge — closer to
+// badges/profiles than to per-soul operational data. content_norm (whitespace/punctuation-stripped and
+// lowercased) carries a UNIQUE index so INSERT OR IGNORE dedupes near-identical wording. status supports
+// soft-archiving instead of deletion. rating_count/rating_sum are reserved aggregate caches for a future
+// rating feature (a detail table would keep them in sync, mirroring pt_ledger → profiles.pt_balance);
+// nothing reads or writes them yet.
+const SCHEMA_V32 = `
+CREATE TABLE IF NOT EXISTS memory_fragments (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  content       TEXT    NOT NULL,
+  content_norm  TEXT    NOT NULL,
+  source_url    TEXT    NOT NULL DEFAULT '',
+  source_note   TEXT    NOT NULL DEFAULT '',
+  category      TEXT    NOT NULL DEFAULT '',
+  status        TEXT    NOT NULL DEFAULT 'active',
+  added_by      TEXT    NOT NULL DEFAULT '',
+  rating_count  INTEGER NOT NULL DEFAULT 0,
+  rating_sum    INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at    INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_fragments_norm ON memory_fragments(content_norm);
+CREATE INDEX IF NOT EXISTS idx_memory_fragments_status ON memory_fragments(status);
+CREATE INDEX IF NOT EXISTS idx_memory_fragments_category ON memory_fragments(category);
+`;
+
+// Pending newcomer-welcome queue (per-soul db). The 5-minute roster sync enqueues each genuinely new
+// member of the visitor group here instead of welcoming immediately; a scheduled digest (08:30/14:30/
+// 20:30) drains the queue and sends ONE batched welcome that @-mentions everyone who joined since the
+// last digest. PK (chat_id, open_id) + INSERT OR IGNORE dedupes a member queued more than once before a
+// digest runs. Rows are deleted wholesale after each digest, so the queue only ever holds the current
+// window's arrivals.
+const SCHEMA_V33 = `
+CREATE TABLE IF NOT EXISTS pending_welcome (
+  chat_id   TEXT NOT NULL,
+  open_id   TEXT NOT NULL,
+  name      TEXT NOT NULL DEFAULT '',
+  queued_at INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (chat_id, open_id)
+);
+`;
+
 /** Apply ordered, idempotent schema migrations tracked in schema_migrations. */
 function runMigrations(db: Db): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -756,6 +877,11 @@ function runMigrations(db: Db): void {
     { version: 26, description: 'visitor_milestones (restart-proof visitor-count announcement ledger)', sql: SCHEMA_V26 },
     { version: 27, description: 'self-service display-name overrides (改名 command, keyed by open_id)', sql: SCHEMA_V27 },
     { version: 28, description: 'like_maniac_weeks (per-week like-maniac announcement ledger, weekly 66-reaction milestone)', sql: SCHEMA_V28 },
+    { version: 29, description: 'tc_counter + tc_proposals (intention-survey proposals)', sql: SCHEMA_V29 },
+    { version: 30, description: 'tc_bets (intention-survey bet records)', sql: SCHEMA_V30 },
+    { version: 31, description: 'rename CVP module to TC: drop legacy cvp_* tables, ensure tc_* exist', sql: SCHEMA_V31 },
+    { version: 32, description: 'memory_fragments (SeeDAO history trivia store, shared db, dedup by content_norm)', sql: SCHEMA_V32 },
+    { version: 33, description: 'pending_welcome (batched newcomer-welcome queue drained by the 08:30/14:30/20:30 digest)', sql: SCHEMA_V33 },
   ];
   for (const m of migrations) {
     if (applied.has(m.version)) continue;
