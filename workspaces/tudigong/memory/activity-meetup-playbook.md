@@ -95,7 +95,7 @@ agent meetup list
 
 ## 七、排程（supervisor，需 `--sup`）
 
-- **08:00 `scheduleDailyMeetupDigest`**：查当天 `confirmed` 会议；无则**静默不发**；有则组富文本（标题/时间/VC 链接）发**围观群**（fallback【运营小天地】测试），文末 @ 【订阅了今日会议任一标签 **且在围观群内**】的成员（`subscribersForTag` ∩ `chatMemberOpenIds([围观群])`，去重）。**框架确定性直接 `sendPost`，不走 LLM/MCP，不过 outbound-guard**。
+- **08:00 `scheduleDailyMeetupDigest`**：查当天 `confirmed` 会议；无则**静默不发**；有则组富文本发**围观群**（fallback【运营小天地】测试）。**框架确定性直接 `sendPost`，不走 LLM/MCP，不过 outbound-guard**。**版式见文末「播报版式（2026-07-13 改版）」**：标题 `📅 YYYY/MM/DD (周X) 今日活动`；每场一块——`• 标题  HH:mm–HH:mm`（**去 `#标签` 与 VC 链接**）+ `会议日程：<日历分享链接>`（`shareLink`→`appLink`→VC）+ @ 该会议标签订阅者（`subscribersForTag` ∩ `chatMemberOpenIds([围观群])`，去重）+ `要追踪后续活动请输入【@城邦土地神 follow <tag>】` CTA；**@ 与 CTA 按会议分组**（不再全局汇总）、多场之间空一行。
 - **08:01 `scheduleDailyMeetupWikiUpdate`**：兜底再刷一次【SeeDAO 活动日历】。
 - 模式仿 `scheduleDailyPtReset` 的 `setTimeout` 自递归。**改 supervisor 排程要完整重启 serve**（`pnpm agent update` 只热重载 worker、不重载 supervisor）。
 
@@ -115,3 +115,36 @@ agent meetup list
 - **文案：面向用户一律简体中文 + 大陆用语；引用标题/标签/命令用【】、不用「」**（AGENTS.md 已写死这条约定）。
 - **测试群**：`configs/lark.json` 的 `knownInternalChats` 里【运营小天地】【围观群】都已配真 chat_id。**测试建会议会真的建线上会议 + VC，测完记得 `meetup cancel <id>` 清理**。
 - **重启注意**：动了 **DB migration（如 v25）或核心档（lark.ts/db.ts/store/meetup-wiki.ts）要完整重启 serve**（`serve tudigong --bot --sup`），不是 `agent update`；只改 worker 层（feishu-bot/commands）才可热重载。
+
+---
+
+## 时间戳护栏（2026-07-09，别让 LLM 算 Unix 时间戳）
+
+**事故背景**：TC 意向调查让 LLM 出绝对 `endTimeSec`，实测 LLM 把年份编成 2025（不知当前时间、凭空造时间戳）→ 提案「秒结束」。Meetup 的 `[MEETUP_CREATE]` 原本同样让 LLM 出 `startTimeSec`/`endTimeSec`，有一样的风险，一并加护栏。
+
+- **prompt 注入【当前时间】**：`agent.ts prepare()` serve 每轮注入 `【当前时间】YYYY-MM-DD HH:mm（周X）`（`new Date().toLocaleString('sv-SE')`+`'日一二三四五六'[getDay()]`，服务器 `TZ=Asia/Shanghai` 即北京时间）。LLM 本来不知道「今天」，注入后才能把「下周三/明天8点」换算成具体日期。放在 `${scene}${nowLine}${turnLine}...`。**这是所有相对时间需求的基础**。
+- **`[MEETUP_CREATE]` 契约改成本地字符串**（`AGENTS.md` 活动预约段）：`startLocal`（`YYYY-MM-DD HH:mm`）+ `endLocal` 或 `durationMinutes`（缺省默认 60 分钟）；**不再让 LLM 出 Unix 秒**。框架 `feishu-bot.ts` 用 `parseLocal`（`Date.parse`，空格转 `T` 当本地时间）解析成 unix。
+- **兜底 + fail-closed**：legacy 绝对 `startTimeSec`/`endTimeSec` 仅当 `> now`/`> start` 才接受；解析后若 `start` 无效或 `< now-3600s`（1h 宽限）或 `end<=start` → **不建日历事件、log.warn 跳过**（建错时间的会议比不建更糟）。
+- **通用教训**：凡「相对时间」需求，让 LLM 出**时长/本地时间字符串**、框架换算成绝对 unix，**别让 LLM 碰绝对时间戳**。TC 用 `endInMinutes`（相对分钟），Meetup 用 `startLocal`+时长，同一原则。见 [[tc-betting-playbook]] §4。
+
+---
+
+## 播报版式（2026-07-13 改版）
+
+第一次真实推送后按运营者要求改版。**两处版式必须同步改**：08:00 自动播报 `src/core/supervisor.ts → scheduleDailyMeetupDigest`，与 CLI 预览/发送 `src/bin/agent.ts → cmd_meetup` 的 `digest` 分支。改完 `tsc` 重建 + **完整重启 serve**（supervisor 排程不热重载）。当前版式：
+
+```
+📅 2026/07/13 (一) 今日活动
+• SeeAlpha 交易入门基础 #3  20:00–21:30
+会议日程：https://www.feishu.cn/calendar/share?token=...
+@订阅者…
+要追踪后续活动请输入【@城邦土地神 follow SeeAlpha】
+```
+
+- **标题**：`📅 ${YYYY/MM/DD} (${'日一二三四五六'[d.getDay()]}) 今日活动`——斜杠日期 + 中文星期，去掉旧「播报」二字。
+- **会议名称行**：`• 标题  HH:mm–HH:mm`，**不带 `#标签`、不带 VC 链接**。
+- **日历链接单独一行** `会议日程：<link>`：优先**日历分享链接** `shareLink`（`feishu.cn/calendar/share?token=...`，让人点「加入日程」到自己日历），回退 `appLink`，再回退 VC `meetupUrl`。
+- **CTA**：@ 订阅者之后加 `要追踪后续活动请输入【@城邦土地神 follow <tag>】`（把标签带进去、**不写 `#`**）。
+- **按会议分组**：@ 与 CTA 都改成一场会议一块（原来是全局汇总一次 @），多场会议之间空一行。
+- **手动改已发出的历史播报**：`updateMessage` 原地编辑（消息只有发送者能改 → 播报是 bot 发的就 `--as bot`）。定位消息 + 拿 @ 的 open_id 走 `im +chat-messages-list --as user`（bot 列外部社区群历史报 `230027`）。完整配方见 [[lark-cli-playbook]] §9「改带 @ 的消息」。
+

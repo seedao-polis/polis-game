@@ -120,3 +120,26 @@
 - **wiki**：每次达标（及回填）**机械式覆写**知识库【访客里程碑】页（`configs/lark.json` 的 `visitorMilestoneWikiDocId`=`KTqsdp3bGo0sK1xHMGcc7b77nof`，node=`MDx4w9siFiAbvfk7mI4cvHGQntQ`），表格：里程碑 / 第 N 位访客 / 达成日期。
 - **通用教训重申**：「只做一次」的动作要用**持久化幂等台账**当闸门，别靠进程内存状态（重启就破）。同「别赖 LLM 调工具」一类的框架确定性原则。
 - 改了核心档（feishu-user/events 采集侧）+ 新增 v26 迁移，**要完整重启 serve 才生效**；旧 serve 在重启前仍是旧逻辑（在群数稳定时不会跨百位、暂不会重发）。
+
+## 15. 迎新自介邀请 + `收录自介` 发 60 LP（2026-07-13）
+
+**需求**：以前迎新靠心跳 LLM 现写，很「干、没意义」（例：「管这么大的地不累吗？…还好我是本地部署🏯 欢迎 @X 加入…」）。改为**框架确定性固定文案**邀请新人自我介绍，并提到自介完成得 60 LP。60 LP **不自动发**——由运营用 `收录自介` 手动机械发放。
+
+**新模块 `src/core/self-intro.ts`**（迎新文案 + 收录逻辑集中一处）：
+- `SELF_INTRO_REWARD_PT=60`、`SELF_INTRO_GRANT_REASON='welcome:self-intro'`（也是幂等键）。文案 `SELF_INTRO_BODY_LINES` 为**逐字固定**：「欢迎你自我介绍一下自己… 怎么来到 SeeDAO：/ 对参与 SeeDAO 的期待：/ 可以给予 SeeDAO 的支持：」+ 「只要自我介绍完成，就能获得 60 LP 奖励（社区积分点数，可用于社区各项活动中）。」**改文案只动这里**。
+- `buildNewcomerWelcomePost(joiners)`→ `sendPost` 用的 `{title,content:PostElement[][]}`：首段 `{tag:'at'}` @ 每位新人（**上限 12**，超出用「等 N 位新朋友」概括），随后固定文案。无有效 open_id 返回 null。
+- `isRecordSelfIntroCommand(text)`：剥前导 @mention/`[/!]` 前缀后 `^收录自介(\s|$)`（整词，"收录自介绍"/"帮我收录自介" 不算）。
+- `handleRecordSelfIntro({commandMessageId,eventParentId,senderOpenId,profile})`：**仅 `isAdmin` 白名单**（configs/admins.json）可发。**关键（2026-07-13 修）**：事件信封**没有 parent_id/root_id**，所以拿「收录自介」这条消息的 `commandMessageId` **fetch 它自己**（`getMessageById`）→ `resolveSelfIntroTarget` 取 `rootId||parentId`（rootId＝话题**第一条**＝自介开场白，「一路回溯到最初那条讯息」的语义就靠它）→ 再 `getMessageById(targetId)` 取自介作者。`store.hasPtGrantForRef(reason,targetId)` 幂等（**按自介消息 id、每条只发一次**）；`grantPt(author,60,reason,targetId)`。成功回复＝`已收录 X 的自我介绍，发放 60 LP 🎉` + **`buildStatusFooter(author,60)`**（发奖后算，出 `\n\n[乔伊] 🌱 LP : 119.9 → 179.9 (+60.0)` 标准状态行，别自己拼「当前 LP」）。无权限/追溯不到/追到的是 app 机器人消息/已收录 都返回对应提示、不抛。**旧版直接用 `ev.parent_id` → 事件里恒空 → 永远回「请引用」**（土地神迎新 2026-07-13 实测踩到，乔伊自介收录不了）。
+
+**迎新触发＝攒一波、定时统一 @（2026-07-13 改：不再每 5 分钟即时发）**：每 5 分钟太密、时间又长，改成**累积到固定时段统一欢迎**：
+- **入队（`feishu-user.ts` 成员同步轮）**：只在**围观群** `VISITOR_WATCH_CHAT_ID` + `watchPrev>0`（跳过某群首次同步把全体旗标为 joined 的 bulk）+ `r.joinedMembers.length>0` 时 `store.enqueuePendingWelcome(chatId, joinedMembers)`（**不再即时 `sendPost`**）。`joinedMembers` 每人只在首次出现时出现、入队 `INSERT OR IGNORE`（PK `chat_id+open_id`）→ 不会重复；离开又回来（行仍在）不算 joined。新表 **`pending_welcome`（migration v33、per-soul db）**、store `enqueue/list/clearPendingWelcome`（members.ts）。
+- **播报（`supervisor.ts scheduleWelcomeDigest`，每天 08:30 / 14:30 / 20:30）**：`nextWelcomeDigestTime` 取三时段中最近的一次、fire 后 re-anchor；`runWelcomeDigest` 读队列 → **只留仍在群的**（`chatMemberOpenIds([chatId])` 过滤，期间进又退的丢掉）→ `buildNewcomerWelcomePost(joiners, 50)` 一条消息 @ 全部（cap 50 只防病态 @ 风暴）→ `sendPost` as bot → `clearPendingWelcome` 清空整队。空队列静默。**需 `--sup`**（同 meetup/ops 播报，`--bot --sup` 标准模式：--sup 的采集器跑成员同步入队、supervisor 跑播报）。确定性发送**不过 outbound-guard**（guard 只在 `mcp-server.ts` LLM 发送路径）。
+- 改时段动 `WELCOME_DIGEST_TIMES`；改单批 @ 上限动 `WELCOME_DIGEST_MAX_MENTIONS`；`buildNewcomerWelcomePost(joiners, maxMentions=12)` 第二参可调 cap。
+
+**`收录自介` 触发（群，`feishu-bot.ts`）**：在 LLM 前、TC-bet 拦截之后加确定性 pre-intercept：`isRecordSelfIntroCommand(text)` → `handleRecordSelfIntro({commandMessageId: messageId, eventParentId: ev.parent_id, …})` → `send` 回复。bot 只收到被 @ 的消息，运营在**自介所在话题里**（回复 / 引用自介，或话题下）@ 土地神写「收录自介」即可——**不需精确引用**，框架 fetch 命令消息拿 `root_id` 自动回溯到自介开场白。`eventParentId` 只是给「事件恰好带了 parent_id」的兜底 hint。
+
+**关掉旧 LLM 干欢迎**：`HEARTBEAT.md` 城邦巡查行删「新加入成员尚未被招呼」并注明「迎新已由框架自动处理，心跳不要再手动欢迎」；「框架自动跑的」加迎新一行；`heartbeat.ts` 提示词示例把「招呼新成员」换成「引导长期潜水成员…迎新已由框架自动处理」。
+
+**已删 P2P `welcome-party` DM（2026-07-13，用户要求）**：原「首次 @ 机器人 → 私信迎新图文」入口整个移除——`events.ts` 删 `registerEvent('welcome-party')` 块 + 清空 `TRIGGERS`（原唯一规则 `first_interaction_welcome`，`souls:['tudigong']`、闸门 `hasSuccessfulDispatch('welcome-party',openId)`）。触发框架 `checkAndFireTriggers`/`TRIGGERS: TriggerRule[]=[]` 保留为扩展点（feishu-bot.ts 仍调、空数组 no-op）。孤儿资源 `assets/events/welcome-party/base.png` 留在磁盘（无引用、无害，要清可删）。迎新现在**只有**围观群确定性群发一条路径。
+
+**改了核心档（feishu-user/feishu-bot/lark/gamification/events/db/store.members/supervisor/self-intro）要 `npx tsc -p tsconfig.build.json`（本机 rtk 改写 `npm run build`→Missing script，用 npx tsc）重建 dist + 完整重启 serve 才生效**（supervisor 排程不热重载，改时段/新增 v33 迁移必**完整重启** serve）。测试 `src/core/self-intro.test.ts`（含 `pending_welcome` 队列）。

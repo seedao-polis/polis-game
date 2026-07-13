@@ -12,7 +12,7 @@
    - `SOUL.md` 描述人设（土地神＝中国民间土地公），**不含 emoji**、改 emoji 不必动它。
 
 2. **框架确定性模板（硬编码，LLM 不经手）** —— 改 IDENTITY.md **管不到**，必须逐处改源码 / 配置：
-   - `src/core/events.ts` —— 事件标题 / 正文模板，如 `welcome-party` 的 `title: '🪐 {{name}}，欢迎来到 SeeDAO 数字城邦！'`。
+   - `src/core/events.ts` —— 事件标题 / 正文模板（硬编码 persona 串，逐个事件改），如 `lurker-discovered` 的 `title: '🐟 {{lurker_name}} 在社区潜水被发现了'`。（原带 🪐 的 `welcome-party` 标题已于 2026-07-13 随该事件删除。）
    - `configs/agents.json` + `configs/agents.json.example` —— `replyPrefix`（`🪐 城邦土地神：`；注意 **bot 频道已不加前缀、只 user 频道生效**，见 `memories.md` 开发规范节）。
    - 改源码后 serve 要**重建 dist + 重启**（见 §3）。
 
@@ -24,7 +24,7 @@
 
 运营者要求把代表 emoji 从 🏯（城堡）换成 🪐（环状行星），因为 **SeeDAO logo 是木星（Jupiter）**。全部落点：
 - `workspaces/tudigong/IDENTITY.md`（源头，驱动全部 LLM 输出）
-- `src/core/events.ts`（`welcome-party` 标题模板）
+- `src/core/events.ts`（当时改的是 `welcome-party` 标题模板；该事件已于 2026-07-13 删除，未来 emoji 改动看其余事件标题）
 - `configs/agents.json` + `.example`（`replyPrefix`）
 - `workspaces/tudigong/memory/memories.md`（文档里引用 prefix 的两处，随手对齐）
 - `.agent/**/.kimi-code/AGENTS.md`（15 个会话历史副本，为一致性一起换）

@@ -88,8 +88,7 @@
 
 - `checkAndFireTriggers(ctx)` 在 `feishu-bot.ts` 的 `processJob` 里、**调用 `respondAsync` 之前**跑；best-effort，触发失败不挡回答。
 - 规则放 `events.ts` 的 `TRIGGERS` 数组，可扩充（之后加 level-up / AP 门槛 / 徽章授予 都往这塞）。
-- 现有规则 `first_interaction_welcome`：`shouldFire = senderOpenId && !hasSuccessfulDispatch('welcome-party', openId)` → 第一次 @ 机器人就发迎新、且只发一次（机器人只收得到 @，所以等同【首次 @ 触发】；闸门用【没发过】还能容错重试）。
-- ⚠️ 副作用：既有成员第一次 @ 机器人也会收到一次迎新。要只对【真新人】发就给闸门加条件（如建档时间在最近 N 分钟内）。
+- ⚠️（2026-07-13 已删）原规则 `first_interaction_welcome`（首次 @ 机器人 → 私信 `welcome-party` 迎新图文、`hasSuccessfulDispatch` 闸门）**已随 P2P welcome-party DM 一并移除**，`TRIGGERS` 现为空数组（框架保留作扩展点）。迎新改由**围观群确定性群发**（新人加入 → `feishu-user.ts` 发自介邀请固定文案），详见 `community-notify-events-playbook.md §15`。
 
 ## 5. 把某人重置成【新人】（测试触发用）
 

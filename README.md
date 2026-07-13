@@ -11,7 +11,7 @@
 
 ---
 
-**城邦游戏 Polis Game** 是 SeeDAO 数字城邦的社区运营游戏化框架：结合**飞书**（社区身份与互动）、**Kimi CLI**（智能体大脑）与 **Telegram**（运维日志与提醒），把一个常驻 agent——城邦土地神——安置在飞书里：监听社区群、采集对话进知识库，被 @ 或符合触发条件时回应；同时持续采集运营数据（成员、活动报名、文档访问），并把日常的社区参与变成一套可玩的游戏化机制——生命点（LP）、徽章、等级、排行榜、里程碑推播、社区活动预约（@ 或自然语言预约飞书会议 + 视频会议、按标签订阅、每日播报），以及自动生成的运营数据报告。
+**城邦游戏 Polis Game** 是 SeeDAO 数字城邦的社区运营游戏化框架：结合**飞书**（社区身份与互动）、**Kimi CLI**（智能体大脑）与 **Telegram**（运维日志与提醒），把一个常驻 agent——城邦土地神——安置在飞书里：监听社区群、采集对话进知识库，被 @ 或符合触发条件时回应；同时持续采集运营数据（成员、活动报名、文档访问），并把日常的社区参与变成一套可玩的游戏化机制——生命点（LP）、徽章、等级、排行榜、里程碑推播、新成员迎新（自我介绍邀请 + 收录发 LP）、社区活动预约（@ 或自然语言预约飞书会议 + 视频会议、按标签订阅、每日播报），以及自动生成的运营数据报告。
 
 ## 快速开始
 
@@ -54,6 +54,7 @@ agent doctor [--fix]                          扫描损坏的执行器会话（-
 agent events                                  列出已定义的事件
 agent event <编号|id> [--test] [--to <oc/ou>] [--dry-run]   手动触发一个事件
 agent meetup create|edit|cancel|digest|list [...]   活动 / Meetup 模块：预约飞书会议（含视频会议 + 循环）、编辑 / 取消、手动播报今日活动、列表（社区成员也可 @ 或自然语言预约；详见 activity-meetup-playbook）
+agent tc list|show|cancel|settle|create [...]   意向调查模块 TC：列出 / 查看 / 撤销退款 / 强制结算 / 建提案（社区成员 @ 城邦土地神自然语言发起、群内 @ 投注（按群关联）、加权平均（社区意向）结算按 LP 占比瓜分奖池；CLI create 只写 DB 不发飞书，端对端走 @bot；详见 tc-betting-playbook）
 agent badge import <json_file>               导入徽章定义（JSON 单对象或数组；模板见 create-badge skill）
 agent badge award <徽章> <对象...> [--note <文本>] [--dry-run]  给一个或多个成员发放徽章（对象=open_id 或飞书显示名）
 agent badge list [对象]                       列出全部徽章定义，或某成员持有的徽章
@@ -123,7 +124,7 @@ agent tg-test [消息...]                       发一条测试消息到 Telegra
 
 ## 心跳（后台主动巡检）与发送护栏
 
-每个 agent 与生俱来一个【心跳】：serve 起了 bot 身份后，worker 按固定节奏（per-soul `workspaces/<soul>/HEARTBEAT_CONFIG.json` 的 `cadenceMinutes`）自动醒来跑一轮 LLM，基于该 soul 的 `HEARTBEAT.md` 判断是否需要主动行动（招呼新人、推播活动、写知识库等），必要时直接发飞书。这是【主动代理 + 闸门】模型——能主动，但靠框架强制的闸门（静默时段、触发概率、每日上限）防刷版，不靠 LLM 自律。
+每个 agent 与生俱来一个【心跳】：serve 起了 bot 身份后，worker 按固定节奏（per-soul `workspaces/<soul>/HEARTBEAT_CONFIG.json` 的 `cadenceMinutes`）自动醒来跑一轮 LLM，基于该 soul 的 `HEARTBEAT.md` 判断是否需要主动行动（推播活动、引导潜水成员、写知识库等），必要时直接发飞书。这是【主动代理 + 闸门】模型——能主动，但靠框架强制的闸门（静默时段、触发概率、每日上限）防刷版，不靠 LLM 自律。（**迎新已改由框架确定性处理，不再由心跳 LLM 现写**，见下节。）
 
 - 与 `--sup` 无关：裸跑 `serve <soul> --bot` 就有；`--quiet` 或纯 `--user` 采集器不挂。
 - 手动测试 `pnpm agent heartbeat <soul> --dry-run|--test`（**不带旗标 = 真触发、真发送**）。
@@ -131,6 +132,14 @@ agent tg-test [消息...]                       发一条测试消息到 Telegra
 - 详见 `workspaces/tudigong/memory/heartbeat-playbook.md`。
 
 **主动发送护栏（防「测试」群发）**：心跳让 LLM 自主决定发给谁，所以框架在 LLM 唯一的发送工具（MCP `feishu_send`）前加了两道**确定性**闸门，拦住模型「试工具能不能发」这类误发（`src/core/outbound-guard.ts`）——① 空白 / 纯标点 / 「测试·test·ping·123」这类占位内容一律不发；② 相同内容 120 秒内发往 ≥3 个不同群即拦下（真群发请走事件系统）。两道闸门对所有 agent 生效，返回提示让模型停手、不真发；改这层要 `pnpm build`。
+
+## 新成员迎新与自我介绍
+
+新人加入围观群时，土地神用一条**框架确定性的固定文案**（不经 LLM 现写）@新成员、邀请他们做自我介绍，并说明自介完成可得 **60 LP**：
+
+- **自动迎新（攒一波、定时统一 @）**：成员同步轮（每 5 分钟）检测到围观群新成员后，先把他们**加入迎新队列**（不即时打扰）；每天 **08:30 / 14:30 / 20:30** 三个时段各发**一条**消息，统一 @ 这段时间内加入、且仍在群里的新人 + 固定自介邀请文案。只对建立基线之后的真新人发、每人只发一次（不刷版、重启不重发）。需 `--sup`（监督者跑定时播报）。
+- **`收录自介` 发 60 LP（运营手动、机械发放）**：运营（`configs/admins.json` 白名单）**引用**某位新人的自介消息、@ 土地神写「收录自介」，框架就把 **60 LP** 记到那条被引用消息的作者名下——同一条自介只发一次（幂等）。非运营触发、或没有引用消息，都会收到相应提示。
+- 文案与逻辑集中在 `src/core/self-intro.ts`（**改迎新文案只动这一处**）；细节与踩坑见 `workspaces/tudigong/memory/community-notify-events-playbook.md §15`。
 
 ## LP 是跨 agent 的共享经济
 
