@@ -148,31 +148,9 @@ registerEvent({
   ],
 });
 
-// Welcome event: sent P2P to a new member. No text overlays for now ("先不改图") — just the base
-// image + a post caption. Layout is title -> (blank) -> image -> (blank) -> body, with the project
-// owner @-mentioned via the {{@contact}} token in the body.
-registerEvent({
-  eventTypeId: 'welcome-party',
-  title: '🪐 {{name}}，欢迎来到 SeeDAO 数字城邦！',
-  description: [
-    '我是城邦土地神，守护这座数字城邦的日常起居 🌱。很高兴见到你这位新市民！',
-    '',
-    'SeeDAO 数字城邦是一座由社区成员共建的协作家园：在这里你可以参与公开活动、加入共学课程、协作各类提案，和大家一起把城邦经营得更热闹 🎈。',
-    '',
-    '在城邦里走动会留下印记：每位市民都有一份【生命点】🌱（LP），随你的参与而增减；持续贡献还能赢得专属【勋章】🎖，记录你在城邦的足迹。',
-    '',
-    '不必着急，按自己的节奏慢慢熟悉这里就好 🍵。有任何问题，随时 @我，或联系 {{@contact}} 了解更多。',
-    '',
-    '🎉 再次欢迎你加入数字城邦！',
-    '',
-    '—— 城邦土地神 · 2026 © SeeDAO 数字城邦',
-  ].join('\n'),
-  scope: 'personal',
-  baseImage: 'assets/events/welcome-party/base.png',
-  overlays: [],
-  mentions: { contact: { id: 'ou_example_operator', name: '操作者' } },
-  gapLines: 2,
-});
+// Newcomer welcome is no longer a P2P event: it is a deterministic GROUP post sent by the member-sync
+// poll when someone joins the visitor group (see src/core/self-intro.ts + src/channels/feishu-user.ts),
+// which invites a self-introduction with a fixed copy. The old first-@ P2P `welcome-party` DM was removed.
 
 // "社区潜水被发现了" — a timed+random event. Once a week (25% chance) it picks a random community
 // member who hasn't spoken in ANY monitored chat for the last few days, @-mentions them, and nudges
@@ -688,26 +666,10 @@ interface TriggerRule {
   fire(ctx: TriggerContext): Promise<unknown>;
 }
 
-const TRIGGERS: TriggerRule[] = [
-  {
-    name: 'first_interaction_welcome',
-    // The welcome-party event and its assets are tudigong-specific; other souls do not fire it.
-    // A new soul opts in by adding its own name here (and providing its own event).
-    souls: ['tudigong'],
-    // Welcome on the user's first interaction WITH THE BOT, exactly once. We gate on "never
-    // welcomed" rather than global profile-newness, because the user channel may have already
-    // created the profile from a prior group message (so isFirstInteraction would be racy). The
-    // bot channel only receives @-mentions, so this fires the first time someone @s the bot.
-    shouldFire: (ctx) =>
-      !!ctx.senderOpenId && !store.hasSuccessfulDispatch('welcome-party', ctx.senderOpenId),
-    fire: (ctx) =>
-      fireEvent('welcome-party', {
-        actorOpenId: ctx.senderOpenId,
-        profile: ctx.larkProfile,
-        triggerReason: 'first_interaction',
-      }),
-  },
-];
+// Currently empty: the first-@ P2P welcome DM was removed (newcomers are now welcomed by the
+// deterministic group post in feishu-user.ts). The framework below is kept as the extension point —
+// add rules here over time (level-up, LP threshold, badge earned, ...), soul-scoped via `souls`.
+const TRIGGERS: TriggerRule[] = [];
 
 /**
  * Run all interaction triggers for the current reply. Best-effort: a trigger failure is logged but
