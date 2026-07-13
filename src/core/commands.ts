@@ -10,8 +10,18 @@ import {
   cancelMeetup as storeCancelMeetup,
 } from './store/meetups.js';
 import { loadConfigs, resolveChatTarget, isAdmin } from './configs.js';
-import { cancelCalendarEvent } from './lark.js';
+import { cancelCalendarEvent, updateMessage } from './lark.js';
 import { refreshMeetupWiki } from './meetup-wiki.js';
+import {
+  getTcByNum,
+  getTcBets,
+  cancelTcProposal,
+  getUnrefundedBets,
+  markBetRefunded,
+  updateTcProposal,
+} from './store/tc.js';
+import { buildTcResultPost } from './tc-post.js';
+import { grantPt } from './store/gamification.js';
 
 // ── command mode (pure code, no LLM / kimi) ───────────────────
 // After being triggered (@ or prefix), the message is passed here first: strip the leading @mention → split on whitespace,
@@ -57,6 +67,19 @@ export interface DispatchResult {
 
 /** A leading @mention + whitespace (like @tudigong / @_user_1); there may be several in a row. */
 const LEADING_MENTION = /^@\S+\s+/;
+
+/**
+ * Tolerant LP-amount parser for bet input.
+ * Accepts: "5", "5LP", "5lp", "5 LP", "5 lp" — all resolve to the number 5.
+ * Returns a positive finite number, or null when the input does not match the expected format.
+ */
+export function parseLpAmount(tokens: string[]): number | null {
+  const s = tokens.join('').trim().toLowerCase().replace(/\s+/g, '');
+  const m = /^(\d+(?:\.\d+)?)(?:lp)?$/.exec(s);
+  if (!m) return null;
+  const v = parseFloat(m[1]!);
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
 
 /**
  * Parse a message: strip the leading @mention, allow an optional / or ! prefix, then split on whitespace.
@@ -164,6 +187,84 @@ function canManageMeetup(senderOpenId: string | undefined, creatorOpenId: string
 /** Resolve a display name for a subscriber's open_id (roster → profile → fallback "你"). */
 function subscriberName(openId: string): string {
   return store.memberName(openId) || store.getProfile(openId)?.name || '你';
+}
+
+// ── TC helper functions ──────────────────────────────────────
+
+/** Ownership gate: proposal creator and admins may cancel or edit a TC. */
+function canManageTc(senderOpenId: string, proposal: { createdBy: string }): boolean {
+  if (!senderOpenId) return false;
+  if (isAdmin(senderOpenId)) return true;
+  return senderOpenId === proposal.createdBy;
+}
+
+/**
+ * Build a plain-text reply describing the current state and bet distribution of a proposal.
+ * Used by the tc-query command and the @土地神 TC-N shorthand.
+ */
+function queryTcReply(num: number): string {
+  if (isNaN(num)) return '请提供有效的 TC 编号，例如：TC-1 或 tc query 1';
+  const proposal = getTcByNum(num);
+  if (!proposal) return `找不到 TC-${num}。`;
+  const bets = getTcBets(proposal.id);
+  const activeBets = bets.filter(b => !b.isRefunded);
+  const totalLp = activeBets.reduce((s, b) => s + b.lpAmount, 0);
+  const participants = new Set(activeBets.map(b => b.userOpenId)).size;
+
+  const statusStr = proposal.status === 'active'
+    ? `进行中，截止 ${new Date(proposal.endTime * 1000).toLocaleString('sv-SE').slice(0, 16)}`
+    : proposal.status === 'settled'
+    ? `已结算，基准值：${proposal.settledOption ?? String(proposal.settledValue)}`
+    : '已撤销';
+
+  const lines: string[] = [
+    `【TC-${proposal.num}】${proposal.title}`,
+    `状态：${statusStr}`,
+    `参与：${participants} 人  总投入：${totalLp.toFixed(1)} LP  奖金池：${(totalLp * 1.05).toFixed(1)} LP`,
+    '',
+  ];
+
+  if (proposal.optionType === 'discrete') {
+    const lpByOption: Record<string, number> = {};
+    for (const b of activeBets) {
+      lpByOption[b.optionValue] = (lpByOption[b.optionValue] ?? 0) + b.lpAmount;
+    }
+    const sorted = Object.entries(lpByOption).sort((a, b) => b[1] - a[1]);
+    for (const [opt, lp] of sorted) {
+      lines.push(`  【${opt}】${lp.toFixed(1)} LP`);
+    }
+  } else {
+    if (activeBets.length > 0) {
+      const totalLpC = activeBets.reduce((s, b) => s + b.lpAmount, 0);
+      const weightedSum = activeBets.reduce((s, b) => s + parseFloat(b.optionValue) * b.lpAmount, 0);
+      const avg = Math.round((weightedSum / totalLpC) * 10000) / 10000;
+      lines.push(`  当前加权均值：${avg}`);
+    }
+  }
+  lines.push('', '🌱 LP');
+  return lines.join('\n');
+}
+
+/**
+ * Refund all outstanding (non-refunded) bets on a proposal.
+ * Strategy: mark is_refunded=1 in per-soul db first, then grantPt in shared db.
+ * If grantPt fails after marking, the bet is counted as skipped (conservative "under-refund").
+ * The caller should log any discrepancy for manual recovery.
+ * Returns the count of successfully refunded bets.
+ */
+function refundTcBets(proposal: { id: number; topMessageId: string }): { refunded: number } {
+  const pending = getUnrefundedBets(proposal.id);
+  let refunded = 0;
+  for (const bet of pending) {
+    try {
+      markBetRefunded(bet.id);
+      grantPt(bet.userOpenId, bet.lpAmount, 'tc_refund_cancel', proposal.topMessageId);
+      refunded++;
+    } catch {
+      // grantPt failed after marking refunded — conservative under-refund; log externally
+    }
+  }
+  return { refunded };
 }
 
 // ── built-in commands ─────────────────────────────────────────
@@ -370,6 +471,75 @@ const COMMANDS: Command[] = [
       return `未知子命令【${sub}】。支持：meetup cancel <id> / meetup edit <id>`;
     },
   },
+  {
+    name: 'tc',
+    summary: '管理投注提案（query / cancel / edit）',
+    usage: 'tc query <编号>  |  tc cancel <编号>  |  tc edit <编号> [--max-bet N] [--end "YYYY-MM-DD HH:mm"]',
+    run(args, ctx) {
+      const sub = args[0]?.toLowerCase();
+      if (!sub) return '用法：tc cancel <编号>  /  tc query <编号>\n或直接 @我 TC-1 查询进展';
+
+      if (sub === 'query' || sub === '查询') {
+        const num = parseInt(args[1] ?? '', 10);
+        return queryTcReply(num);
+      }
+
+      if (sub === 'cancel' || sub === '撤销' || sub === '取消') {
+        const num = parseInt(args[1] ?? '', 10);
+        if (isNaN(num)) return '用法：tc cancel <编号>，例如：tc cancel 1';
+        const proposal = getTcByNum(num);
+        if (!proposal) return `找不到 TC-${num}。`;
+        if (proposal.status === 'cancelled') return `TC-${num} 已经是撤销状态。`;
+        if (proposal.status === 'settled') return `TC-${num} 已结算，不能撤销。`;
+        if (!ctx.senderOpenId) return '无法确认你的身份，请在群内使用此命令。';
+        if (!canManageTc(ctx.senderOpenId, proposal)) {
+          return `只有提案发起人或管理员才能撤销 TC-${proposal.num}。`;
+        }
+        const result = refundTcBets(proposal);
+        cancelTcProposal(proposal.id);
+        // Best-effort: update the original post to show cancelled state
+        try {
+          const bets = getTcBets(proposal.id);
+          const post = buildTcResultPost({ ...proposal, status: 'cancelled' }, bets);
+          updateMessage(proposal.topMessageId, post, { as: 'bot' });
+        } catch { /* ignore */ }
+        return `TC-${proposal.num}【${proposal.title}】已撤销，已退还 ${result.refunded} 笔投注 LP。\n🌱 LP`;
+      }
+
+      if (sub === 'edit' || sub === '编辑') {
+        const num = parseInt(args[1] ?? '', 10);
+        if (isNaN(num)) return '用法：tc edit <编号> [--max-bet N] [--end "YYYY-MM-DD HH:mm"]';
+        const proposal = getTcByNum(num);
+        if (!proposal) return `找不到 TC-${num}。`;
+        if (!ctx.senderOpenId || !isAdmin(ctx.senderOpenId)) {
+          return 'TC 内容修改仅限管理员操作（提案人只能撤销）。';
+        }
+        const updates: { maxBetLp?: number; endTime?: number } = {};
+        // Parse --max-bet flag
+        const maxBetIdx = args.indexOf('--max-bet');
+        if (maxBetIdx !== -1 && args[maxBetIdx + 1]) {
+          const v = parseFloat(args[maxBetIdx + 1]!);
+          if (Number.isFinite(v) && v > 0) updates.maxBetLp = v;
+        }
+        // Parse --end flag ("YYYY-MM-DD HH:mm" or ISO 8601)
+        const endIdx = args.indexOf('--end');
+        if (endIdx !== -1 && args[endIdx + 1]) {
+          const raw = args[endIdx + 1]!;
+          const t = Date.parse(raw.includes('T') ? raw : raw.replace(' ', 'T'));
+          if (Number.isFinite(t)) updates.endTime = Math.floor(t / 1000);
+        }
+        if (Object.keys(updates).length === 0) {
+          return 'tc edit：请提供 --max-bet 或 --end 参数。';
+        }
+        const ok = updateTcProposal(proposal.id, updates);
+        return ok
+          ? `TC-${num} 已更新（${Object.entries(updates).map(([k, v]) => `${k}=${v}`).join('  ')}）。`
+          : `TC-${num} 更新失败（无有效变更）。`;
+      }
+
+      return `未知子命令【${sub}】。支持：tc query <编号> / tc cancel <编号> / tc edit <编号>`;
+    },
+  },
 ];
 
 // Index from name / alias → command.
@@ -413,6 +583,16 @@ export function dispatchCommand(raw: string, ctx: CommandContext): DispatchResul
   const cmd = parsed ? lookup(parsed.name) : undefined;
   if (parsed && cmd) {
     return handle(cmd.name, parsed.args, () => cmd.run(parsed.args, ctx));
+  }
+
+  // TC quick-query shorthand: "@土地神 TC-1" — parseCommand yields name="tc-1" which is not
+  // in the command index, so intercept it here before falling through to the LLM.
+  if (parsed) {
+    const tcNumMatch = /^tc-(\d+)$/i.exec(parsed.name);
+    if (tcNumMatch) {
+      const num = parseInt(tcNumMatch[1]!, 10);
+      return handle('tc-query', [String(num)], () => queryTcReply(num));
+    }
   }
 
   // Fuzzy daily check-in ("每日签到", "8/12 签") — layered on top of the exact 签 / 签到 aliases above.

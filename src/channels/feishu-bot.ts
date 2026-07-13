@@ -25,6 +25,16 @@ import { loadLpStrategy, judgeReply } from '../core/lp-strategy.js';
 import { loadConfigs, userOpenIdForProfile } from '../core/configs.js';
 import { insertMeetup, setMeetupTags } from '../core/store/meetups.js';
 import { refreshMeetupWiki } from '../core/meetup-wiki.js';
+import {
+  insertTcProposal,
+  updateTcTopMessageId,
+  getTcById,
+  listActiveTcsByChat,
+} from '../core/store/tc.js';
+import { buildTcProposalPost } from '../core/tc-post.js';
+import { sendPost } from '../core/lark.js';
+import { tryParseTcBet } from '../core/tc-bet-parser.js';
+import { isRecordSelfIntroCommand, handleRecordSelfIntro } from '../core/self-intro.js';
 import fs from 'node:fs';
 import {
   ensureInbox,
@@ -287,13 +297,39 @@ export class FeishuBotChannel implements Channel {
           try {
             const intent = JSON.parse(meetupMatch[1]!) as {
               title?: string;
+              startLocal?: string;
+              endLocal?: string;
+              durationMinutes?: number;
               startTimeSec?: number;
               endTimeSec?: number;
               tags?: string[];
               recur?: string;
               description?: string;
             };
-            if (intent.title && intent.startTimeSec && intent.endTimeSec) {
+            // Resolve the schedule from LLM-friendly local datetime strings ("YYYY-MM-DD HH:mm" in the
+            // server timezone) that the framework parses — an LLM cannot produce a correct absolute
+            // unix timestamp and will hallucinate the year. A legacy absolute startTimeSec/endTimeSec
+            // is honoured only when sane and future. The event is created only for a valid, non-past
+            // window, so a bad time skips creation instead of scheduling a wrong-time meeting.
+            const nowSec = Math.floor(Date.now() / 1000);
+            const parseLocal = (v?: string): number | null => {
+              if (typeof v !== 'string' || !v.trim()) return null;
+              const ms = Date.parse(v.includes('T') ? v : v.replace(' ', 'T'));
+              return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+            };
+            let startSec = parseLocal(intent.startLocal);
+            if (startSec == null && Number.isFinite(intent.startTimeSec as number) && (intent.startTimeSec as number) > nowSec) {
+              startSec = intent.startTimeSec as number;
+            }
+            let endSec = parseLocal(intent.endLocal);
+            if (endSec == null && startSec != null && Number.isFinite(intent.durationMinutes as number) && (intent.durationMinutes as number) > 0) {
+              endSec = startSec + Math.round(intent.durationMinutes as number) * 60;
+            }
+            if (endSec == null && startSec != null && Number.isFinite(intent.endTimeSec as number) && (intent.endTimeSec as number) > startSec) {
+              endSec = intent.endTimeSec as number;
+            }
+            if (endSec == null && startSec != null) endSec = startSec + 3600;
+            if (intent.title && startSec != null && endSec != null && startSec > nowSec - 3600 && endSec > startSec) {
               let activityCalendarId: string | undefined;
               try {
                 activityCalendarId = loadConfigs().lark.activityCalendarId;
@@ -303,8 +339,8 @@ export class FeishuBotChannel implements Channel {
                 const created = createCalendarEvent({
                   calendarId: activityCalendarId,
                   title: intent.title,
-                  startTimeSec: intent.startTimeSec,
-                  endTimeSec: intent.endTimeSec,
+                  startTimeSec: startSec,
+                  endTimeSec: endSec,
                   description: intent.description,
                   recurrence: intent.recur,
                   withVc: true,
@@ -317,8 +353,8 @@ export class FeishuBotChannel implements Channel {
                     title: intent.title,
                     description: intent.description ?? '',
                     recurrence: intent.recur ?? '',
-                    startTime: intent.startTimeSec,
-                    endTime: intent.endTimeSec,
+                    startTime: startSec,
+                    endTime: endSec,
                     meetupUrl: created.meetupUrl,
                     appLink: created.appLink,
                     shareLink: created.shareLink,
@@ -354,9 +390,76 @@ export class FeishuBotChannel implements Channel {
               } else {
                 log.warn('MEETUP_CREATE：configs 缺少 activityCalendarId，跳过日历创建。');
               }
+            } else {
+              log.warn(`MEETUP_CREATE：时间无效或已过期，跳过创建（title=${intent.title ?? ''}、startLocal=${intent.startLocal ?? ''}、start=${startSec}、end=${endSec}）`);
             }
           } catch (e) {
             log.warn('MEETUP_CREATE 解析失败：', (e as Error).message);
+          }
+        }
+      }
+
+      // TC_CREATE deterministic path: intercepts [TC_CREATE: {...}] appended by the LLM.
+      // The framework strips the marker from the visible reply, then atomically assigns a proposal
+      // number, writes the proposal row, sends the canonical proposal post to the group top-level,
+      // and backfills the top_message_id. All failures are best-effort (logged, never bubble up).
+      if (replyOk) {
+        const tcMatch = /\[TC_CREATE:\s*(\{[\s\S]*?\})\]/m.exec(reply);
+        if (tcMatch) {
+          reply = reply
+            .replace(/\[TC_CREATE:\s*\{[\s\S]*?\}\]/m, '')
+            .replace(/\n{3,}/g, '\n\n')
+            .trimEnd();
+          try {
+            const intent = JSON.parse(tcMatch[1]!) as {
+              title?: string;
+              optionType?: 'discrete' | 'continuous';
+              options?: string[] | [number, number];
+              endInMinutes?: number;
+              endTimeSec?: number;
+              maxBetLp?: number;
+            };
+            if (intent.title && intent.optionType && Array.isArray(intent.options) && intent.options.length >= 2) {
+              // The deadline is derived from a RELATIVE duration the LLM extracts from natural language,
+              // because an LLM cannot produce a correct absolute unix timestamp (it hallucinates the
+              // year/epoch, which would make the proposal expire instantly). An absolute endTimeSec is
+              // honoured only when it is a sane future time; otherwise the default is 24 hours.
+              const nowSec = Math.floor(Date.now() / 1000);
+              const mins = Number(intent.endInMinutes);
+              const endTimeSec = Number.isFinite(mins) && mins > 0
+                ? nowSec + Math.min(Math.max(Math.round(mins), 1), 43200) * 60
+                : (Number.isFinite(intent.endTimeSec as number) && (intent.endTimeSec as number) > nowSec + 60
+                    ? (intent.endTimeSec as number)
+                    : nowSec + 86400);
+              const { id: tcId, num } = insertTcProposal({
+                title: intent.title,
+                optionType: intent.optionType,
+                options: intent.options as string[] | [number, number],
+                endTime: endTimeSec,
+                maxBetLp: intent.maxBetLp ?? 10,
+                createdBy: job.senderOpenId,
+                chatId: job.chatId,
+              });
+              const tcProposal = getTcById(tcId);
+              if (tcProposal) {
+                const postContent = buildTcProposalPost(tcProposal);
+                let topMsgId = '';
+                try {
+                  const sent = sendPost({ chatId: job.chatId }, postContent, { as: 'bot', profile });
+                  topMsgId = sent.messageId ?? '';
+                } catch (e) {
+                  log.warn(`TC_CREATE：发送制式提案消息失败（num=${num}）：${(e as Error).message}`);
+                }
+                if (topMsgId) {
+                  updateTcTopMessageId(tcId, topMsgId);
+                }
+                log.info(`TC 提案已创建：TC-${num}  id=${tcId}  title=${intent.title}  topMsgId=${topMsgId}`);
+              }
+            } else {
+              log.warn('TC_CREATE 解析失败：缺少必填字段（title / optionType / options）');
+            }
+          } catch (e) {
+            log.warn(`TC_CREATE 解析失败：${(e as Error).message}`);
           }
         }
       }
@@ -432,7 +535,7 @@ export class FeishuBotChannel implements Channel {
       // envelope confirmed sender_id; thread_id field name is verified defensively here (debug log
       // surfaces the real shape on the first topic message).
       const threadId: string = ev.thread_id ?? ev.message?.thread_id ?? ev.thread?.thread_id ?? '';
-      log.debug(`事件字段：thread_id=${ev.thread_id ?? '∅'} chat_type=${ev.chat_type ?? '∅'}`);
+      log.debug(`事件字段：thread_id=${ev.thread_id ?? '∅'} chat_type=${ev.chat_type ?? '∅'} parent_id=${ev.parent_id ?? ev.message?.parent_id ?? '∅'}`);
       // p2p (1:1 DM) vs group: a p2p reply goes out as a plain direct message; a group reply stays in the thread.
       const isP2p: boolean = ev.chat_type === 'p2p';
 
@@ -499,6 +602,41 @@ export class FeishuBotChannel implements Channel {
             if (fetchedName) store.upsertProfileRaw(senderOpenId, fetchedName);
           }
         } catch { /* best-effort */ }
+      }
+
+      // TC bet pre-intercept: deterministic, bypasses the LLM entirely.
+      // Association is by chat, not thread: the group event stream carries no thread id, so a
+      // bet-syntax message (@agent <option> <LP>) is matched to the chat's active proposal. When a
+      // chat has multiple active proposals, the message must name one (e.g. "TC-2 67 5LP") to
+      // disambiguate; otherwise it falls through to the LLM. tryParseTcBet validates the option and
+      // LP amount, so non-bet mentions naturally return false and pass through.
+      let tcBetHandled = false;
+      if (senderOpenId && chatId) {
+        const actives = listActiveTcsByChat(chatId);
+        const tcProposal = actives.length === 1
+          ? actives[0]
+          : actives.find(p => new RegExp(`\\bTC-${p.num}\\b`, 'i').test(text)) ?? null;
+        if (tcProposal) {
+          const betResult = tryParseTcBet(text, tcProposal, senderOpenId, messageId ?? '', profile);
+          if (betResult !== false) {
+            tcBetHandled = true;
+            send(messageId, chatId, betResult.reply, isP2p);
+          }
+        }
+      }
+      if (tcBetHandled) return;
+
+      // 收录自介 pre-intercept: deterministic, operator-only, bypasses the LLM. When an operator replies
+      // to (or in the topic of) a newcomer's self-intro with "@我 收录自介", the self-intro's author is
+      // awarded 60 LP, once per self-intro. The raw event envelope has no parent_id/root_id/thread_id, so
+      // handleRecordSelfIntro fetches the command message (by its own id) to trace back to the opening
+      // self-intro; the eventParentId is only a best-effort hint for envelopes that do carry one.
+      if (isRecordSelfIntroCommand(text)) {
+        const eventParentId: string = ev.parent_id ?? ev.message?.parent_id ?? '';
+        const reply = handleRecordSelfIntro({ commandMessageId: messageId ?? '', eventParentId, senderOpenId, profile });
+        log.info(`收录自介：${preview(reply)}`);
+        send(messageId, chatId, reply, isP2p);
+        return;
       }
 
       // Command mode first (pure code, no kimi call): reply instantly, no queue / reaction needed.

@@ -12,7 +12,10 @@ import { listScheduledEvents, rollScheduledEvent, type EventSchedule } from './e
 import { generateAndSendDailyReport, generateAndSendMonthlyReport } from './ops-report.js';
 import { generateAndSendWeeklyReport } from './weekly-report.js';
 import { meetupsOnDate, subscribersForTag, listAllMeetupsForWiki } from './store/meetups.js';
+import { listExpiredActiveTcs } from './store/tc.js';
+import { settleTc } from './tc-settlement.js';
 import { chatMemberOpenIds } from './store/members.js';
+import { buildNewcomerWelcomePost } from './self-intro.js';
 import { generateMeetupWikiMarkdown } from './meetup-wiki.js';
 import { checkUserTokenExpiry } from './token-watch.js';
 import { purgeExpiredMemories, listKnownChatIds } from './store/memory.js';
@@ -543,43 +546,124 @@ function scheduleDailyMeetupDigest(): void {
       // Resolve the lark profile for sending.
       const profile = eventSendProfile();
 
-      // Build post content (rich-text paragraphs).
-      const dateStr = fmtDate(dayStart);
-      const lines: PostElement[][] = [];
-      lines.push([{ tag: 'text', text: `📅 今日活动播报（${dateStr}）` }]);
-      for (const m of meetups) {
-        const timeRange = `${fmtTime(m.startTime)}–${fmtTime(m.endTime)}`;
-        const tagsStr = m.tags.length ? `  #${m.tags.join(' #')}` : '';
-        const vcPart = m.meetupUrl ? `  加入视频会议：${m.meetupUrl}` : '';
-        lines.push([{ tag: 'text', text: `• ${m.title}  ${timeRange}${tagsStr}${vcPart}` }]);
-      }
-
-      // Build @-mention list: collect subscribers for all today's meetup tags,
-      // then filter to those who are present in the broadcast group.
+      // Build post content (rich-text paragraphs). Each meeting is its own block:
+      // a title+time bullet, a calendar schedule link, the @-mentioned subscribers,
+      // and a call-to-action for following that meeting's tag.
+      const d = new Date(dayStart * 1000);
+      const dateSlash = fmtDate(dayStart).replace(/-/g, '/'); // YYYY/MM/DD
+      const weekday = '日一二三四五六'[d.getDay()];
       const groupMembers = chatMemberOpenIds([chatId]);
-      const mentionSet = new Set<string>();
-      for (const m of meetups) {
+      const lines: PostElement[][] = [];
+      lines.push([{ tag: 'text', text: `📅 ${dateSlash} (${weekday}) 今日活动` }]);
+
+      let mentionTotal = 0;
+      for (let i = 0; i < meetups.length; i++) {
+        const m = meetups[i]!;
+        if (i > 0) lines.push([{ tag: 'text', text: '' }]); // blank line between meetings
+
+        const timeRange = `${fmtTime(m.startTime)}–${fmtTime(m.endTime)}`;
+        lines.push([{ tag: 'text', text: `• ${m.title}  ${timeRange}` }]);
+
+        // Calendar schedule link — people click it to add the event to their own
+        // calendar. Prefer the public share link, fall back to the app deep-link,
+        // and only as a last resort the VC join url.
+        const calLink = m.shareLink || m.appLink;
+        if (calLink) {
+          lines.push([{ tag: 'text', text: `会议日程：${calLink}` }]);
+        } else if (m.meetupUrl) {
+          lines.push([{ tag: 'text', text: `加入视频会议：${m.meetupUrl}` }]);
+        }
+
+        // @-mention subscribers of this meeting's tags who are present in the group.
+        const atElements: PostElement[] = [];
+        const mentioned = new Set<string>();
         for (const tag of m.tags) {
           for (const uid of subscribersForTag(tag)) {
-            if (groupMembers.has(uid)) mentionSet.add(uid);
+            if (groupMembers.has(uid) && !mentioned.has(uid)) {
+              mentioned.add(uid);
+              atElements.push({ tag: 'at', user_id: uid });
+              atElements.push({ tag: 'text', text: ' ' });
+            }
           }
         }
-      }
-      if (mentionSet.size > 0) {
-        const atElements: PostElement[] = [];
-        for (const uid of mentionSet) {
-          atElements.push({ tag: 'at', user_id: uid });
-          atElements.push({ tag: 'text', text: ' ' });
+        if (atElements.length > 0) lines.push(atElements);
+        mentionTotal += mentioned.size;
+
+        // Call-to-action: how to follow this meeting's tag for future activities.
+        for (const tag of m.tags) {
+          lines.push([{ tag: 'text', text: `要追踪后续活动请输入【@城邦土地神 follow ${tag}】` }]);
         }
-        lines.push(atElements);
       }
 
       sendPost({ chatId }, { content: lines }, { as: 'bot', profile });
-      log.info(`08:00 会议播报已发送（${meetups.length} 场会议，@${mentionSet.size} 人）→ ${chatId}`);
+      log.info(`08:00 会议播报已发送（${meetups.length} 场会议，@${mentionTotal} 人次）→ ${chatId}`);
     } catch (e) {
       log.error('08:00 会议播报失败：', (e as Error).message);
     }
     setTimeout(scheduleDailyMeetupDigest, 0); // re-anchor to the next 08:00
+  }, next.getTime() - now.getTime());
+}
+
+// ── newcomer welcome digest (08:30 / 14:30 / 20:30) ──────────
+// Drains the pending_welcome queue for the visitor group into ONE batched welcome: @-mentions everyone
+// who joined since the last digest and invites a self-introduction with the fixed copy (self-intro.ts).
+// Batching keeps the every-5-minutes roster sync from trickling out lots of tiny welcomes across a long
+// day. Deterministic: no LLM, no outbound-guard gate. The 60 LP is still awarded separately by an
+// operator via 收录自介 (feishu-bot.ts), never here.
+
+/** Local times of day the welcome digest fires at, as [hour, minute]. */
+const WELCOME_DIGEST_TIMES: Array<[number, number]> = [[8, 30], [14, 30], [20, 30]];
+/** @-mention cap for the batched digest — higher than a single poll round, since it gathers a window. */
+const WELCOME_DIGEST_MAX_MENTIONS = 50;
+
+/** The soonest future occurrence of any WELCOME_DIGEST_TIMES entry, relative to `now`. */
+function nextWelcomeDigestTime(now: Date): Date {
+  const candidates = WELCOME_DIGEST_TIMES.map(([h, m]) => {
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0);
+    if (d <= now) d.setDate(d.getDate() + 1); // already past today → same time tomorrow
+    return d;
+  });
+  return candidates.reduce((a, b) => (b < a ? b : a));
+}
+
+/** Send the batched newcomer welcome to the visitor group, then clear the queue. Best-effort. */
+function runWelcomeDigest(): void {
+  const chatId = resolveChatTarget('围观群');
+  if (!chatId) {
+    log.warn('迎新播报：未配置围观群，跳过。');
+    return;
+  }
+  const pending = store.listPendingWelcome(chatId);
+  if (pending.length === 0) {
+    log.info('迎新播报：队列为空，静默。');
+    return;
+  }
+  // Only welcome members who are still present in the group (someone who joined and left within the
+  // window is dropped). The queue is cleared wholesale afterwards regardless.
+  const present = chatMemberOpenIds([chatId]);
+  const joiners = pending.filter((p) => present.has(p.openId));
+  const post = buildNewcomerWelcomePost(joiners, WELCOME_DIGEST_MAX_MENTIONS);
+  if (post) {
+    const profile = eventSendProfile();
+    sendPost({ chatId }, post, { as: 'bot', profile });
+    log.info(`迎新播报已发送（${joiners.length}/${pending.length} 位在群新成员）→ ${chatId}`);
+  } else {
+    log.info(`迎新播报：队列 ${pending.length} 人均已离群，静默。`);
+  }
+  store.clearPendingWelcome(chatId);
+}
+
+/** Fire the welcome digest at the next 08:30 / 14:30 / 20:30, then re-anchor to the following one. */
+function scheduleWelcomeDigest(): void {
+  const now = new Date();
+  const next = nextWelcomeDigestTime(now);
+  setTimeout(() => {
+    try {
+      runWelcomeDigest();
+    } catch (e) {
+      log.error('迎新播报失败：', (e as Error).message);
+    }
+    setTimeout(scheduleWelcomeDigest, 0); // re-anchor to the next slot
   }, next.getTime() - now.getTime());
 }
 
@@ -625,6 +709,38 @@ function scheduleDailyMeetupWikiUpdate(): void {
     }
     setTimeout(scheduleDailyMeetupWikiUpdate, 0); // re-anchor to the next 08:01
   }, next.getTime() - now.getTime());
+}
+
+// ── TC settlement scheduler (every minute) ──────────────────
+// Polls for expired active TC proposals and settles them.
+// Runs immediately on startup (setTimeout 0) to catch proposals that expired during downtime.
+// Uses a rolling setTimeout rather than setInterval to avoid overlapping runs when settlement is slow.
+
+/**
+ * Poll every 60 seconds for TC proposals whose end_time has passed but status is still 'active'.
+ * On startup the first tick fires immediately (setTimeout 0) to settle proposals that expired
+ * while the process was down. Each tick re-schedules itself, so the interval self-corrects.
+ */
+function scheduleTcSettlement(): void {
+  const INTERVAL_MS = 60_000;
+  const tick = async (): Promise<void> => {
+    try {
+      const expired = listExpiredActiveTcs();
+      for (const proposal of expired) {
+        try {
+          const profile = eventSendProfile() ?? '';
+          await settleTc(proposal, profile);
+          log.info(`TC 结算完成：TC-${proposal.num}  title=${proposal.title}`);
+        } catch (e) {
+          log.error(`TC-${proposal.num} 结算失败：${(e as Error).message}`);
+        }
+      }
+    } catch (e) {
+      log.error(`TC 结算轮询失败：${(e as Error).message}`);
+    }
+    setTimeout(tick, INTERVAL_MS);
+  };
+  setTimeout(tick, 0);
 }
 
 /** Start the supervisor: stays resident, watches over the worker child process, and SIGHUP triggers a graceful restart. */
@@ -750,6 +866,8 @@ export function runSupervisor(opts: SupervisorOptions): Promise<void> {
   scheduleSessionJanitor();
   scheduleDailyMeetupDigest();     // daily 08:00 today's meetup broadcast → 围观群
   scheduleDailyMeetupWikiUpdate(); // daily 08:01 overwrite "SeeDAO 活动日历" wiki page
+  scheduleWelcomeDigest();         // 08:30/14:30/20:30 batched newcomer welcome → 围观群
+  scheduleTcSettlement();         // every minute: scan for expired TC proposals and settle them
   startChild();
 
   return new Promise(() => {

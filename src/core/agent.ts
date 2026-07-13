@@ -213,6 +213,14 @@ export class Agent {
       ? `【对话轮次】这是你与当前对话者的第 ${input.turnNumber} 轮对话。\n\n`
       : '';
 
+    // Current wall-clock time (serve only): an LLM cannot know the present time and will hallucinate
+    // it, so relative expressions ("明天下午3点", "下周三", "1 小时后") and the deterministic markers
+    // that carry schedules ([MEETUP_CREATE] / [TC_CREATE]) need this as their anchor.
+    const now = new Date();
+    const nowLine = isServe
+      ? `【当前时间】${now.toLocaleString('sv-SE', { hour12: false }).slice(0, 16)}（周${'日一二三四五六'[now.getDay()]}）。涉及相对时间时以此为基准换算。\n\n`
+      : '';
+
     // Workspace files: tell the agent the absolute path to its own workspace so it can read its source
     // files (examples/, memory/*.md, ...) with the file tools. The agent's cwd is the per-session chats
     // workDir, NOT the workspace, so relative references like "examples/" would not resolve on their own.
@@ -227,7 +235,7 @@ export class Agent {
     // links. Self-gates to '' when the soul has no activities, so non-activity souls are unaffected.
     const meetupBlock = isServe ? buildMeetupContextBlock() : '';
 
-    const prompt = `${scene}${turnLine}${filesLine}${identity}${memBlock}${meetupBlock}${body}\n\n${langRule}${judge ? '\n\n' + judge : ''}`;
+    const prompt = `${scene}${nowLine}${turnLine}${filesLine}${identity}${memBlock}${meetupBlock}${body}\n\n${langRule}${judge ? '\n\n' + judge : ''}`;
     return {
       prompt,
       workDir,

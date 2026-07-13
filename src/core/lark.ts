@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { resolveLarkRun, RUNTIME_DIR } from './paths.js';
 import { runFileSync } from './subprocess.js';
+import { log } from './log.js';
 
 // ── lark-cli wrapper (Feishu official CLI, dual user/bot identity) ─────────────────
 // Run run.js directly via node to avoid the Windows .cmd shim and Chinese/emoji argument encoding issues.
@@ -88,6 +89,45 @@ function larkExec(args: string[], opts: LarkExecOptions = {}): any {
   } catch {
     return { ok: false, raw: out };
   }
+}
+
+/**
+ * Detect a Feishu rate-limit (HTTP 429 / frequency limit) from a larkExec result. Matches both the
+ * structured envelope (error code 99991400) and the CLI's non-JSON crash text ("...HTTP 429..."),
+ * which surfaces in `raw`. Deliberately narrow: only rate limits, not generic timeouts/crashes.
+ */
+export function isRateLimited(res: any): boolean {
+  if (!res || res.ok !== false) return false;
+  const code = res?.error?.code ?? res?.code;
+  if (code === 99991400) return true;
+  const text = String(res?.raw ?? res?.error?.message ?? res?.msg ?? '').toLowerCase();
+  return /http.?429|429 too many|too many request|rate.?limit|frequency.?limit|too_many_request/.test(text);
+}
+
+// Synchronous sleep. larkExec runs synchronously (execFileSync), so async timers cannot be awaited on
+// the reply worker's critical path; Atomics.wait blocks the thread for the backoff interval instead.
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Bounded backoff schedule for a rate-limited send.
+const SEND_RETRY_DELAYS_MS = [1000, 2500, 5000];
+
+/**
+ * Run a lark-cli send with bounded backoff on a Feishu rate limit (HTTP 429). A 429 means the request
+ * was rejected before processing, so retrying cannot duplicate the message — this makes bursty sends
+ * (e.g. rapid bets each editing a post and replying) survive transient throttling instead of failing
+ * and leaving the user without confirmation. Only rate limits are retried; timeouts/crashes are not,
+ * since those may already have been delivered and retrying could duplicate.
+ */
+function larkExecSend(args: string[], opts: LarkExecOptions = {}): any {
+  let res = larkExec(args, opts);
+  for (let i = 0; i < SEND_RETRY_DELAYS_MS.length && isRateLimited(res); i++) {
+    log.warn(`飞书发送被限流（429），${SEND_RETRY_DELAYS_MS[i]}ms 后重试（第 ${i + 1}/${SEND_RETRY_DELAYS_MS.length} 次）`);
+    sleepSync(SEND_RETRY_DELAYS_MS[i]);
+    res = larkExec(args, opts);
+  }
+  return res;
 }
 
 export function authStatus(profile?: string): any {
@@ -864,6 +904,70 @@ export function listMessages(
   });
 }
 
+/** A single message fetched by id: its author, text, and thread/reply linkage. */
+export interface LarkMessageDetail {
+  messageId: string;
+  senderOpenId: string;
+  senderName: string;
+  senderType: string;
+  msgType: string;
+  text: string;
+  /** id of the message this one replied to (om_xxx), '' when none */
+  parentId: string;
+  /** id of the root message of the reply chain / topic (om_xxx), '' when none */
+  rootId: string;
+  /** topic thread id (omt_xxx), '' when the message is not in a thread */
+  threadId: string;
+}
+
+/**
+ * Fetch one message by its message_id (om_xxx) via the native GET endpoint, as the bot identity.
+ * Returns the author's open_id, a best-effort plain-text body, and the parent/root/thread linkage — or
+ * null on any error / not-found (so callers degrade gracefully). The parent_id/root_id/thread_id fields
+ * are NOT present on the raw `event consume` envelope, so fetching the message is how a reply's target
+ * (or a topic's opening message) is recovered. Used to resolve the author of a quoted/replied-to message.
+ */
+export function getMessageById(
+  messageId: string,
+  opts: { as?: 'user' | 'bot'; profile?: string } = {},
+): LarkMessageDetail | null {
+  if (!messageId) return null;
+  try {
+    const res = larkExec(
+      ['api', 'GET', `/open-apis/im/v1/messages/${messageId}`, '--as', opts.as ?? 'bot', '--format', 'json'],
+      { profile: opts.profile },
+    );
+    // `api` passthrough envelopes signal success via code===0 (the +command wrappers use ok===true);
+    // accept either so this works regardless of which shape lark-cli returns.
+    if (!res || (res.ok !== true && res.code !== 0)) return null;
+    const m: any = (res.data?.items ?? [])[0];
+    if (!m) return null;
+    const senderFields = extractSenderFields(m.sender);
+    // body.content is a JSON string; for a text message it is {"text":"..."}. Best-effort extraction.
+    let text = '';
+    try {
+      const raw = m.body?.content ?? m.content;
+      if (typeof raw === 'string') {
+        const parsed = JSON.parse(raw);
+        text = typeof parsed?.text === 'string' ? parsed.text : '';
+      }
+    } catch { /* non-text or unparseable body; leave text empty */ }
+    return {
+      messageId: m.message_id ?? messageId,
+      senderOpenId: senderFields.senderOpenId,
+      senderName: extractSenderName(m.sender),
+      senderType: senderFields.senderType ?? '',
+      msgType: typeof m.msg_type === 'string' ? m.msg_type : '',
+      text,
+      parentId: typeof m.parent_id === 'string' ? m.parent_id : '',
+      rootId: typeof m.root_id === 'string' ? m.root_id : '',
+      threadId: typeof m.thread_id === 'string' ? m.thread_id : '',
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Extract the flat list of emoji reactions from a message's reactions.details[]. Each detail is one
  * reactor + one emoji; the operator carries the reactor's open_id and type ('user' vs 'app'). Returns
@@ -939,7 +1043,7 @@ export function sendText(
     ? ['--chat-id', target.chatId]
     : ['--user-id', target.userId as string];
   const asArgs = opts.as ? ['--as', opts.as] : [];
-  const res = larkExec(
+  const res = larkExecSend(
     [
       'im',
       '+messages-send',
@@ -1056,7 +1160,7 @@ export function sendPost(
     : ['--user-id', target.userId as string];
   const asArgs = opts.as ? ['--as', opts.as] : ['--as', 'bot'];
   const body = { zh_cn: { title: post.title ?? '', content: post.content } };
-  const res = larkExec(
+  const res = larkExecSend(
     [
       'im',
       '+messages-send',
@@ -1078,6 +1182,46 @@ export function sendPost(
 }
 
 /**
+ * Edit a Feishu message in-place (bot-sent messages only, identified by om_xxx message_id).
+ * The Feishu API requires the `content` field to be doubly JSON-serialised: the outer body is
+ * JSON, but its `content` value is itself a JSON string rather than an object. This wrapper
+ * performs both serialisation steps so callers work with plain PostElement[][] values.
+ * Returns true on success; returns false on any API or CLI failure so callers can degrade
+ * gracefully (e.g. fall back to sending a new message) without crashing.
+ */
+export function updateMessage(
+  messageId: string,
+  post: { title?: string; content: PostElement[][] },
+  opts: { as?: 'user' | 'bot'; profile?: string } = {},
+): boolean {
+  if (!messageId) return false;
+  const innerBody = { zh_cn: { title: post.title ?? '', content: post.content } };
+  const body = JSON.stringify({
+    msg_type: 'post',
+    content: JSON.stringify(innerBody),
+  });
+  try {
+    const res = larkExecSend(
+      [
+        'api',
+        'PUT',
+        `/open-apis/im/v1/messages/${messageId}`,
+        '--as',
+        opts.as ?? 'bot',
+        '--data',
+        body,
+        '--format',
+        'json',
+      ],
+      { profile: opts.profile },
+    );
+    return res?.code === 0 || res?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Reply to an existing message (via +messages-reply, requires an om_ message ID).
  * When inThread=true, the reply goes into the thread stream the original message belongs to: in a topic group
  * (topic mode) this avoids being treated as a new topic and the reply appears in the original thread; in a
@@ -1090,7 +1234,7 @@ export function replyText(
 ): { ok: boolean; messageId?: string } {
   const asArgs = opts.as ? ['--as', opts.as] : [];
   const threadArgs = opts.inThread ? ['--reply-in-thread'] : [];
-  const res = larkExec(
+  const res = larkExecSend(
     [
       'im',
       '+messages-reply',

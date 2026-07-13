@@ -1509,13 +1509,23 @@ async function cmd_meetup(argv: string[]): Promise<void> {
     }
 
     const lines: import('../core/lark.js').PostElement[][] = [];
-    const dateStr = fmtSec(Math.floor(dayStart.getTime() / 1000)).slice(0, 10);
-    lines.push([{ tag: 'text', text: `📅 今日活动播报（${dateStr}）` }]);
-    for (const m of meetups) {
+    const dateSlash = fmtSec(Math.floor(dayStart.getTime() / 1000)).slice(0, 10).replace(/-/g, '/');
+    const weekday = '日一二三四五六'[dayStart.getDay()];
+    lines.push([{ tag: 'text', text: `📅 ${dateSlash} (${weekday}) 今日活动` }]);
+    for (let i = 0; i < meetups.length; i++) {
+      const m = meetups[i]!;
+      if (i > 0) lines.push([{ tag: 'text', text: '' }]); // blank line between meetings
       const timeRange = `${fmtSec(m.startTime).slice(11, 16)}–${fmtSec(m.endTime).slice(11, 16)}`;
-      const tagsStr = m.tags.length ? `  #${m.tags.join(' #')}` : '';
-      const vcPart = m.meetupUrl ? `  [入会](${m.meetupUrl})` : '';
-      lines.push([{ tag: 'text', text: `• ${m.title}  ${timeRange}${tagsStr}${vcPart}` }]);
+      lines.push([{ tag: 'text', text: `• ${m.title}  ${timeRange}` }]);
+      const calLink = m.shareLink || m.appLink; // prefer the calendar share link
+      if (calLink) {
+        lines.push([{ tag: 'text', text: `会议日程：${calLink}` }]);
+      } else if (m.meetupUrl) {
+        lines.push([{ tag: 'text', text: `加入视频会议：${m.meetupUrl}` }]);
+      }
+      for (const tag of m.tags) {
+        lines.push([{ tag: 'text', text: `要追踪后续活动请输入【@城邦土地神 follow ${tag}】` }]);
+      }
     }
 
     console.log('播报内容：');
@@ -1776,6 +1786,289 @@ async function cmd_visitors(argv: string[]): Promise<void> {
   console.log(`完成：新记录 ${recorded} 个里程碑；wiki【访客里程碑】${wikiOk ? '已更新' : '未更新（检查 visitorMilestoneWikiDocId / scope）'}`);
 }
 
+// ── TC CLI ──────────────────────────────────────────────────
+// Operator-facing subcommands for managing TC (betting-survey) proposals.
+// These run as one-shot CLI invocations.
+
+async function cmd_tc(argv: string[]): Promise<void> {
+  const sub = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+
+  if (!sub || sub === 'help') {
+    console.log([
+      '用法:',
+      '  agent tc list             — 列出所有 active 提案',
+      '  agent tc list --all       — 列出最近 20 个提案（含已结算/撤销）',
+      '  agent tc show <num>       — 查看提案详情 + 投注分布',
+      '  agent tc cancel <num>     — 撤销提案并退还所有投注 LP',
+      '  agent tc settle <num>     — 强制立即结算（测试/运维用）',
+      '  agent tc create --title <标题> --type <discrete|continuous>',
+      '                  --options <A,B,C 或 min-max>',
+      '                  [--end <YYYY-MM-DD HH:mm>] [--max-bet <N>]',
+    ].join('\n'));
+    return;
+  }
+
+  process.env.AGENT_SOUL = DEFAULT_SOUL;
+
+  const { listActiveTcs, listAllTcs, getTcByNum, getTcBets, cancelTcProposal,
+          getUnrefundedBets, markBetRefunded, insertTcProposal, updateTcTopMessageId } = await import('../core/store/tc.js');
+  const { grantPt } = await import('../core/store/gamification.js');
+  const { settleTc } = await import('../core/tc-settlement.js');
+
+  let larkProfile: string | undefined;
+  try {
+    const cfg = loadConfigs();
+    for (const id of listAgents(cfg)) {
+      if (cfg.agents.agents[id]?.enabled) {
+        larkProfile = resolveAgent(id, cfg).larkProfile;
+        break;
+      }
+    }
+  } catch { /* use default */ }
+
+  // ── tc list ───────────────────────────────────────────────
+  if (sub === 'list') {
+    const all = hasFlag(argv, 'all');
+    const proposals = all ? listAllTcs(20) : listActiveTcs();
+    if (proposals.length === 0) {
+      console.log(all ? '暂无提案记录。' : '暂无 active 提案。');
+      return;
+    }
+    for (const p of proposals) {
+      const endStr = new Date(p.endTime * 1000).toLocaleString('sv-SE').slice(0, 16);
+      console.log(`TC-${p.num}  [${p.status}]  ${p.title}  截止:${endStr}`);
+    }
+    return;
+  }
+
+  // ── tc show ───────────────────────────────────────────────
+  if (sub === 'show') {
+    const numStr = argv[2];
+    const num = numStr ? parseInt(numStr, 10) : NaN;
+    if (isNaN(num)) { log.error('用法: agent tc show <编号>'); process.exit(1); }
+    const p = getTcByNum(num);
+    if (!p) { log.error(`找不到 TC-${num}`); process.exit(1); }
+    const bets = getTcBets(p.id);
+    const activeBets = bets.filter(b => !b.isRefunded);
+    const totalLp = activeBets.reduce((s, b) => s + b.lpAmount, 0);
+    console.log(`TC-${p.num}: ${p.title}`);
+    console.log(`  状态: ${p.status}  类型: ${p.optionType}`);
+    console.log(`  选项: ${JSON.stringify(p.options)}`);
+    console.log(`  截止: ${new Date(p.endTime * 1000).toLocaleString('sv-SE').slice(0, 16)}`);
+    console.log(`  投注上限: ${p.maxBetLp} LP  topMsgId: ${p.topMessageId || '(未发送)'}`);
+    console.log(`  参与人数: ${new Set(activeBets.map(b => b.userOpenId)).size}  总投入: ${totalLp.toFixed(1)} LP`);
+    if (activeBets.length > 0) {
+      const byOpt: Record<string, number> = {};
+      for (const b of activeBets) byOpt[b.optionValue] = (byOpt[b.optionValue] ?? 0) + b.lpAmount;
+      for (const [opt, lp] of Object.entries(byOpt).sort((a, b) => b[1] - a[1])) {
+        console.log(`    【${opt}】${lp.toFixed(1)} LP`);
+      }
+    }
+    if (p.status === 'settled') {
+      console.log(`  结算结果: value=${p.settledValue}  option=${p.settledOption}`);
+    }
+    return;
+  }
+
+  // ── tc cancel ─────────────────────────────────────────────
+  if (sub === 'cancel') {
+    const numStr = argv[2];
+    const num = numStr ? parseInt(numStr, 10) : NaN;
+    if (isNaN(num)) { log.error('用法: agent tc cancel <编号>'); process.exit(1); }
+    const p = getTcByNum(num);
+    if (!p) { log.error(`找不到 TC-${num}`); process.exit(1); }
+    if (p.status !== 'active') { log.error(`TC-${num} 状态为 ${p.status}，不可撤销`); process.exit(1); }
+    const pending = getUnrefundedBets(p.id);
+    let refunded = 0;
+    for (const bet of pending) {
+      try {
+        markBetRefunded(bet.id);
+        grantPt(bet.userOpenId, bet.lpAmount, 'tc_refund_cancel', p.topMessageId);
+        refunded++;
+      } catch (e) {
+        log.warn(`退款失败（bet.id=${bet.id}）：${(e as Error).message}`);
+      }
+    }
+    cancelTcProposal(p.id);
+    console.log(`TC-${p.num}【${p.title}】已撤销，退款 ${refunded} 笔。`);
+    return;
+  }
+
+  // ── tc settle ─────────────────────────────────────────────
+  if (sub === 'settle') {
+    const numStr = argv[2];
+    const num = numStr ? parseInt(numStr, 10) : NaN;
+    if (isNaN(num)) { log.error('用法: agent tc settle <编号>'); process.exit(1); }
+    const p = getTcByNum(num);
+    if (!p) { log.error(`找不到 TC-${num}`); process.exit(1); }
+    if (p.status !== 'active') { log.error(`TC-${num} 状态为 ${p.status}，无法结算`); process.exit(1); }
+    log.info(`强制结算 TC-${p.num}【${p.title}】…`);
+    await settleTc(p, larkProfile ?? '');
+    console.log(`TC-${p.num} 结算完成。`);
+    return;
+  }
+
+  // ── tc create ─────────────────────────────────────────────
+  if (sub === 'create') {
+    const title = getFlag(argv, 'title');
+    const typeArg = getFlag(argv, 'type') as 'discrete' | 'continuous' | undefined;
+    const optionsArg = getFlag(argv, 'options');
+    const endArg = getFlag(argv, 'end');
+    const maxBetArg = getFlag(argv, 'max-bet');
+    if (!title || !typeArg || !optionsArg) {
+      log.error('--title、--type、--options 均为必填项。\n示例（离散）：agent tc create --title 标题 --type discrete --options "A,B,C"\n示例（连续）：agent tc create --title 标题 --type continuous --options 1-100');
+      process.exit(1);
+    }
+    let options: string[] | [number, number];
+    if (typeArg === 'discrete') {
+      options = optionsArg.split(',').map(s => s.trim()).filter(Boolean);
+      if (options.length < 2) { log.error('离散型至少需要 2 个选项'); process.exit(1); }
+    } else {
+      const parts = optionsArg.split(/[-–]/).map(s => parseFloat(s.trim()));
+      if (parts.length < 2 || parts.some(isNaN)) { log.error('连续型 --options 格式：min-max，例如 1-100'); process.exit(1); }
+      options = [parts[0]!, parts[1]!];
+    }
+    const endSec = endArg
+      ? Math.floor(Date.parse(endArg.includes('T') ? endArg : endArg.replace(' ', 'T')) / 1000)
+      : Math.floor(Date.now() / 1000) + 86400;
+    if (!Number.isFinite(endSec)) { log.error('--end 日期格式无效'); process.exit(1); }
+    const maxBet = maxBetArg ? parseFloat(maxBetArg) : 10;
+    const { id, num } = insertTcProposal({ title, optionType: typeArg, options, endTime: endSec, maxBetLp: maxBet });
+    console.log(`TC-${num} 已创建（id=${id}），topMessageId 待手动发送后回填。`);
+    return;
+  }
+
+  log.error(`未知子命令【${sub}】。运行 agent tc help 查看用法。`);
+  process.exit(1);
+}
+
+// ── Memory-fragment CLI ─────────────────────────────────────
+// Operator- and /goal-facing subcommands for the SeeDAO history "memory fragment" store.
+// Every write is DB-only (shared.db via the fragments store) with zero Feishu side effects,
+// mirroring `tc create`, so an autonomous /goal loop can ingest Notion history without touching
+// the outbound send path (and therefore never trips outbound-guard).
+
+async function cmd_fragment(argv: string[]): Promise<void> {
+  process.env.AGENT_SOUL = DEFAULT_SOUL;
+  const sub = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+
+  if (!sub || sub === 'help') {
+    console.log([
+      '用法（记忆碎片 · SeeDAO 历史 DB，写入共享库 shared.db，不发飞书）:',
+      '  agent fragment add "<15-30字碎片>" [--source <url>] [--note <备注>] [--category <标签>] [--by <来源>]',
+      '  agent fragment import <file.jsonl>  — 每行一个 JSON: {"content","sourceUrl?","sourceNote?","category?","addedBy?"}',
+      '  agent fragment list [--limit N] [--offset N] [--status active|archived] [--category <标签>]',
+      '  agent fragment search "<关键字>" [--limit N]  — 写入前查重用',
+      '  agent fragment random [--category <标签>]     — 随机抽一条（验证用）',
+      '  agent fragment count [--status active|archived]',
+      '  agent fragment archive <id>                   — 软停用（不删除）',
+    ].join('\n'));
+    return;
+  }
+
+  const {
+    insertFragment, listFragments, searchFragments, getRandomFragment,
+    countFragments, archiveFragment,
+  } = await import('../core/store/fragments.js');
+
+  // ── fragment add ──────────────────────────────────────────
+  if (sub === 'add') {
+    const content = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
+    if (!content) { log.error('用法: agent fragment add "<碎片文字>" [--source <url>] [--category <标签>]'); process.exit(1); }
+    const { inserted, id } = insertFragment({
+      content,
+      sourceUrl: getFlag(argv, 'source'),
+      sourceNote: getFlag(argv, 'note'),
+      category: getFlag(argv, 'category'),
+      addedBy: getFlag(argv, 'by') ?? 'cli',
+    });
+    console.log(inserted ? `已写入碎片 #${id}` : `已存在等价碎片 #${id}（跳过）`);
+    return;
+  }
+
+  // ── fragment import ───────────────────────────────────────
+  if (sub === 'import') {
+    const file = argv[2];
+    if (!file || file.startsWith('--')) { log.error('用法: agent fragment import <file.jsonl>'); process.exit(1); }
+    let raw: string;
+    try { raw = fs.readFileSync(file, 'utf8'); }
+    catch (e) { log.error(`读取文件失败：${(e as Error).message}`); process.exit(1); }
+    const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
+    let added = 0, dup = 0, bad = 0;
+    for (const line of lines) {
+      let obj: { content?: string; sourceUrl?: string; sourceNote?: string; category?: string; addedBy?: string };
+      try { obj = JSON.parse(line); } catch { bad++; continue; }
+      if (!obj.content || typeof obj.content !== 'string' || !obj.content.trim()) { bad++; continue; }
+      const { inserted } = insertFragment({
+        content: obj.content,
+        sourceUrl: obj.sourceUrl,
+        sourceNote: obj.sourceNote,
+        category: obj.category,
+        addedBy: obj.addedBy ?? 'jsonl-import',
+      });
+      if (inserted) added++; else dup++;
+    }
+    console.log(`导入完成：新增 ${added}，重复跳过 ${dup}，无效行 ${bad}，共 ${lines.length} 行。`);
+    return;
+  }
+
+  // ── fragment list ─────────────────────────────────────────
+  if (sub === 'list') {
+    const limitArg = getFlag(argv, 'limit');
+    const offsetArg = getFlag(argv, 'offset');
+    const rows = listFragments({
+      limit: limitArg ? parseInt(limitArg, 10) : 50,
+      offset: offsetArg ? parseInt(offsetArg, 10) : 0,
+      status: getFlag(argv, 'status') as 'active' | 'archived' | undefined,
+      category: getFlag(argv, 'category'),
+    });
+    if (rows.length === 0) { console.log('（空）'); return; }
+    for (const f of rows) {
+      const tag = f.category ? ` [${f.category}]` : '';
+      const st = f.status === 'active' ? '' : ` (${f.status})`;
+      console.log(`#${f.id}${st}${tag} ${f.content}`);
+    }
+    console.log(`— 本页 ${rows.length} 条；active 总数 ${countFragments({ status: 'active' })}`);
+    return;
+  }
+
+  // ── fragment search ───────────────────────────────────────
+  if (sub === 'search') {
+    const q = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
+    if (!q) { log.error('用法: agent fragment search "<关键字>" [--limit N]'); process.exit(1); }
+    const limitArg = getFlag(argv, 'limit');
+    const rows = searchFragments(q, limitArg ? parseInt(limitArg, 10) : 20);
+    if (rows.length === 0) { console.log('（无匹配，可安全写入新碎片）'); return; }
+    for (const f of rows) console.log(`#${f.id} ${f.content}`);
+    return;
+  }
+
+  // ── fragment random ───────────────────────────────────────
+  if (sub === 'random') {
+    const f = getRandomFragment({ category: getFlag(argv, 'category') });
+    console.log(f ? f.content : '（碎片库为空）');
+    return;
+  }
+
+  // ── fragment count ────────────────────────────────────────
+  if (sub === 'count') {
+    console.log(String(countFragments({ status: getFlag(argv, 'status') as 'active' | 'archived' | undefined })));
+    return;
+  }
+
+  // ── fragment archive ──────────────────────────────────────
+  if (sub === 'archive') {
+    const idStr = argv[2];
+    const id = idStr ? parseInt(idStr, 10) : NaN;
+    if (isNaN(id)) { log.error('用法: agent fragment archive <id>'); process.exit(1); }
+    console.log(archiveFragment(id) ? `碎片 #${id} 已软停用。` : `碎片 #${id} 不存在或已非 active。`);
+    return;
+  }
+
+  log.error(`未知子命令【${sub}】。运行 agent fragment help 查看用法。`);
+  process.exit(1);
+}
+
 interface CliCommand {
   /** Command name plus any aliases. */
   names: string[];
@@ -1810,6 +2103,8 @@ const COMMANDS: CliCommand[] = [
   { names: ['tg-test'], run: cmd_tg_test },
   { names: ['heartbeat'], run: cmd_heartbeat },
   { names: ['meetup'], run: cmd_meetup },
+  { names: ['tc'], run: cmd_tc },
+  { names: ['fragment', 'fragments'], run: cmd_fragment },
 ];
 
 const COMMAND_INDEX = new Map<string, CliCommand>();
