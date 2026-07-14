@@ -216,6 +216,7 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt   # matplotlib + netwo
 - **文件夹式 skill**：每个 skill 一个文件夹，主文件 `SKILL.md`（YAML frontmatter：`name` 小写连字符、`description` 写清何时用），可带 `scripts/` `references/` `assets/`，正文用相对路径引用。
 - **改 skill 或大写人格档自动生效**：执行器在会话创建时把 skill + 组装好的人格（AGENTS.md）定死、`--continue` 不重读，所以每次 `agent serve` 重启或 `agent update` 都会按**内容指纹**检测【skill + 大写人格档（SOUL/AGENTS/IDENTITY 等）】变化，有变就重置该 soul 的会话（相关群下次对话重建、载入新内容；首次启动只记基准、不动会话）。`memory/` 下的 playbook 是按需现读、不进会话缓存，所以改它们不触发重置。
 - **现有共用 skill**（`workspaces/_shared/skills/`）：`create-agent-skills`（写 SKILL.md 的元技能）、`create-badge`（徽章导入/发放/查询）、`create-event`（事件设计→注册→配图→验收）、`lp-usage-design`（LP 经济设计参考指南，含续航模拟脚本）。
+- **tudigong 专属 skill**（`workspaces/tudigong/skills/`）：`agent-self-heal`（诊断修复损坏的执行器会话）、`market-price-lookup`（查东方财富任意标的行情：`resolve`/`quote`/`kline`，自带跨进程本地限流；详见 `workspaces/tudigong/memory/market-price-lookup-playbook.md`）。
 - 装载 / 生效机制见 `workspaces/tudigong/memory/agent-skill-playbook.md`；**创作共用 skill 的房规、中立化与验收清单**见 `workspaces/tudigong/memory/skill-authoring-playbook.md`。
 
 ## 环境变量（`.env`）
