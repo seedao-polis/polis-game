@@ -33,10 +33,12 @@ window.PROFILE_DATA = {
     exclusive: [
       {
         name: 'agent-self-heal',
+        from: 'Ricky',
         desc: '诊断并修复损坏的执行器会话（HTTP 400 持续回传时使用），通过 pnpm agent doctor --fix 隔离损坏会话。'
       },
       {
         name: 'market-price-lookup',
+        from: 'Ethan',
         desc: '查东方财富能查到的任意标的行情——A股/港股/美股、ETF/基金、全球指数（如韩国 KOSPI）、板块等；支持按名称或代码搜索、即时报价与日/周/月 K 线，自带跨进程本地限流避免被封 IP。'
       }
     ],

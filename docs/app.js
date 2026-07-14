@@ -194,12 +194,14 @@
       var nameLbl = document.createElement('span');
       nameLbl.className = 'font-mono font-semibold text-sm gradient-text';
       nameLbl.textContent = sk.name;
-      var badge = document.createElement('span');
-      badge.className = 'chip chip-green';
-      badge.style.fontSize = '0.65rem';
-      badge.textContent = '专属';
       nameRow.appendChild(nameLbl);
-      nameRow.appendChild(badge);
+      if (sk.from) {
+        var badge = document.createElement('span');
+        badge.className = 'chip chip-green';
+        badge.style.fontSize = '0.65rem';
+        badge.textContent = '来自 ' + sk.from + ' 许愿';
+        nameRow.appendChild(badge);
+      }
       var desc = document.createElement('p');
       desc.className = 'text-sm text-gray-400 leading-relaxed';
       desc.textContent = sk.desc;
