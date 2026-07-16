@@ -139,6 +139,24 @@ export function hasPtGrantForRef(reason: string, refMessageId: string): boolean 
   return row != null;
 }
 
+/** A user's most recent LP ledger entries (newest first) — backs the "recent changes" query. */
+export function recentPtLedger(
+  openId: string,
+  limit = 3,
+): Array<{ delta: number; reason: string; createdAt: number }> {
+  if (!openId) return [];
+  const rows = getLpDb()
+    .prepare(
+      'SELECT delta, reason, created_at FROM pt_ledger WHERE user_open_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?',
+    )
+    .all(cid(openId), Math.max(1, limit)) as Array<{ delta: number; reason: string; created_at: number }>;
+  return rows.map((r) => ({
+    delta: Number(r.delta),
+    reason: String(r.reason ?? ''),
+    createdAt: Number(r.created_at),
+  }));
+}
+
 /**
  * Award a badge to a user.
  * Returns true when newly granted; false when the user already holds the badge.

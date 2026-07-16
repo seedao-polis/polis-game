@@ -8,7 +8,7 @@ import path from 'node:path';
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-commands-test-'));
 process.env.AGENT_DB_PATH = path.join(TMP, 'test.db');
 
-const { dispatchCommand, isFuzzyCheckIn, parseRename } = await import('./commands.js');
+const { dispatchCommand, isFuzzyCheckIn, isFuzzyLpQuery, parseRename } = await import('./commands.js');
 const store = await import('./store.js');
 const { closeDb } = await import('./db.js');
 
@@ -53,6 +53,28 @@ test('a fuzzy check-in routes to the sign command and awards LP once per day', (
   const again = dispatchCommand('8/12 签', ctx(u));
   assert.equal(again.command, 'sign');
   assert.match(again.reply ?? '', /已在 SeeDAO 数字城邦签到/);
+});
+
+// ── fuzzy LP-balance query ────────────────────────────────────
+
+test('isFuzzyLpQuery matches short self-referential balance checks', () => {
+  assert.equal(isFuzzyLpQuery('我现在有多少 LP'), true);
+  assert.equal(isFuzzyLpQuery('查一下我的积分'), true);
+  assert.equal(isFuzzyLpQuery('我还有多少生命点'), true);
+  assert.equal(isFuzzyLpQuery('@城邦土地神 我的 LP 还剩多少'), true); // leading mention stripped
+});
+
+test('isFuzzyLpQuery rejects bet-status questions that merely mention LP', () => {
+  // A member asking about a wager they placed — the LP is a bet amount, not the balance.
+  assert.equal(isFuzzyLpQuery('我西班牙的 押注 LP呢'), false);
+  assert.equal(isFuzzyLpQuery('我投注的 LP 什么时候结算'), false);
+  assert.equal(isFuzzyLpQuery('我押 5LP 中了没'), false);
+  assert.equal(isFuzzyLpQuery('LP是什么'), false); // mechanism question, no self/query signal
+});
+
+test('a bet-status question is not swallowed by the lp command (falls through to the LLM)', () => {
+  const r = dispatchCommand('@城邦土地神 我西班牙的 押注 LP呢', ctx('ou_bet_asker'));
+  assert.equal(r.handled, false); // not handled as a command → handed to the agent to answer
 });
 
 // ── rename ────────────────────────────────────────────────────

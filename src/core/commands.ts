@@ -120,6 +120,67 @@ export function isFuzzyCheckIn(raw: string): boolean {
   return /(签到|签)$/.test(s);
 }
 
+// ── fuzzy LP-balance query ────────────────────────────────────
+// The bare form 我的 is already a `profile` alias, but a member usually asks in natural language
+// ("看我现在有多少 LP", "我还有多少积分", "查一下我的 LP"). A SHORT message that mentions LP/积分/生命点 AND
+// reads as "how much do I have" is answered deterministically by the profile command — so a plain
+// balance check never reaches the LLM (fast, free, and immune to a provider content-moderation reject).
+// The length cap keeps a longer sentence that merely happens to mention LP from being swallowed.
+const LP_QUERY_MAX_LEN = 30;
+
+export function isFuzzyLpQuery(raw: string): boolean {
+  const s = stripLead(raw).replace(/\s+/g, '').toLowerCase();
+  if (!s || s.length > LP_QUERY_MAX_LEN) return false;
+  if (!/(lp|积分|生命点)/.test(s)) return false; // must be about LP at all
+  // A bet-status question ("我西班牙的押注 LP 呢", "我投注的 LP 什么时候结算") is self-referential and mentions
+  // LP, but there the LP is a wager, not the account balance. Betting keywords disqualify it so it falls
+  // through to the LLM instead of being answered with the balance — the "我" modifies the bet, not "我有多少 LP".
+  if (/押注|投注|下注|押|赌|结算|中奖|赔|提案|输了|赢/.test(s)) return false;
+  // A balance check reads as self-referential, a query verb, or a "how much / remaining" quantity.
+  // Mechanism questions ("怎么获得LP", "LP是什么", "LP怎么用") carry none of these — and longer ones are
+  // excluded by the length cap — so they still fall through to the LLM.
+  return /我|自己|查|多少|几多|余额|还有|剩/.test(s);
+}
+
+// Human-readable label for an LP ledger reason code (shown in the `lp` recent-changes list). Unknown
+// reasons fall back to their prefix family, then to the raw string, so the list never shows blanks.
+function humanizeLpReason(reason: string): string {
+  const exact: Record<string, string> = {
+    first_contact: '初次建档',
+    daily_checkin: '每日签到',
+    daily_floor_reset: '每日补底',
+    llm_reply: '对话回复',
+    manual_reset: '统一重置',
+    'welcome:self-intro': '收录自介',
+  };
+  if (exact[reason]) return exact[reason];
+  if (reason.startsWith('event:')) {
+    const ev: Record<string, string> = {
+      'like-maniac-notify': '点赞狂魔',
+      'first-try-notify': '尝新奖励',
+      'lurker-discovered': '潜水被发现',
+    };
+    return ev[reason.slice(6)] ?? '活动奖励';
+  }
+  if (reason.startsWith('tc_')) return '意向调查';
+  if (reason.startsWith('predict_chest_')) return '宝箱';
+  if (reason.startsWith('predict_')) return '社区预测';
+  if (reason.startsWith('chest_')) return '宝箱';
+  if (reason.startsWith('refund')) return '退款';
+  if (reason.startsWith('judge_')) return '对话评分';
+  if (reason.startsWith('task:')) return '任务奖励';
+  if (reason.startsWith('manual:')) return '运营调整';
+  return reason || '变动';
+}
+
+/** Compact local timestamp "MM-DD HH:mm" for a unix-second ledger time. */
+function fmtLpWhen(createdAtSec: number): string {
+  if (!createdAtSec) return '';
+  const t = new Date(createdAtSec * 1000);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`;
+}
+
 // ── self-service rename (改名) ─────────────────────────────────
 // "@我 改名 <名字>" lets a member rename themselves. The name may be glued to 改名 ("改名Vicky") or
 // separated by a half/full-width space ("改名 Vicky Huang"), and may itself contain spaces, so this is
@@ -340,6 +401,33 @@ const COMMANDS: Command[] = [
         `🌱 LP：${p.ptBalance.toFixed(1)}`,
         `🎖 徽章：${badgeStr}`,
       ].join('\n');
+    },
+  },
+  {
+    name: 'lp',
+    aliases: ['积分', '生命点'],
+    summary: '查看自己的 LP 与最近 3 笔变化',
+    usage: 'lp',
+    run(_args, ctx) {
+      if (!ctx.senderOpenId) {
+        return '无法确认你的身份（缺少 sender open_id），请在飞书群内使用此命令。';
+      }
+      const p = store.getProfile(ctx.senderOpenId);
+      if (!p) {
+        return '你还没有档案，和我互动一次就会自动建立！';
+      }
+      const recent = store.recentPtLedger(ctx.senderOpenId, 3);
+      const lines = [`🌱 ${p.name || ctx.senderOpenId} 当前 LP：${p.ptBalance.toFixed(1)}`];
+      if (recent.length === 0) {
+        lines.push('', '（暂无 LP 变化记录）');
+      } else {
+        lines.push('', `最近 ${recent.length} 笔变化：`);
+        for (const e of recent) {
+          const sign = e.delta >= 0 ? '+' : '';
+          lines.push(`· ${humanizeLpReason(e.reason)} ${sign}${e.delta.toFixed(1)}（${fmtLpWhen(e.createdAt)}）`);
+        }
+      }
+      return lines.join('\n');
     },
   },
   {
