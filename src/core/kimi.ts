@@ -41,6 +41,8 @@ const DEFAULT_TIMEOUT_MS = 600_000; // 10 minutes — research-heavy turns can r
  * - timeout: our own execFileSync timeout killed kimi mid-turn; this is what *creates* a
  *   corrupt session, so heal = validate + quarantine the session before anything else.
  * - empty-output: kimi returned no assistant text (often only emitted tool calls then stopped).
+ * - content-rejected: the provider's content moderation / risk control rejected the prompt (a 400
+ *   "high risk"). Deterministic, so NOT retryable — fall back instead of retrying the same prompt.
  * - config: kimi binary missing / auth / bad flags — not self-healable.
  * - unknown: anything unclassified.
  */
@@ -50,6 +52,7 @@ export type KimiErrorKind =
   | 'transient'
   | 'timeout'
   | 'empty-output'
+  | 'content-rejected'
   | 'config'
   | 'unknown';
 
@@ -152,6 +155,14 @@ export function classifyKimiError(detail: string, ctx: KimiFailureContext): Kimi
     /did not have response messages|must be followed by tool messages|tool_call_id|'tool_calls'|"tool_calls"/.test(d)
   ) {
     return 'corrupt-session';
+  }
+  // Provider-side content moderation / risk control rejected the prompt (e.g. Moonshot 400 "The request
+  // was rejected because it was considered high risk"). Deterministic — the identical prompt is rejected
+  // again — so this is NOT retryable; fail fast to the generic fallback instead of burning a full retry.
+  // Checked before session-missing because kimi prints a benign "starting a fresh session" line first
+  // when it had to start fresh, which would otherwise mask the real failure and trigger a pointless retry.
+  if (/considered high risk|request was rejected because|命中.{0,6}(风险|安全)|内容(风险|违规)|风险(内容|策略)/.test(d)) {
+    return 'content-rejected';
   }
   // --continue pointed at a session that no longer exists (e.g. it was quarantined/removed).
   // Recoverable: retry without --continue to start a fresh session.
