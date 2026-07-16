@@ -143,8 +143,13 @@ export function computeTcSettlement(
     }
   }
 
-  // Floating-point guard: round the dust to avoid tiny negative values
-  const dust = Math.round((effectivePool - distributed) * 10) / 10;
+  // Floating-point guard. LP arithmetic leaves IEEE754 noise in the remainder (34.65 - 34.5 evaluates
+  // to 0.1499999999999986), so round it at a precision far finer than any real LP amount to recover
+  // the exact value, then clamp at zero — every payout is floored, so the distributed total can never
+  // legitimately exceed the pool, and only noise can push the subtraction negative. Note the rounding
+  // step must stay finer than the 0.1 payout-flooring step: the remainder is by construction a
+  // fraction of that step, so rounding it at 0.1 would quantise away the very value being reported.
+  const dust = Math.max(0, Math.round((effectivePool - distributed) * 1e6) / 1e6);
 
   return { settledValue, settledOption, totalPool: effectivePool, winners, dust };
 }
@@ -194,7 +199,7 @@ export async function settleTc(proposal: TcProposal, larkProfile: string): Promi
   }
 
   if (result.dust > 0) {
-    log.info(`TC-${proposal.num} dust=${result.dust.toFixed(1)} LP（丢弃，不分配）`);
+    log.info(`TC-${proposal.num} dust=${result.dust} LP（丢弃，不分配）`);
   }
 
   // Update the original proposal post in-place; fall back to a new text message on failure

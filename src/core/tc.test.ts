@@ -74,11 +74,10 @@ describe('computeTcSettlement — continuous', () => {
     const result = computeTcSettlement('continuous', [0, 100], [
       { userOpenId: 'A', optionValue: '50', lpAmount: 5 },
     ]);
-    // avg=50; A is the only bet → winner; pool=5.25; payout=floor(5.25*10)/10=5.2
-    // dust = Math.round((5.25-5.2)*10)/10; 5.25-5.2 = 0.04999... so round gives 0
+    // avg=50; A is the only bet → winner; pool=5.25; payout=floor(5.25*10)/10=5.2; dust=5.25-5.2
     assert.equal(result.winners.length, 1);
     assert.equal(result.winners[0]!.payout, 5.2);
-    assert.equal(result.dust, 0);
+    assert.equal(result.dust, 0.05);
   });
 
   it('no bets → empty result', () => {
@@ -130,12 +129,11 @@ describe('computeTcSettlement — discrete', () => {
       { userOpenId: 'B', optionValue: '选项B', lpAmount: 2 },
     ]);
     // 选项A wins (3 LP > 2 LP); pool = 5 * 1.05 = 5.25
-    // payout = floor(5.25*10)/10 = 5.2
-    // dust = Math.round((5.25-5.2)*10)/10; 5.25-5.2 = 0.04999... → round gives 0
+    // payout = floor(5.25*10)/10 = 5.2; dust = 5.25 - 5.2
     assert.equal(result.winners.length, 1);
     assert.equal(result.winners[0]!.userOpenId, 'A');
     assert.equal(result.winners[0]!.payout, 5.2);
-    assert.equal(result.dust, 0);
+    assert.equal(result.dust, 0.05);
     assert.equal(result.settledOption, '["选项A"]');
   });
 
@@ -172,16 +170,32 @@ describe('computeTcSettlement — discrete', () => {
     assert.equal(cWin!.payout, 11.0);
   });
 
-  it('dust precision: pool=7.35 single winner → payout=7.3 dust=0.1 (float rounding)', () => {
+  it('dust precision: pool=7.35 single winner → payout=7.3, dust is the exact 0.05 remainder', () => {
     // 7LP total * 1.05 = 7.35; X (4LP) wins over Y (3LP)
     const result = computeTcSettlement('discrete', ['A', 'B'], [
       { userOpenId: 'X', optionValue: 'A', lpAmount: 4 },
       { userOpenId: 'Y', optionValue: 'B', lpAmount: 3 },
     ]);
-    // payout = floor(7.35*10)/10 = 7.3
-    // dust = Math.round((7.35-7.3)*10)/10; 7.35-7.3 = 0.05000... → round gives 0.1 (rounds up)
+    // payout = floor(7.35*10)/10 = 7.3, so the pool keeps a 0.05 remainder. Dust is reported at a
+    // precision finer than the 0.1 flooring step — quantising it at 0.1 would report 0 or 0.1 here.
     assert.equal(result.winners[0]!.payout, 7.3);
-    assert.equal(result.dust, 0.1);
+    assert.equal(result.dust, 0.05);
+  });
+
+  it('dust never goes negative and never exceeds the pool, across ragged stake splits', () => {
+    // Guards the clamp: float noise must not surface as a tiny negative remainder, and dust is
+    // always exactly pool-minus-payouts, so it stays under one 0.1 step per winner.
+    for (const stakes of [[1, 2], [3, 7], [9, 8, 3, 3], [5.5, 2.5], [1, 1, 1, 1, 1, 1, 1]]) {
+      const bets = stakes.map((lp, i) => ({ userOpenId: `u${i}`, optionValue: 'A', lpAmount: lp }));
+      const result = computeTcSettlement('discrete', ['A', 'B'], bets);
+      const paid = result.winners.reduce((s, w) => s + w.payout, 0);
+      assert.ok(result.dust >= 0, `dust ${result.dust} went negative for stakes ${stakes}`);
+      assert.ok(result.dust < 0.1 * stakes.length, `dust ${result.dust} too large for stakes ${stakes}`);
+      assert.ok(
+        Math.abs(result.totalPool - paid - result.dust) < 1e-6,
+        `pool ${result.totalPool} != paid ${paid} + dust ${result.dust} for stakes ${stakes}`,
+      );
+    }
   });
 });
 
