@@ -114,6 +114,18 @@ heartbeatTick
 - **修法**：`feishu_send` 里 `sendText(..., { as: 'bot', profile })`，并把「发送失败」从抛异常改成 `try/catch` 回一句可操作回执（告诉 LLM 若 access denied 就是 bot 未在该群 / 该群禁言，别重试同群）。改动要 `pnpm build`（心跳读 `dist/tools/mcp-server.js`）；**每轮心跳新起 MCP 子进程读 dist，下一轮自动生效、无需重启 serve**。
 - **给新工具的通用教训**：任何以 agent/bot 名义发飞书的封装，`sendText/sendPost/replyText` 都要显式 `as: 'bot'`，别依赖 lark-cli 的 `--as` 默认（会变成 user 身份、只能发操作者所在的群）。
 
+## 心跳别自己发活动 / 会议提醒（2026-07-15 修，「会前提醒」编造报名数 + 重复 @ 事故）
+
+- **事故**：心跳发了条「【会前提醒】今晚 20:00 的【SeeDAO 周会】还有约 6 小时开始，目前日历上暂无人报名」+ @ 两名成员。实际上**有 5 人报名**（说成 0），且这两人**上午 08:00 播报已 @ 过一次**（重复标注）。
+- **根因（两个 bug 同一个源头）**：这条消息**不是任何确定性代码发的**，是**心跳 LLM 即兴写的**。驱动它的有两处正向指令：① `HEARTBEAT.md` 的「主动推播」职责行（关注「重要日程即将开始」、行动「@ 相关成员」）；② `heartbeat.ts` 的 `buildHeartbeatPrompt` 举例「如推播活动提醒」。
+  - **报名数编造**：心跳 prompt **不注入**【近期活动】块（那块只在 serve 每轮 `agent.ts prepare()` 注入、心跳没有），更没有报名数字段。真实报名数（accepted）每 5 分钟采进 `calendar_event_rsvp_rounds`、`latestCalendarEventRsvpRound(eventId)` 可取——但 LLM 看不到，于是凭空写「0 报名」。**LLM 说出它看不到的真实世界数据 = 本仓库到处在杜绝的坑**。
+  - **消息哪来的**：心跳 MCP 只有 `message_search` 等工具、无日历工具。LLM 大概率 `message_search` 翻到**当天 08:00 的确定性播报**（`scheduleDailyMeetupDigest`，里面就有这场周会的日历分享链接 + @ 了那两名订阅者），照抄链接、照抄 @ 名单，再补一句自造的「暂无人报名」——所以链接和 @ 名单和早上那条一模一样。
+- **修法（确定性优先，运营者拍板「彻底移除会前提醒」）**：活动 / 会议提醒**只由框架 08:00 `scheduleDailyMeetupDigest` 做**（播报当天活动 + @ 订阅者），心跳一律不碰。
+  1. `HEARTBEAT.md`：删掉「主动推播」职责行；在「框架自动跑的」段加一条明确禁止——**心跳不要再手动发会议 / 活动 / 会前提醒、也不要再 @ 订阅者**（08:00 已标注→重发即重复；心跳看不到真实报名数→自己写人数必编造）。仿既有「迎新已由框架处理、心跳别手动欢迎」的护栏写法。
+  2. `heartbeat.ts` `buildHeartbeatPrompt`：把举例「如推播活动提醒」去掉，改成「迎新与活动 / 会议提醒均已由框架确定性处理，心跳不要再发」。**编译档，要 `pnpm build`（tsc）+ 重启 serve** 才生效（HEARTBEAT.md 是 md、每轮 `assembleSoul` 重读、下一轮即生效无需重启）。
+- **未处理但相关**：`HEARTBEAT.md`「里程碑庆祝」行（共学报名 / 围观群人数跨整数关口）与框架 `class-event-notify` / `visitor-num-notify` **同样重叠**、有同类双发风险；本次未动（超出授权范围），需要时按同一模式移除。
+- **通用教训**：凡「必须准确 + 必须去重」的推播（活动提醒、里程碑、迎新），走**框架确定性 code**，别让心跳 LLM 即兴发——它既看不到真实数字（会编），又会和框架已发的内容撞车（会重复 @）。见 [[activity-meetup-playbook]] 08:00 播报节。
+
 ## 关联
 
 - 抛弃式 LLM 触发的范本：`ops-report-playbook.md` 末节（ops-narrative 04:59）。
