@@ -159,3 +159,24 @@ export function buildTcSettledPost(
   ];
   return { title: `【TC-${proposal.num}】${proposal.title}`, content: lines };
 }
+
+/**
+ * Post shown after a proposal is cancelled by its creator or an admin: every bet is refunded and the
+ * survey is closed. Replaces the canonical post in-place.
+ */
+export function buildTcCancelledPost(
+  proposal: TcProposal,
+  refunded: number,
+): { title: string; content: PostElement[][] } {
+  const lines: PostElement[][] = [
+    [{ tag: 'text', text: '🔸调查进度：已撤销' }],
+    [{
+      tag: 'text',
+      text: refunded > 0
+        ? `🔸已退还全部投注（${refunded} 笔），LP 已原路返还`
+        : '🔸本次没有投注需要退还',
+    }],
+    [{ tag: 'text', text: `了解更多 👉 ${WIKI_URL}` }],
+  ];
+  return { title: `【TC-${proposal.num}】${proposal.title}`, content: lines };
+}

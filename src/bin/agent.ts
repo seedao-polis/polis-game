@@ -1810,10 +1810,10 @@ async function cmd_tc(argv: string[]): Promise<void> {
 
   process.env.AGENT_SOUL = DEFAULT_SOUL;
 
-  const { listActiveTcs, listAllTcs, getTcByNum, getTcBets, cancelTcProposal,
-          getUnrefundedBets, markBetRefunded, insertTcProposal, updateTcTopMessageId } = await import('../core/store/tc.js');
-  const { grantPt } = await import('../core/store/gamification.js');
+  const { listActiveTcs, listAllTcs, getTcByNum, getTcBets,
+          insertTcProposal, updateTcTopMessageId } = await import('../core/store/tc.js');
   const { settleTc } = await import('../core/tc-settlement.js');
+  const { cancelTcWithRefund } = await import('../core/tc-command.js');
 
   let larkProfile: string | undefined;
   try {
@@ -1878,18 +1878,7 @@ async function cmd_tc(argv: string[]): Promise<void> {
     const p = getTcByNum(num);
     if (!p) { log.error(`找不到 TC-${num}`); process.exit(1); }
     if (p.status !== 'active') { log.error(`TC-${num} 状态为 ${p.status}，不可撤销`); process.exit(1); }
-    const pending = getUnrefundedBets(p.id);
-    let refunded = 0;
-    for (const bet of pending) {
-      try {
-        markBetRefunded(bet.id);
-        grantPt(bet.userOpenId, bet.lpAmount, 'tc_refund_cancel', p.topMessageId);
-        refunded++;
-      } catch (e) {
-        log.warn(`退款失败（bet.id=${bet.id}）：${(e as Error).message}`);
-      }
-    }
-    cancelTcProposal(p.id);
+    const { refunded } = cancelTcWithRefund(p);
     console.log(`TC-${p.num}【${p.title}】已撤销，退款 ${refunded} 笔。`);
     return;
   }

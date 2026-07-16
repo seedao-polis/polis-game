@@ -104,6 +104,11 @@ export function tryParseTcBet(
   if (proposal.optionType === 'discrete') {
     const validOptions = proposal.options as string[];
     if (!validOptions.includes(optionValue)) {
+      // Only report an invalid-option error when the text actually looks like a bet — i.e. it carries
+      // an explicit lp/LP amount marker. Otherwise a command or plain chatter that merely ends in a
+      // number (e.g. "tc cancel 51", "我觉得 8") would be swallowed as a failed bet; let it fall
+      // through to the command dispatcher / LLM instead.
+      if (!/\d\s*lp/i.test(rawText)) return false;
       return {
         reply: `投注失败：【${optionValue}】不是有效选项。\n` +
                `有效选项：${validOptions.map(o => `【${o}】`).join(' / ')}`,

@@ -14,6 +14,9 @@ const { computeTcSettlement } = await import('./tc-settlement.js');
 const { parseLpAmount } = await import('./commands.js');
 // TC store functions for counter/insert tests.
 const { insertTcProposal, getTcByNum, getTcBets, nextTcNumUnsafe } = await import('./store/tc.js');
+const { insertTcBet, getUnrefundedBets } = await import('./store/tc.js');
+const { tryParseTcBet } = await import('./tc-bet-parser.js');
+const { cancelTcWithRefund, tryHandleTcCommand } = await import('./tc-command.js');
 const { closeDb, tx } = await import('./db.js');
 
 after(() => {
@@ -34,6 +37,75 @@ describe('parseLpAmount', () => {
   it('returns null for zero', () => assert.equal(parseLpAmount(['0LP']), null));
   it('returns null for negative token', () => assert.equal(parseLpAmount(['-1LP']), null));
   it('returns null for text-only', () => assert.equal(parseLpAmount(['abc']), null));
+});
+
+// ── TC command / bet-parser regression: "tc cancel" must not be a bet ──
+
+function makeDiscreteProposal(createdBy = 'U1') {
+  const { num } = insertTcProposal({
+    title: '西班牙还是法国',
+    optionType: 'discrete',
+    options: ['法国', '西班牙'],
+    endTime: Math.floor(Date.now() / 1000) + 86400,
+    maxBetLp: 10,
+    createdBy,
+    chatId: 'oc_test',
+  });
+  return getTcByNum(num)!;
+}
+
+describe('tryParseTcBet — non-bet messages fall through', () => {
+  it('"tc cancel 51" is NOT parsed as a bet', () => {
+    const p = makeDiscreteProposal();
+    assert.equal(tryParseTcBet('@城邦土地神 tc cancel 51', p, 'U9', 'm1'), false);
+  });
+  it('chatter ending in a bare number is NOT a bet', () => {
+    const p = makeDiscreteProposal();
+    assert.equal(tryParseTcBet('@城邦土地神 我觉得 8', p, 'U9', 'm2'), false);
+  });
+  it('an invalid option WITH an lp marker still reports an error', () => {
+    const p = makeDiscreteProposal();
+    const r = tryParseTcBet('@城邦土地神 法國 5lp', p, 'U9', 'm3');
+    assert.notEqual(r, false);
+    assert.match((r as { reply: string }).reply, /不是有效选项/);
+  });
+});
+
+describe('tryHandleTcCommand — cancel', () => {
+  it('a non-tc message returns false (not a command)', () => {
+    assert.equal(tryHandleTcCommand('@城邦土地神 法国 5lp', 'U1'), false);
+  });
+  it('an unknown TC number replies not-found', () => {
+    const r = tryHandleTcCommand('@城邦土地神 tc cancel 999999', 'U1');
+    assert.notEqual(r, false);
+    assert.match((r as { reply: string }).reply, /找不到/);
+  });
+  it('a non-creator, non-admin is rejected and the proposal stays active', () => {
+    const p = makeDiscreteProposal('creator1');
+    const r = tryHandleTcCommand(`@城邦土地神 tc cancel ${p.num}`, 'someone-else');
+    assert.notEqual(r, false);
+    assert.match((r as { reply: string }).reply, /只有发起人或管理员/);
+    assert.equal(getTcByNum(p.num)!.status, 'active');
+  });
+});
+
+describe('cancelTcWithRefund', () => {
+  it('cancels a proposal with no bets', () => {
+    const p = makeDiscreteProposal();
+    const res = cancelTcWithRefund(p);
+    assert.equal(res.refunded, 0);
+    assert.equal(getTcByNum(p.num)!.status, 'cancelled');
+  });
+  it('refunds outstanding bets and marks the proposal cancelled', () => {
+    const p = makeDiscreteProposal('creator2');
+    insertTcBet({ proposalId: p.id, userOpenId: 'bettor', optionValue: '法国', lpAmount: 4, messageId: 'b1' });
+    assert.equal(getUnrefundedBets(p.id).length, 1);
+    const res = cancelTcWithRefund(p);
+    assert.equal(res.refunded, 1);
+    assert.equal(res.refundedLp, 4);
+    assert.equal(getTcByNum(p.num)!.status, 'cancelled');
+    assert.equal(getUnrefundedBets(p.id).length, 0);
+  });
 });
 
 // ── computeTcSettlement — continuous type ────────────────────
