@@ -59,11 +59,13 @@ node scripts/fetch.mjs kline 1.600519 6      # 最近 6 根日K
 脚本永远输出一行 JSON，据 `ok` 与 `mode`：
 
 - `mode:"resolve"` → `candidates[]`，每条 `{secid,code,name,type,market}`，挑对的那条的 `secid`。
-- `ok:true, mode:"quote"` → 用 `name`/`price`/`prevClose`/`change`/`changePct`（+ `open`/`high`/`low`/`volume`）作答，例：「贵州茅台现报 1213.5 元，涨 2.51（+0.21%）」。留意 `resolved`（裸名字查询时实际匹配到的标的）与 `alternatives`（其他候选），核对没选错。
+- `ok:true, mode:"quote"` → **先看 `source`**：
+  - `source:"realtime"` → 实时报价，用 `name`/`price`/`prevClose`/`change`/`changePct`（+ `open`/`high`/`low`/`volume`）作答，例：「韩国KOSPI 现报 6890.72，涨 83.79（+1.23%）」。
+  - `source:"daily-close"`（带 `stale:true`）→ **实时源暂时不可用、脚本已自动回退为最近交易日收盘**（`asOf` 是该交易日日期）。回答**必须如实说明是「{asOf} 收盘、非实时」**，例：「实时源暂时不稳，韩国KOSPI 最近交易日（07-14）收 6874.07，+0.99%」。
+  两种都留意 `resolved`（裸名字查询实际匹配到的标的）/ `alternatives`，核对没选错。
 - `ok:true, mode:"kline"` → `bars` 按日期升序，每根有 `date/open/close/high/low/changePct` 等，取最后一根说当日、或串起来说走势。
 - `ok:false, reason:"not-found"` → 搜不到这个名字/代码，照 `hint` 如实告知，按需降级/引导，别编数字。
-- `ok:false, reason:"no-data"` → 解析到了 secid 但该接口无数据，如实告知。
-- `ok:false, reason:"error"`（常见 `fetch failed`/`operation was aborted`）→ 网络波动或已被限流。如实说「行情源暂时不可用，稍后再试」，别臆测；即时主机拿不到可改用 `kline` 主机（不同主机）。
+- `ok:false, reason:"no-data"` / `reason:"error"` → **实时与日K都拿不到**（被限流/拥堵或标的不支持）。如实说「行情源暂时不可用，稍后再试」，别臆测。（`quote` 已内建实时→日K 自动回退，走到这步是两个主机都不行。）
 </output_handling>
 
 <reference_guides>

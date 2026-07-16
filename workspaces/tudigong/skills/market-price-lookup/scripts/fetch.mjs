@@ -6,9 +6,12 @@
 // and no third-party dependency; uses the Node built-in fetch only. All calls go
 // through the machine-global rate limiter in ./rate-limiter.mjs.
 //
+// quote falls back to the latest daily close (kline, a steadier host) when the
+// real-time endpoint is unavailable, so a congested quote host still yields data.
+//
 // Usage:
 //   node fetch.mjs resolve <query> [count]       -> candidate instruments + their secid
-//   node fetch.mjs quote   <secid|query>         -> real-time quote
+//   node fetch.mjs quote   <secid|query>         -> real-time quote (falls back to daily close)
 //   node fetch.mjs kline   <secid|query> [lmt] [klt]
 // Examples:
 //   node fetch.mjs resolve 贵州茅台
@@ -23,8 +26,11 @@ function intEnv(key, def) {
   return Number.isFinite(n) && n > 0 ? n : def;
 }
 
-const TIMEOUT_MS = intEnv('EM_TIMEOUT_MS', 8000);
-const MAX_ATTEMPTS = intEnv('EM_MAX_ATTEMPTS', 2); // one gentle retry on transient socket errors
+// East Money hosts get slow (not dead) while recovering from a throttle, so the
+// timeout is generous. One gentle retry (MAX_ATTEMPTS) covers transient socket
+// resets; the quote path additionally falls back from realtime to daily-close.
+const TIMEOUT_MS = intEnv('EM_TIMEOUT_MS', 20000);
+const MAX_ATTEMPTS = intEnv('EM_MAX_ATTEMPTS', 2);
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36';
 const REFERER = 'https://quote.eastmoney.com/';
 // Public frontend token baked into East Money's own web client — not a secret.
@@ -35,10 +41,10 @@ function isSecid(s) {
   return /^\d+\.[A-Za-z0-9]+$/.test(String(s || ''));
 }
 
-// Rate-limited JSON GET with one gentle retry on transient network failure.
-async function emGet(url) {
+// Rate-limited JSON GET. attempts>1 gives gentle retries on transient failure.
+async function emGet(url, attempts = MAX_ATTEMPTS) {
   let lastErr;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  for (let i = 1; i <= attempts; i++) {
     await reserveSlot();
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
@@ -81,45 +87,72 @@ async function toSecid(input) {
 async function quote(input) {
   const { secid, resolved, alternatives } = await toSecid(input);
   if (!secid) return notFound(input);
-  const url =
-    'https://push2.eastmoney.com/api/qt/stock/get' +
-    `?invt=2&fltt=2&secid=${secid}&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f169,f170`;
-  const json = await emGet(url);
-  const d = json && json.data;
-  if (!d || d.f43 == null) return noData(secid, resolved);
+
+  // 1) Real-time quote (push2). One attempt — on any failure fall back to kline.
+  try {
+    const url =
+      'https://push2.eastmoney.com/api/qt/stock/get' +
+      `?invt=2&fltt=2&secid=${secid}&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f169,f170`;
+    const json = await emGet(url, 1); // one shot — fall straight to the kline fallback on failure
+    const d = json && json.data;
+    if (d && d.f43 != null) {
+      return {
+        ok: true, mode: 'quote', source: 'realtime', secid,
+        code: d.f57, name: d.f58, type: resolved && resolved.type,
+        price: d.f43, open: d.f46, high: d.f44, low: d.f45, prevClose: d.f60,
+        change: d.f169, changePct: d.f170, volume: d.f47, amount: d.f48,
+        resolved, alternatives,
+      };
+    }
+  } catch (e) {
+    // fall through to the daily-close fallback below
+  }
+
+  // 2) Fallback: latest daily close from kline (push2his — a steadier host).
+  try {
+    const kd = await klineData(secid, 2, 101);
+    if (kd && kd.bars.length) {
+      const last = kd.bars[kd.bars.length - 1];
+      const prev = kd.bars.length > 1 ? kd.bars[kd.bars.length - 2] : null;
+      return {
+        ok: true, mode: 'quote', source: 'daily-close', stale: true, secid,
+        name: kd.name || (resolved && resolved.name), type: resolved && resolved.type,
+        asOf: last.date, price: last.close, open: last.open, high: last.high, low: last.low,
+        prevClose: prev ? prev.close : null, change: last.change, changePct: last.changePct,
+        volume: last.volume,
+        note: '实时报价源暂时不可用，此为最近一个交易日的收盘数据（非实时），回答时请据实说明。',
+        resolved, alternatives,
+      };
+    }
+  } catch (e) {
+    // both endpoints failed
+  }
+
   return {
-    ok: true,
-    mode: 'quote',
-    secid,
-    code: d.f57,
-    name: d.f58,
-    type: resolved && resolved.type,
-    price: d.f43,
-    open: d.f46,
-    high: d.f44,
-    low: d.f45,
-    prevClose: d.f60,
-    change: d.f169,
-    changePct: d.f170,
-    volume: d.f47,
-    amount: d.f48,
-    resolved,
-    alternatives,
+    ok: false, secid, resolved, reason: 'no-data',
+    hint: `实时(push2)与日K(push2his)都拿不到 secid=${secid} 的数据（可能被限流/拥堵，或该标的不支持此接口）。稍后再试，别臆测数字。`,
   };
 }
 
 async function kline(input, lmt = 6, klt = 101) {
   const { secid, resolved, alternatives } = await toSecid(input);
   if (!secid) return notFound(input);
+  const kd = await klineData(secid, lmt, klt);
+  if (!kd) return noData(secid, resolved);
+  return { ok: true, mode: 'kline', secid, name: kd.name, type: resolved && resolved.type, bars: kd.bars, resolved, alternatives };
+}
+
+// Fetch + parse K-line bars for a secid. Returns { name, bars } or null.
+async function klineData(secid, lmt = 6, klt = 101, attempts = MAX_ATTEMPTS) {
   const url =
     'https://push2his.eastmoney.com/api/qt/stock/kline/get' +
     `?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6` +
     '&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61' +
     `&klt=${klt}&fqt=1&end=20500101&lmt=${lmt}`;
-  const json = await emGet(url);
+  const json = await emGet(url, attempts);
   const d = json && json.data;
-  if (!d || !Array.isArray(d.klines) || d.klines.length === 0) return noData(secid, resolved);
-  return { ok: true, mode: 'kline', secid, name: d.name, type: resolved && resolved.type, bars: d.klines.map(parseBar), resolved, alternatives };
+  if (!d || !Array.isArray(d.klines) || d.klines.length === 0) return null;
+  return { name: d.name, bars: d.klines.map(parseBar) };
 }
 
 // One K-line row: "date,open,close,high,low,volume,amount,amplitude%,changePct%,change,turnover%".
@@ -158,7 +191,7 @@ function notFound(query) {
   };
 }
 
-// Resolved to a secid but the quote/kline endpoint returned nothing.
+// Resolved to a secid but the endpoint returned nothing.
 function noData(secid, resolved) {
   return {
     ok: false,
