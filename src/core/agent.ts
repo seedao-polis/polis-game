@@ -29,6 +29,8 @@ function sleepSync(ms: number): void {
 /** Inputs to the self-heal loop (shared by the sync and async runners). */
 interface HealArgs {
   prompt: string;
+  /** Moderation-safe fallback: persona + bare user message, no injected memory / backstory / context. */
+  reducedPrompt: string;
   workDir: string;
   useSession: boolean;
   chatId?: string;
@@ -236,11 +238,17 @@ export class Agent {
     const meetupBlock = isServe ? buildMeetupContextBlock() : '';
 
     const prompt = `${scene}${nowLine}${turnLine}${filesLine}${identity}${memBlock}${meetupBlock}${body}\n\n${langRule}${judge ? '\n\n' + judge : ''}`;
+    // Moderation-safe fallback prompt (used by the content-rejected retry in runWithHeal): persona +
+    // essential framing + the bare user message. Drops the injected memory / activity context / group
+    // backstory, and — via a fresh session on retry — the history. That injected dynamic content, not
+    // the benign user message, is what trips the provider's 400 "high risk"; the reduced request passes.
+    const reducedPrompt = `${scene}${nowLine}${filesLine}${identity}用户消息：\n${input.message}\n\n${langRule}`;
     return {
       prompt,
       workDir,
       heal: {
         prompt,
+        reducedPrompt,
         workDir,
         useSession: Boolean(input.session), // resume the per-(chat,user) session for short-term memory
         chatId: input.chatId,
@@ -349,6 +357,7 @@ export class Agent {
     const { timeoutMs, extraArgs, skillsDirs, maxRetries, corrId } = this.healSetup();
     let continueSession = args.useSession;
     let lastErr: KimiError | null = null;
+    let triedReduced = false;
 
     for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
       try {
@@ -356,6 +365,19 @@ export class Agent {
       } catch (e) {
         const r = this.processAttemptError(e, args, corrId, attempt, maxRetries, continueSession);
         lastErr = r.err;
+        // Content-moderation rejection (400 "high risk"): the trigger is the injected memory / group
+        // backstory / session history, not the benign user message. Retry ONCE with the reduced prompt
+        // (persona + bare message) and a fresh session, which passes moderation and still answers.
+        if (r.err.kind === 'content-rejected' && !triedReduced && args.reducedPrompt) {
+          triedReduced = true;
+          try {
+            const reduced = runKimi({ prompt: args.reducedPrompt, workDir: args.workDir, continueSession: false, timeoutMs, extraArgs, skillsDirs });
+            log.info(`[${corrId}] ${this.name} 内容风控回退：精简提示重试成功（已略去记忆/上下文）`);
+            return reduced;
+          } catch (e2) {
+            lastErr = this.processAttemptError(e2, { ...args, prompt: args.reducedPrompt }, corrId, attempt, maxRetries, false).err;
+          }
+        }
         if (!r.willRetry) break;
         continueSession = r.continueSession;
         if (r.backoffMs) sleepSync(r.backoffMs);
@@ -370,6 +392,7 @@ export class Agent {
     const { timeoutMs, extraArgs, skillsDirs, maxRetries, corrId } = this.healSetup();
     let continueSession = args.useSession;
     let lastErr: KimiError | null = null;
+    let triedReduced = false;
 
     for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
       try {
@@ -377,6 +400,19 @@ export class Agent {
       } catch (e) {
         const r = this.processAttemptError(e, args, corrId, attempt, maxRetries, continueSession);
         lastErr = r.err;
+        // Content-moderation rejection (400 "high risk"): the trigger is the injected memory / group
+        // backstory / session history, not the benign user message. Retry ONCE with the reduced prompt
+        // (persona + bare message) and a fresh session, which passes moderation and still answers.
+        if (r.err.kind === 'content-rejected' && !triedReduced && args.reducedPrompt) {
+          triedReduced = true;
+          try {
+            const reduced = await runKimiAsync({ prompt: args.reducedPrompt, workDir: args.workDir, continueSession: false, timeoutMs, extraArgs, skillsDirs });
+            log.info(`[${corrId}] ${this.name} 内容风控回退：精简提示重试成功（已略去记忆/上下文）`);
+            return reduced;
+          } catch (e2) {
+            lastErr = this.processAttemptError(e2, { ...args, prompt: args.reducedPrompt }, corrId, attempt, maxRetries, false).err;
+          }
+        }
         if (!r.willRetry) break;
         continueSession = r.continueSession;
         if (r.backoffMs) await new Promise((res) => setTimeout(res, r.backoffMs));
