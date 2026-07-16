@@ -2058,6 +2058,294 @@ async function cmd_fragment(argv: string[]): Promise<void> {
   process.exit(1);
 }
 
+// ── Community Prediction CLI ────────────────────────────────
+// Operator-facing subcommands for managing community-prediction proposals. Mirrors agent tc, but
+// `announce` replaces `settle` (a human-chosen winning option, not an algorithm) and this CLI path
+// does not itself check the predict_judge badge — same as `agent tc settle`, it relies on shell access
+// control (see the community-prediction research doc §C.3: "CLI 路徑可選擇是否也做徽章檢查").
+
+async function cmd_predict(argv: string[]): Promise<void> {
+  const sub = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+
+  if (!sub || sub === 'help') {
+    console.log([
+      '用法:',
+      '  agent predict list             — 列出所有 active 提案',
+      '  agent predict list --all       — 列出最近 20 个提案（含已结算/撤销）',
+      '  agent predict show <num>       — 查看提案详情 + 投注分布',
+      '  agent predict refresh <num>    — 用当前模板重绘 active / settled 提案原帖（模板改版后同步已发消息）',
+      '  agent predict cancel <num>     — 撤销提案并退还所有投注 LP',
+      '  agent predict announce <num> <获胜选项>  — 裁判宣布结果并结算（运维用；不做徽章检查）',
+      '  agent predict create --title <标题> --options <A,B,C>',
+      '                       [--end <YYYY-MM-DD HH:mm>] [--max-bet <N>]',
+    ].join('\n'));
+    return;
+  }
+
+  process.env.AGENT_SOUL = DEFAULT_SOUL;
+
+  const { listActivePredicts, listAllPredicts, getPredictByNum, getPredictBets,
+          insertPredictProposal } = await import('../core/store/predict.js');
+  const { settlePredict } = await import('../core/predict-settlement.js');
+  const { cancelPredictWithRefund } = await import('../core/predict-command.js');
+
+  let larkProfile: string | undefined;
+  try {
+    const cfg = loadConfigs();
+    for (const id of listAgents(cfg)) {
+      if (cfg.agents.agents[id]?.enabled) {
+        larkProfile = resolveAgent(id, cfg).larkProfile;
+        break;
+      }
+    }
+  } catch { /* use default */ }
+
+  // ── predict list ──────────────────────────────────────────
+  if (sub === 'list') {
+    const all = hasFlag(argv, 'all');
+    const proposals = all ? listAllPredicts(20) : listActivePredicts();
+    if (proposals.length === 0) {
+      console.log(all ? '暂无提案记录。' : '暂无 active 提案。');
+      return;
+    }
+    for (const p of proposals) {
+      const endStr = new Date(p.endTime * 1000).toLocaleString('sv-SE').slice(0, 16);
+      console.log(`BET-${p.num}  [${p.status}]  ${p.title}  投注截止:${endStr}`);
+    }
+    return;
+  }
+
+  // ── predict show ──────────────────────────────────────────
+  if (sub === 'show') {
+    const numStr = argv[2];
+    const num = numStr ? parseInt(numStr, 10) : NaN;
+    if (isNaN(num)) { log.error('用法: agent predict show <编号>'); process.exit(1); }
+    const p = getPredictByNum(num);
+    if (!p) { log.error(`找不到 BET-${num}`); process.exit(1); }
+    const bets = getPredictBets(p.id);
+    const activeBets = bets.filter(b => !b.isRefunded);
+    const totalLp = activeBets.reduce((s, b) => s + b.lpAmount, 0);
+    console.log(`BET-${p.num}: ${p.title}`);
+    console.log(`  状态: ${p.status}`);
+    console.log(`  选项: ${JSON.stringify(p.options)}`);
+    console.log(`  投注截止: ${new Date(p.endTime * 1000).toLocaleString('sv-SE').slice(0, 16)}`);
+    console.log(`  投注上限: ${p.maxBetLp} LP  topMsgId: ${p.topMessageId || '(未发送)'}`);
+    console.log(`  参与人数: ${new Set(activeBets.map(b => b.userOpenId)).size}  总投入: ${totalLp.toFixed(1)} LP`);
+    if (activeBets.length > 0) {
+      const byOpt: Record<string, number> = {};
+      for (const b of activeBets) byOpt[b.optionValue] = (byOpt[b.optionValue] ?? 0) + b.lpAmount;
+      for (const [opt, lp] of Object.entries(byOpt).sort((a, b) => b[1] - a[1])) {
+        console.log(`    【${opt}】${lp.toFixed(1)} LP`);
+      }
+    }
+    if (p.status === 'settled') {
+      console.log(`  结算结果: ${p.settledOption}  宣布人: ${p.announcedBy}`);
+    }
+    return;
+  }
+
+  // ── predict refresh ───────────────────────────────────────
+  // Re-render a proposal's canonical post in-place with the current template, without placing a bet
+  // or re-running settlement — used to propagate a template change (e.g. a new footer line) onto
+  // messages that were already sent.
+  //
+  // Active proposals re-render from their live bets. Settled ones re-render purely from the LP
+  // ledger: the winner payouts and the chest contribution are read back from the rows settlement
+  // actually booked, never recomputed, so redrawing an old post can only ever restate what was paid
+  // — a later change to the payout formula cannot silently rewrite history. This path grants no LP
+  // and touches no DB state; it only edits the Feishu message.
+  if (sub === 'refresh') {
+    const numStr = argv[2];
+    const num = numStr ? parseInt(numStr, 10) : NaN;
+    if (isNaN(num)) { log.error('用法: agent predict refresh <编号>'); process.exit(1); }
+    const p = getPredictByNum(num);
+    if (!p) { log.error(`找不到 BET-${num}`); process.exit(1); }
+    if (p.status !== 'active' && p.status !== 'settled') {
+      log.error(`BET-${num} 状态为 ${p.status}，只有 active / settled 提案有可原地重绘的原帖`);
+      process.exit(1);
+    }
+    if (!p.topMessageId) { log.error(`BET-${num} 尚未发送（topMessageId 为空），无法重绘`); process.exit(1); }
+    const { buildPredictResultPost, buildPredictSettledPost } = await import('../core/predict-post.js');
+    const { updateMessage } = await import('../core/lark.js');
+    const bets = getPredictBets(p.id);
+
+    let post;
+    if (p.status === 'settled') {
+      const rewards = store.ptGrantsForRef('predict_reward', p.topMessageId);
+      const winnerNames = rewards.map((r) => ({
+        userOpenId: r.openId,
+        userName: store.memberName(r.openId) || store.getProfile(r.openId)?.name || r.openId,
+        amount: r.delta,
+      }));
+      const chestContribution = store
+        .ptGrantsForRef('predict_chest_contribute', p.topMessageId)
+        .reduce((s, r) => s + r.delta, 0);
+      const announcerName = p.announcedBy
+        ? store.memberName(p.announcedBy) || store.getProfile(p.announcedBy)?.name || p.announcedBy
+        : '';
+      post = buildPredictSettledPost(p, bets, winnerNames, announcerName, chestContribution);
+    } else {
+      post = buildPredictResultPost(p, bets);
+    }
+
+    const ok = updateMessage(p.topMessageId, post, { as: 'bot', profile: larkProfile });
+    if (!ok) { log.error(`重绘失败：更新原帖返回失败（topMsgId=${p.topMessageId}）`); process.exit(1); }
+    console.log(`BET-${p.num}【${p.title}】原帖已用当前模板重绘（status=${p.status}, topMsgId=${p.topMessageId}）。`);
+    return;
+  }
+
+  // ── predict cancel ────────────────────────────────────────
+  if (sub === 'cancel') {
+    const numStr = argv[2];
+    const num = numStr ? parseInt(numStr, 10) : NaN;
+    if (isNaN(num)) { log.error('用法: agent predict cancel <编号>'); process.exit(1); }
+    const p = getPredictByNum(num);
+    if (!p) { log.error(`找不到 BET-${num}`); process.exit(1); }
+    if (p.status !== 'active') { log.error(`BET-${num} 状态为 ${p.status}，不可撤销`); process.exit(1); }
+    const { refunded } = cancelPredictWithRefund(p);
+    console.log(`BET-${p.num}【${p.title}】已撤销，退款 ${refunded} 笔。`);
+    return;
+  }
+
+  // ── predict announce ──────────────────────────────────────
+  if (sub === 'announce') {
+    const numStr = argv[2];
+    const num = numStr ? parseInt(numStr, 10) : NaN;
+    // Positional args after <num> up to (not including) any --flag form the winner option, so
+    // "agent predict announce 3 巴西 --by ou_..." still parses the option correctly.
+    const rest = argv.slice(3);
+    const flagStart = rest.findIndex((a) => a.startsWith('--'));
+    const winnerOption = (flagStart === -1 ? rest : rest.slice(0, flagStart)).join(' ').trim();
+    const announcer = getFlag(argv, 'by') || 'cli';
+    if (isNaN(num) || !winnerOption) { log.error('用法: agent predict announce <编号> <获胜选项> [--by <open_id>]'); process.exit(1); }
+    const p = getPredictByNum(num);
+    if (!p) { log.error(`找不到 BET-${num}`); process.exit(1); }
+    if (p.status !== 'active') { log.error(`BET-${num} 状态为 ${p.status}，无法宣布结果`); process.exit(1); }
+    if (!p.options.includes(winnerOption)) {
+      log.error(`【${winnerOption}】不是 BET-${num} 的有效选项：${JSON.stringify(p.options)}`);
+      process.exit(1);
+    }
+    log.info(`宣布 BET-${p.num}【${p.title}】获胜选项：${winnerOption}…`);
+    const result = await settlePredict(p, winnerOption, announcer, larkProfile ?? '');
+    if (!result.ok) { log.error(`结算失败：${result.error}`); process.exit(1); }
+    console.log(`BET-${p.num} 结算完成。总投注池: ${result.totalPool.toFixed(1)} LP  公益宝箱注资: ${result.chestContribution.toFixed(2)} LP`);
+    return;
+  }
+
+  // ── predict create ────────────────────────────────────────
+  if (sub === 'create') {
+    const title = getFlag(argv, 'title');
+    const optionsArg = getFlag(argv, 'options');
+    const endArg = getFlag(argv, 'end');
+    const maxBetArg = getFlag(argv, 'max-bet');
+    if (!title || !optionsArg) {
+      log.error('--title、--options 均为必填项。\n示例：agent predict create --title 标题 --options "A,B,C"');
+      process.exit(1);
+    }
+    const options = optionsArg.split(',').map(s => s.trim()).filter(Boolean);
+    if (options.length < 2) { log.error('至少需要 2 个选项'); process.exit(1); }
+    const endSec = endArg
+      ? Math.floor(Date.parse(endArg.includes('T') ? endArg : endArg.replace(' ', 'T')) / 1000)
+      : Math.floor(Date.now() / 1000) + 86400;
+    if (!Number.isFinite(endSec)) { log.error('--end 日期格式无效'); process.exit(1); }
+    const maxBet = maxBetArg ? parseFloat(maxBetArg) : 10;
+    const { id, num } = insertPredictProposal({ title, options, endTime: endSec, maxBetLp: maxBet });
+    console.log(`BET-${num} 已创建（id=${id}），topMessageId 待手动发送后回填。`);
+    return;
+  }
+
+  log.error(`未知子命令【${sub}】。运行 agent predict help 查看用法。`);
+  process.exit(1);
+}
+
+// ── Treasure Chest CLI ──────────────────────────────────────
+// Operator-facing subcommands for the chest module. In-group members use the "宝箱 …" chat command
+// (treasure-chest.ts's tryHandleChestCommand); this CLI is for operator setup/inspection — e.g. the
+// initial `agent chest create --name 公益宝箱 --owner ou_...` deployment step, though the community
+// prediction module also calls ensurePublicWelfareChest() itself on first settlement so this is
+// optional (see the implementation summary for the exact bootstrap sequence).
+
+async function cmd_chest(argv: string[]): Promise<void> {
+  const sub = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
+
+  if (!sub || sub === 'help') {
+    console.log([
+      '用法:',
+      '  agent chest create --name <名称> --owner <open_id>',
+      '  agent chest balance <名称>',
+      '  agent chest deposit <名称> --from <open_id> --amount <N>',
+      '  agent chest withdraw <名称> --to <open_id> --amount <N>',
+    ].join('\n'));
+    return;
+  }
+
+  process.env.AGENT_SOUL = DEFAULT_SOUL;
+
+  const { createChest, getChestByName, chestBalance, chestDeposit, chestWithdraw } = await import('../core/treasure-chest.js');
+
+  // ── chest create ──────────────────────────────────────────
+  if (sub === 'create') {
+    const name = getFlag(argv, 'name');
+    const owner = getFlag(argv, 'owner');
+    if (!name || !owner) { log.error('用法: agent chest create --name <名称> --owner <open_id>'); process.exit(1); }
+    const chestId = `chest:${name.trim()}`;
+    const { chest, created } = createChest({ chestId, name, ownerOpenId: owner });
+    console.log(created
+      ? `宝箱【${chest.name}】已创建（chest_id=${chest.chestId}，owner=${chest.ownerOpenId}）。`
+      : `宝箱【${chest.name}】已存在（owner=${chest.ownerOpenId}），未重复创建。`);
+    return;
+  }
+
+  // ── chest balance ─────────────────────────────────────────
+  if (sub === 'balance') {
+    const name = argv[2];
+    if (!name) { log.error('用法: agent chest balance <名称>'); process.exit(1); }
+    const chest = getChestByName(name);
+    if (!chest) { log.error(`找不到宝箱【${name}】`); process.exit(1); }
+    console.log(`宝箱【${chest.name}】余额：${chestBalance(chest.chestId).toFixed(1)} LP（owner=${chest.ownerOpenId}）`);
+    return;
+  }
+
+  // ── chest deposit ─────────────────────────────────────────
+  if (sub === 'deposit') {
+    const name = argv[2];
+    const from = getFlag(argv, 'from');
+    const amountArg = getFlag(argv, 'amount');
+    const amount = amountArg ? parseFloat(amountArg) : NaN;
+    if (!name || !from || !Number.isFinite(amount) || amount <= 0) {
+      log.error('用法: agent chest deposit <名称> --from <open_id> --amount <N>');
+      process.exit(1);
+    }
+    const chest = getChestByName(name);
+    if (!chest) { log.error(`找不到宝箱【${name}】`); process.exit(1); }
+    const result = chestDeposit(chest.chestId, from, amount);
+    if (!result.ok) { log.error(`存入失败：${result.error}`); process.exit(1); }
+    console.log(`已存入 ${amount.toFixed(1)} LP，宝箱【${chest.name}】当前余额：${result.balance.toFixed(1)} LP。`);
+    return;
+  }
+
+  // ── chest withdraw ────────────────────────────────────────
+  if (sub === 'withdraw') {
+    const name = argv[2];
+    const to = getFlag(argv, 'to');
+    const amountArg = getFlag(argv, 'amount');
+    const amount = amountArg ? parseFloat(amountArg) : NaN;
+    if (!name || !to || !Number.isFinite(amount) || amount <= 0) {
+      log.error('用法: agent chest withdraw <名称> --to <open_id> --amount <N>');
+      process.exit(1);
+    }
+    const chest = getChestByName(name);
+    if (!chest) { log.error(`找不到宝箱【${name}】`); process.exit(1); }
+    const result = chestWithdraw(chest.chestId, chest.ownerOpenId, to, amount);
+    if (!result.ok) { log.error(`转出失败：${result.error}`); process.exit(1); }
+    console.log(`已转出 ${amount.toFixed(1)} LP 给 ${to}，宝箱【${chest.name}】当前余额：${result.balance.toFixed(1)} LP。`);
+    return;
+  }
+
+  log.error(`未知子命令【${sub}】。运行 agent chest help 查看用法。`);
+  process.exit(1);
+}
+
 interface CliCommand {
   /** Command name plus any aliases. */
   names: string[];
@@ -2093,6 +2381,8 @@ const COMMANDS: CliCommand[] = [
   { names: ['heartbeat'], run: cmd_heartbeat },
   { names: ['meetup'], run: cmd_meetup },
   { names: ['tc'], run: cmd_tc },
+  { names: ['predict'], run: cmd_predict },
+  { names: ['chest'], run: cmd_chest },
   { names: ['fragment', 'fragments'], run: cmd_fragment },
 ];
 

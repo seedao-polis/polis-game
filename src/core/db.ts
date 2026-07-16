@@ -838,6 +838,83 @@ CREATE TABLE IF NOT EXISTS pending_welcome (
 );
 `;
 
+// Community Prediction module (predict_*) — per-soul db tables, discrete-option-only. Unlike TC,
+// there is no automatic settlement: a proposal is closed by a "predict_judge" badge holder manually
+// announcing the winning option (announced_by records who did it). end_time only gates bet acceptance
+// (no scheduler polls it), so the table carries no settled_value / thread_id columns TC needed.
+const SCHEMA_V34 = `
+CREATE TABLE IF NOT EXISTS predict_counter (
+  id       INTEGER PRIMARY KEY CHECK (id = 1),
+  next_num INTEGER NOT NULL DEFAULT 1
+);
+INSERT OR IGNORE INTO predict_counter(id, next_num) VALUES (1, 1);
+
+CREATE TABLE IF NOT EXISTS predict_proposals (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  num             INTEGER NOT NULL UNIQUE,
+  title           TEXT    NOT NULL DEFAULT '',
+  option_type     TEXT    NOT NULL DEFAULT 'discrete' CHECK (option_type = 'discrete'),
+  options         TEXT    NOT NULL DEFAULT '[]',
+  end_time        INTEGER NOT NULL,
+  min_bet_lp      REAL    NOT NULL DEFAULT 1.0,
+  max_bet_lp      REAL    NOT NULL DEFAULT 10.0,
+  status          TEXT    NOT NULL DEFAULT 'active',
+  created_by      TEXT    NOT NULL DEFAULT '',
+  chat_id         TEXT    NOT NULL DEFAULT '',
+  top_message_id  TEXT    NOT NULL DEFAULT '',
+  announced_by    TEXT    NOT NULL DEFAULT '',
+  settled_option  TEXT,
+  settled_at      INTEGER,
+  created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at      INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_predict_proposals_num
+  ON predict_proposals(num);
+CREATE INDEX IF NOT EXISTS idx_predict_proposals_status
+  ON predict_proposals(status);
+CREATE INDEX IF NOT EXISTS idx_predict_proposals_chat
+  ON predict_proposals(chat_id, status);
+CREATE INDEX IF NOT EXISTS idx_predict_proposals_top_msg
+  ON predict_proposals(top_message_id);
+`;
+
+// Bet records: same shape as tc_bets — no UNIQUE(proposal_id, user_open_id), since a user may bet
+// multiple times across options, accumulating toward the per-user max_bet_lp ceiling.
+const SCHEMA_V35 = `
+CREATE TABLE IF NOT EXISTS predict_bets (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  proposal_id   INTEGER NOT NULL REFERENCES predict_proposals(id),
+  user_open_id  TEXT    NOT NULL,
+  option_value  TEXT    NOT NULL,
+  lp_amount     REAL    NOT NULL,
+  message_id    TEXT    NOT NULL DEFAULT '',
+  is_refunded   INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_predict_bets_proposal
+  ON predict_bets(proposal_id);
+CREATE INDEX IF NOT EXISTS idx_predict_bets_user
+  ON predict_bets(user_open_id, proposal_id);
+CREATE INDEX IF NOT EXISTS idx_predict_bets_refund
+  ON predict_bets(proposal_id, is_refunded);
+`;
+
+// Treasure chests: owned virtual LP accounts. Balance lives in the shared pt_ledger/profiles under
+// chest_id as the account key (an opaque string, same as any open_id); this table only records
+// ownership metadata. is_public flags the one "公益宝箱" instance that automatically receives a
+// contribution on every community-prediction settlement (see predict-settlement.ts). Lives in the
+// shared LP database, alongside profiles/badges.
+const SCHEMA_V36 = `
+CREATE TABLE IF NOT EXISTS chests (
+  chest_id      TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,
+  owner_open_id TEXT NOT NULL,
+  is_public     INTEGER NOT NULL DEFAULT 0,
+  created_at    INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_chests_owner ON chests(owner_open_id);
+`;
+
 /** Apply ordered, idempotent schema migrations tracked in schema_migrations. */
 function runMigrations(db: Db): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -882,6 +959,9 @@ function runMigrations(db: Db): void {
     { version: 31, description: 'rename CVP module to TC: drop legacy cvp_* tables, ensure tc_* exist', sql: SCHEMA_V31 },
     { version: 32, description: 'memory_fragments (SeeDAO history trivia store, shared db, dedup by content_norm)', sql: SCHEMA_V32 },
     { version: 33, description: 'pending_welcome (batched newcomer-welcome queue drained by the 08:30/14:30/20:30 digest)', sql: SCHEMA_V33 },
+    { version: 34, description: 'predict_counter + predict_proposals (community prediction, discrete-only, judge-announced settlement)', sql: SCHEMA_V34 },
+    { version: 35, description: 'predict_bets (community prediction bet records)', sql: SCHEMA_V35 },
+    { version: 36, description: 'chests (owned virtual LP accounts, e.g. 公益宝箱)', sql: SCHEMA_V36 },
   ];
   for (const m of migrations) {
     if (applied.has(m.version)) continue;

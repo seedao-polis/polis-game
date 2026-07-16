@@ -123,17 +123,37 @@ export function computeTcSettlement(
     effectivePool = totalAllLp;
   }
 
-  // Two-tier distribution:
-  //   Tier 1: each winner group receives an equal share (effectivePool / G).
-  //   Tier 2: within each group, each bet row receives (groupShare * betLp / groupTotalLp).
+  const { winners, dust } = distributePool(winnerGroups, effectivePool);
+
+  return { settledValue, settledOption, totalPool: effectivePool, winners, dust };
+}
+
+/**
+ * Two-tier prize distribution over a set of winner groups (pure function, no DB or network side
+ * effects). Shared by every settlement flavour that has already decided WHO won — TC's automatic
+ * algorithm above (winner groups derived from a tie-breaking rule) and the community-prediction
+ * module's manual judge announcement (a single winner group = every bet on the announced option) both
+ * feed their winnerGroups into this same function so the payout math (tie handling, dust discarding,
+ * 0.1 LP flooring) is identical and defined in exactly one place.
+ *   Tier 1: each winner group receives an equal share (effectivePool / G) — ties split evenly, not by LP.
+ *   Tier 2: within each group, each bet row receives (groupShare * betLp / groupTotalLp) — proportional to stake.
+ * A winner group with zero bets (e.g. an announced option nobody backed) simply contributes no winners;
+ * its share becomes dust. Every payout is floored to 0.1 LP precision (decision 3); the undistributed
+ * remainder is returned as dust for the caller to log (never redistributed, never re-added to the pool).
+ */
+export function distributePool(
+  winnerGroups: Map<string, BetRow[]>,
+  effectivePool: number,
+): { winners: WinnerPayout[]; dust: number } {
   const G = winnerGroups.size;
-  const groupShare = effectivePool / G;
+  const groupShare = G > 0 ? effectivePool / G : 0;
 
   const winners: WinnerPayout[] = [];
   let distributed = 0;
 
   for (const [, groupBets] of winnerGroups) {
     const groupTotalLp = groupBets.reduce((s, b) => s + b.lpAmount, 0);
+    if (groupTotalLp <= 0) continue; // empty winner group (nobody bet on it) — its share becomes dust
     for (const wb of groupBets) {
       const personalShare = groupShare * (wb.lpAmount / groupTotalLp);
       // Floor to 0.1 LP precision per decision 3
@@ -151,7 +171,7 @@ export function computeTcSettlement(
   // fraction of that step, so rounding it at 0.1 would quantise away the very value being reported.
   const dust = Math.max(0, Math.round((effectivePool - distributed) * 1e6) / 1e6);
 
-  return { settledValue, settledOption, totalPool: effectivePool, winners, dust };
+  return { winners, dust };
 }
 
 // ── Side-effectful settlement (DB writes + LP grants + post update) ───────────

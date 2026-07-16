@@ -1150,6 +1150,7 @@ export function downloadMessageResource(
 export type PostElement =
   | { tag: 'text'; text: string }
   | { tag: 'md'; text: string }
+  | { tag: 'a'; text: string; href: string }
   | { tag: 'at'; user_id: string; user_name?: string }
   | { tag: 'img'; image_key: string };
 

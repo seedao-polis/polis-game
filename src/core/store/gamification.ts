@@ -139,6 +139,25 @@ export function hasPtGrantForRef(reason: string, refMessageId: string): boolean 
   return row != null;
 }
 
+/**
+ * Every LP ledger entry booked under a given (reason, ref_message_id) pair, oldest first.
+ * Lets a already-completed grant be re-read as the source of truth instead of being recomputed —
+ * e.g. re-rendering a settled post shows the amounts that were actually credited, so a later change
+ * to the payout formula can never make an old post disagree with its own ledger.
+ */
+export function ptGrantsForRef(
+  reason: string,
+  refMessageId: string,
+): Array<{ openId: string; delta: number }> {
+  if (!reason || !refMessageId) return [];
+  const rows = getLpDb()
+    .prepare(
+      'SELECT user_open_id, delta FROM pt_ledger WHERE reason = ? AND ref_message_id = ? ORDER BY id',
+    )
+    .all(reason, refMessageId) as Array<{ user_open_id: string; delta: number }>;
+  return rows.map((r) => ({ openId: String(r.user_open_id), delta: Number(r.delta) }));
+}
+
 /** A user's most recent LP ledger entries (newest first) — backs the "recent changes" query. */
 export function recentPtLedger(
   openId: string,
@@ -378,7 +397,12 @@ export function spendPt(openId: string, cost: number, reason: string, refMessage
 export function resetDailyPtFloor(floor = 10): { affected: number } {
   return lpTx(() => {
     const db = getLpDb();
-    const rows = db.prepare('SELECT open_id, pt_balance FROM profiles WHERE pt_balance < ?').all(floor) as Array<{ open_id: string; pt_balance: number }>;
+    // Exclude treasure-chest virtual accounts — the daily floor top-up is a member benefit, not
+    // something a chest (which may legitimately sit at/near 0 between deposits) should receive.
+    const rows = db.prepare(`
+      SELECT open_id, pt_balance FROM profiles
+      WHERE pt_balance < ? AND open_id NOT IN (SELECT chest_id FROM chests)
+    `).all(floor) as Array<{ open_id: string; pt_balance: number }>;
     for (const r of rows) {
       // delta brings the balance up to the floor; ledgerRaw applies it (balance + delta == floor).
       ledgerRaw(db, r.open_id, floor - r.pt_balance, 'daily_floor_reset');
@@ -397,7 +421,12 @@ export function resetDailyPtFloor(floor = 10): { affected: number } {
 export function resetAllPtTo(target = FIRST_CONTACT_PT, reason = 'manual_reset'): { affected: number; target: number } {
   return lpTx(() => {
     const db = getLpDb();
-    const rows = db.prepare('SELECT open_id, pt_balance FROM profiles').all() as Array<{ open_id: string; pt_balance: number }>;
+    // Exclude treasure-chest virtual accounts — a blanket community reset must never wipe out chest
+    // funds (e.g. the 公益宝箱's accumulated balance) by forcing them to the same target as members.
+    const rows = db.prepare(`
+      SELECT open_id, pt_balance FROM profiles
+      WHERE open_id NOT IN (SELECT chest_id FROM chests)
+    `).all() as Array<{ open_id: string; pt_balance: number }>;
     let affected = 0;
     for (const r of rows) {
       const delta = target - r.pt_balance;
@@ -559,6 +588,23 @@ export function hasFirstContact(openId: string): boolean {
     const row = getLpDb()
       .prepare("SELECT 1 FROM user_badges WHERE user_open_id = ? AND badge_id = 'first_contact' LIMIT 1")
       .get(cid(openId));
+    return !!row;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether a user holds a given badge. General-purpose role-permission check (badges double as roles,
+ * e.g. 'predict_judge' gates who may announce a community-prediction result), unlike hasFirstContact
+ * which is hardcoded to one badge id.
+ */
+export function hasBadge(openId: string, badgeId: string): boolean {
+  if (!openId || !badgeId) return false;
+  try {
+    const row = getLpDb()
+      .prepare('SELECT 1 FROM user_badges WHERE user_open_id = ? AND badge_id = ? LIMIT 1')
+      .get(cid(openId), badgeId);
     return !!row;
   } catch {
     return false;

@@ -34,6 +34,17 @@ import {
 import { buildTcProposalPost } from '../core/tc-post.js';
 import { sendPost } from '../core/lark.js';
 import { tryParseTcBet } from '../core/tc-bet-parser.js';
+import { tryHandleTcCommand } from '../core/tc-command.js';
+import {
+  insertPredictProposal,
+  updatePredictTopMessageId,
+  getPredictById,
+  listActivePredictsByChat,
+} from '../core/store/predict.js';
+import { buildPredictProposalPost } from '../core/predict-post.js';
+import { tryParsePredictBet } from '../core/predict-bet-parser.js';
+import { tryHandlePredictCommand } from '../core/predict-command.js';
+import { tryHandleChestCommand } from '../core/treasure-chest.js';
 import { isRecordSelfIntroCommand, handleRecordSelfIntro } from '../core/self-intro.js';
 import fs from 'node:fs';
 import {
@@ -464,6 +475,71 @@ export class FeishuBotChannel implements Channel {
         }
       }
 
+      // BET_CREATE deterministic path: intercepts [BET_CREATE: {...}] appended by the LLM.
+      // Same framework-executed pattern as TC_CREATE above, but community prediction is discrete-only
+      // (a judge announces a winning option later — see predict-command.ts) — a continuous optionType
+      // is rejected rather than created, since "announce a winning number" has no coherent semantics.
+      if (replyOk) {
+        const predictMatch = /\[BET_CREATE:\s*(\{[\s\S]*?\})\]/m.exec(reply);
+        if (predictMatch) {
+          reply = reply
+            .replace(/\[BET_CREATE:\s*\{[\s\S]*?\}\]/m, '')
+            .replace(/\n{3,}/g, '\n\n')
+            .trimEnd();
+          try {
+            const intent = JSON.parse(predictMatch[1]!) as {
+              title?: string;
+              optionType?: 'discrete' | 'continuous';
+              options?: string[];
+              endInMinutes?: number;
+              endTimeSec?: number;
+              maxBetLp?: number;
+            };
+            if (intent.optionType && intent.optionType !== 'discrete') {
+              log.warn(`BET_CREATE：拒绝创建（社区预测仅支持 discrete，收到 ${intent.optionType}）`);
+            } else if (intent.title && Array.isArray(intent.options) && intent.options.length >= 2) {
+              // Deadline derived from a RELATIVE duration (same reasoning as TC_CREATE): an LLM cannot
+              // produce a correct absolute unix timestamp. Community prediction never auto-settles at
+              // end_time — it only gates bet acceptance (see store/predict.ts header comment).
+              const nowSec = Math.floor(Date.now() / 1000);
+              const mins = Number(intent.endInMinutes);
+              const endTimeSec = Number.isFinite(mins) && mins > 0
+                ? nowSec + Math.min(Math.max(Math.round(mins), 1), 43200) * 60
+                : (Number.isFinite(intent.endTimeSec as number) && (intent.endTimeSec as number) > nowSec + 60
+                    ? (intent.endTimeSec as number)
+                    : nowSec + 86400);
+              const { id: predictId, num } = insertPredictProposal({
+                title: intent.title,
+                options: intent.options,
+                endTime: endTimeSec,
+                maxBetLp: intent.maxBetLp ?? 10,
+                createdBy: job.senderOpenId,
+                chatId: job.chatId,
+              });
+              const predictProposal = getPredictById(predictId);
+              if (predictProposal) {
+                const postContent = buildPredictProposalPost(predictProposal);
+                let topMsgId = '';
+                try {
+                  const sent = sendPost({ chatId: job.chatId }, postContent, { as: 'bot', profile });
+                  topMsgId = sent.messageId ?? '';
+                } catch (e) {
+                  log.warn(`BET_CREATE：发送制式提案消息失败（num=${num}）：${(e as Error).message}`);
+                }
+                if (topMsgId) {
+                  updatePredictTopMessageId(predictId, topMsgId);
+                }
+                log.info(`社区预测提案已创建：BET-${num}  id=${predictId}  title=${intent.title}  topMsgId=${topMsgId}`);
+              }
+            } else {
+              log.warn('BET_CREATE 解析失败：缺少必填字段（title / options）');
+            }
+          } catch (e) {
+            log.warn(`BET_CREATE 解析失败：${(e as Error).message}`);
+          }
+        }
+      }
+
       send(job.messageId, job.chatId, reply, job.isP2p);
       // Peer kickoff: after a genuine group reply, broadcast a cue so same-chat colleague agents can
       // opt into the conversation. Deterministic (not LLM-driven) so collaboration reliably appears.
@@ -604,6 +680,43 @@ export class FeishuBotChannel implements Channel {
         } catch { /* best-effort */ }
       }
 
+      // Community-prediction command pre-intercept (announce / cancel / query): deterministic,
+      // permissioned, runs BEFORE the predict bet parser so "预测 宣布 3 巴西" — which ends in a
+      // discrete option token — is never misread as a bet on the chat's active proposal. Announcing
+      // requires the predict_judge badge; cancelling accepts the proposal creator OR that badge.
+      if (senderOpenId) {
+        const predictCmd = tryHandlePredictCommand(text, senderOpenId, profile);
+        if (predictCmd !== false) {
+          log.info(`社区预测命令：${preview(predictCmd.reply)}`);
+          send(messageId, chatId, predictCmd.reply, isP2p);
+          return;
+        }
+      }
+
+      // Treasure-chest command pre-intercept (创建/存入/转出/查询): deterministic, runs BEFORE any bet
+      // parser so "宝箱 X 转出 @某人 3" — which ends in a number — is never misread as a bet. Deposit
+      // and withdrawal are gated on chest ownership inside tryHandleChestCommand itself.
+      if (senderOpenId) {
+        const chestCmd = tryHandleChestCommand(text, senderOpenId);
+        if (chestCmd !== false) {
+          log.info(`宝箱命令：${preview(chestCmd.reply)}`);
+          send(messageId, chatId, chestCmd.reply, isP2p);
+          return;
+        }
+      }
+
+      // TC command pre-intercept (cancel): deterministic, permissioned, runs BEFORE the bet parser so
+      // "@agent tc cancel <num>" — which ends in a number — is never misread as a bet on the chat's
+      // active proposal. Only the proposal creator or an admin may cancel; cancelling refunds all bets.
+      if (senderOpenId) {
+        const tcCmd = tryHandleTcCommand(text, senderOpenId, profile);
+        if (tcCmd !== false) {
+          log.info(`TC 命令：${preview(tcCmd.reply)}`);
+          send(messageId, chatId, tcCmd.reply, isP2p);
+          return;
+        }
+      }
+
       // TC bet pre-intercept: deterministic, bypasses the LLM entirely.
       // Association is by chat, not thread: the group event stream carries no thread id, so a
       // bet-syntax message (@agent <option> <LP>) is matched to the chat's active proposal. When a
@@ -625,6 +738,24 @@ export class FeishuBotChannel implements Channel {
         }
       }
       if (tcBetHandled) return;
+
+      // Community-prediction bet pre-intercept: deterministic, bypasses the LLM entirely. Same
+      // chat-scoped association and disambiguation rule as TC bets above, using BET-N tokens.
+      let predictBetHandled = false;
+      if (senderOpenId && chatId) {
+        const actives = listActivePredictsByChat(chatId);
+        const predictProposal = actives.length === 1
+          ? actives[0]
+          : actives.find(p => new RegExp(`\\bBET-${p.num}\\b`, 'i').test(text)) ?? null;
+        if (predictProposal) {
+          const betResult = tryParsePredictBet(text, predictProposal, senderOpenId, messageId ?? '', profile);
+          if (betResult !== false) {
+            predictBetHandled = true;
+            send(messageId, chatId, betResult.reply, isP2p);
+          }
+        }
+      }
+      if (predictBetHandled) return;
 
       // 收录自介 pre-intercept: deterministic, operator-only, bypasses the LLM. When an operator replies
       // to (or in the topic of) a newcomer's self-intro with "@我 收录自介", the self-intro's author is

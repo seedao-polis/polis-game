@@ -22,6 +22,7 @@ import {
 } from './store/tc.js';
 import { buildTcResultPost } from './tc-post.js';
 import { grantPt } from './store/gamification.js';
+import { queryPredictReply } from './predict-command.js';
 
 // ── command mode (pure code, no LLM / kimi) ───────────────────
 // After being triggered (@ or prefix), the message is passed here first: strip the leading @mention → split on whitespace,
@@ -683,10 +684,28 @@ export function dispatchCommand(raw: string, ctx: CommandContext): DispatchResul
     }
   }
 
+  // Community-prediction quick-query shorthand: "@土地神 BET-1" — same shape as the TC-N shorthand
+  // above. queryPredictReply is the single authoritative query implementation (predict-command.ts);
+  // this is only a lookup-table entry point, not a second implementation.
+  if (parsed) {
+    const predictNumMatch = /^bet-(\d+)$/i.exec(parsed.name);
+    if (predictNumMatch) {
+      const num = parseInt(predictNumMatch[1]!, 10);
+      return handle('predict-query', [String(num)], () => queryPredictReply(num));
+    }
+  }
+
   // Fuzzy daily check-in ("每日签到", "8/12 签") — layered on top of the exact 签 / 签到 aliases above.
   if (isFuzzyCheckIn(raw)) {
     const sign = lookup('sign');
     if (sign) return handle(sign.name, [], () => sign.run([], ctx));
+  }
+
+  // Fuzzy LP-balance query ("看我现在有多少 LP", "我还有多少积分") — answered by the lp command (current
+  // balance + last 3 changes) so a plain balance check is deterministic and never reaches the LLM.
+  if (isFuzzyLpQuery(raw)) {
+    const lp = lookup('lp');
+    if (lp) return handle(lp.name, [], () => lp.run([], ctx));
   }
 
   return { handled: false };
