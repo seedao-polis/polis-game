@@ -92,6 +92,17 @@ function larkExec(args: string[], opts: LarkExecOptions = {}): any {
 }
 
 /**
+ * Whether a larkExec result represents a successful call. lark-cli wraps EVERY command — native dotted
+ * commands (`im chat.members get`), `+command` shortcut wrappers, AND raw `api` passthrough — in an
+ * `{ ok, identity, data | error }` envelope, so success is `ok === true`. The legacy raw Feishu
+ * envelope (`{ code: 0, ... }`) is still accepted so an older CLI binary (version skew) keeps working.
+ * A failure is `{ ok: false, error: { code, message, ... } }`, which LarkApiError / isChatGoneError read.
+ */
+export function isLarkOk(res: any): boolean {
+  return res?.ok === true || res?.code === 0;
+}
+
+/**
  * Detect a Feishu rate-limit (HTTP 429 / frequency limit) from a larkExec result. Matches both the
  * structured envelope (error code 99991400) and the CLI's non-JSON crash text ("...HTTP 429..."),
  * which surfaces in `raw`. Deliberately narrow: only rate limits, not generic timeouts/crashes.
@@ -177,7 +188,7 @@ export function listChatMembers(chatId: string, opts: { profile?: string } = {})
     } catch {
       break; // transport blip (CLI produced no output) → return what we have so far
     }
-    if (res?.code !== 0) {
+    if (!isLarkOk(res)) {
       // Surface a permanent "chat gone / inaccessible" so the caller can stop servicing this chat;
       // swallow everything else (transient blip / partial page) and return what we gathered.
       const apiErr = new LarkApiError('读取群成员失败', res);
@@ -316,7 +327,7 @@ export function listEventAttendees(
     } catch {
       break; // transport blip → return what we have so far
     }
-    if (res?.code !== 0) break;
+    if (!isLarkOk(res)) break;
     const items: any[] = res.data?.items ?? [];
     for (const it of items) {
       const userId = typeof it?.user_id === 'string' ? it.user_id : '';
@@ -414,7 +425,7 @@ export function listWikiSpaces(opts: { profile?: string } = {}): WikiSpace[] {
     } catch {
       break;
     }
-    if (res?.code !== 0) break;
+    if (!isLarkOk(res)) break;
     const items: any[] = res.data?.items ?? [];
     for (const it of items) {
       const spaceId = typeof it?.space_id === 'string' ? it.space_id : '';
@@ -448,7 +459,7 @@ function listWikiChildNodes(spaceId: string, parentNodeToken: string, opts: { pr
     } catch {
       break;
     }
-    if (res?.code !== 0) break;
+    if (!isLarkOk(res)) break;
     const items: any[] = res.data?.items ?? [];
     for (const it of items) {
       const nodeToken = typeof it?.node_token === 'string' ? it.node_token : '';
@@ -527,7 +538,7 @@ export function createWikiNode(
       '--format', 'json'],
     { profile: opts.profile }
   );
-  if (res?.code !== 0) {
+  if (!isLarkOk(res)) {
     throw new LarkApiError(`创建知识库节点失败（space=${spaceId}）`, res);
   }
   const node = res?.data?.node;
@@ -618,7 +629,7 @@ function listDriveFolder(folderToken: string, opts: { profile?: string }): Drive
     } catch {
       break;
     }
-    if (res?.code !== 0) break;
+    if (!isLarkOk(res)) break;
     const files: any[] = res.data?.files ?? [];
     for (const f of files) {
       const token = typeof f?.token === 'string' ? f.token : '';
@@ -688,7 +699,7 @@ export function listFileViewRecords(
       ['drive', 'file.view_records', 'list', '--params', JSON.stringify(params), '--as', 'user', '--format', 'json'],
       { profile: opts.profile }
     );
-    if (res?.code !== 0) throw new LarkApiError('读取文档访问记录失败', res);
+    if (!isLarkOk(res)) throw new LarkApiError('读取文档访问记录失败', res);
     const items: any[] = res.data?.items ?? [];
     for (const it of items) {
       const viewerId = typeof it?.viewer_id === 'string' ? it.viewer_id : '';
@@ -937,9 +948,7 @@ export function getMessageById(
       ['api', 'GET', `/open-apis/im/v1/messages/${messageId}`, '--as', opts.as ?? 'bot', '--format', 'json'],
       { profile: opts.profile },
     );
-    // `api` passthrough envelopes signal success via code===0 (the +command wrappers use ok===true);
-    // accept either so this works regardless of which shape lark-cli returns.
-    if (!res || (res.ok !== true && res.code !== 0)) return null;
+    if (!isLarkOk(res)) return null;
     const m: any = (res.data?.items ?? [])[0];
     if (!m) return null;
     const senderFields = extractSenderFields(m.sender);
@@ -1087,7 +1096,7 @@ export function uploadImage(filePath: string, opts: { profile?: string } = {}): 
     ],
     { profile: opts.profile }
   );
-  if (res?.code === 0 && res.data?.image_key) return res.data.image_key as string;
+  if (isLarkOk(res) && res.data?.image_key) return res.data.image_key as string;
   return null;
 }
 
@@ -1129,7 +1138,7 @@ export function downloadMessageResource(
       { profile: opts.profile }
     );
     // Accept when the CLI reports success OR the file simply materialized (older CLI envelopes vary).
-    if ((res?.code === 0 || res == null) && fs.existsSync(abs) && fs.statSync(abs).size > 0) return abs;
+    if ((isLarkOk(res) || res == null) && fs.existsSync(abs) && fs.statSync(abs).size > 0) return abs;
     if (fs.existsSync(abs) && fs.statSync(abs).size > 0) return abs;
     return null;
   } catch {
@@ -1215,7 +1224,7 @@ export function updateMessage(
       ],
       { profile: opts.profile },
     );
-    return res?.code === 0 || res?.ok === true;
+    return isLarkOk(res);
   } catch {
     return false;
   }
@@ -1269,12 +1278,12 @@ export function recallMessage(
     ['im', 'messages', 'delete', '--message-id', messageId, ...asArgs, '--yes', '--format', 'json'],
     { profile: opts.profile }
   );
-  if (res?.code === 0) return { ok: true };
+  if (isLarkOk(res)) return { ok: true };
   return { ok: false, error: res?.error?.message ?? res?.msg ?? JSON.stringify(res) };
 }
 
-// reactions is a native OpenAPI command whose response envelope is { code: 0, data: {...} } (different from
-// the { ok: true } of +messages-*), so success is determined by code===0.
+// reactions is a native OpenAPI command; success is read through isLarkOk (ok===true, with legacy
+// code===0 accepted), same as every other lark-cli call.
 
 /**
  * Add an emoji reaction to a message as a visual "processing / thinking" indicator, returning the reaction_id
@@ -1302,7 +1311,7 @@ export function addReaction(
     ],
     { profile: opts.profile }
   );
-  if (res?.code === 0 && res.data?.reaction_id) return res.data.reaction_id;
+  if (isLarkOk(res) && res.data?.reaction_id) return res.data.reaction_id;
   return null;
 }
 
@@ -1326,7 +1335,7 @@ export function removeReaction(
     ],
     { profile: opts.profile }
   );
-  return res?.code === 0;
+  return isLarkOk(res);
 }
 
 /**
@@ -1340,7 +1349,7 @@ export function pinMessage(messageId: string, opts: { as?: 'user' | 'bot'; profi
     ['im', 'pins', 'create', '--data', JSON.stringify({ message_id: messageId }), ...asArgs, '--format', 'json'],
     { profile: opts.profile }
   );
-  return res?.code === 0;
+  return isLarkOk(res);
 }
 
 /**
@@ -1353,7 +1362,7 @@ export function unpinMessage(messageId: string, opts: { as?: 'user' | 'bot'; pro
     ['im', 'pins', 'delete', '--params', JSON.stringify({ message_id: messageId }), '--yes', ...asArgs, '--format', 'json'],
     { profile: opts.profile }
   );
-  return res?.code === 0;
+  return isLarkOk(res);
 }
 
 // ── calendar event write operations ──────────────────────────
@@ -1417,7 +1426,7 @@ export function createCalendarEvent(opts: {
   } catch {
     return null;
   }
-  if (res?.code !== 0) return null;
+  if (!isLarkOk(res)) return null;
 
   const ev = res.data?.event;
   const rawEventId = typeof ev?.event_id === 'string' ? ev.event_id : '';
@@ -1454,7 +1463,7 @@ export function addEventAttendees(calendarId: string, eventId: string, openIds: 
         '--as', 'user', '--format', 'json'],
       { profile: opts.profile }
     );
-    return res?.code === 0;
+    return isLarkOk(res);
   } catch {
     return false;
   }
@@ -1489,7 +1498,7 @@ export function updateCalendarEvent(opts: {
   if (opts.rrule) { args.push('--rrule', opts.rrule); }
   try {
     const res = larkExec(args, { profile: opts.profile });
-    return res?.code === 0 || res?.ok === true;
+    return isLarkOk(res);
   } catch {
     return false;
   }
@@ -1514,7 +1523,7 @@ export function cancelCalendarEvent(
         '--format', 'json'],
       { profile: opts.profile }
     );
-    return res?.code === 0;
+    return isLarkOk(res);
   } catch {
     return false;
   }

@@ -7,9 +7,7 @@
 ## 0. 最重要的三条（最容易踩坑）
 
 1. **对 SeeDAO 的每一条命令都要带 `--profile example_lark_profile`**（全局参数，放在子命令前面，例如 `lark-cli --profile example_lark_profile im +chat-list`）。不带就会悄悄回退到默认的旧应用，对 SeeDAO 群发消息会被 `230027` 拦截。环境变量（`LARK_PROFILE` 等）一律无效，只有 `--profile` 有效。
-2. **返回结构分两种，判断成功的字段不一样**：
-   - 带 `+` 的便捷命令（`im +messages-send` / `+messages-reply` / `+chat-list` / `+chat-messages-list`）返回 `{ "ok": true, "data": {...} }` → 看 `ok`。
-   - 原生 OpenAPI 命令（`im reactions ...` / `im messages delete` / `im chat.members ...`）返回 `{ "code": 0, "data": {...} }` → 看 `code === 0`。
+2. **判断成功一律用 `ok===true`，代码走 `isLarkOk(res)`（2026-07-14 起，lark-cli ≥1.0.69）**：CLI 已把**所有命令**（`+` 便捷命令、原生 OpenAPI 命令 `im reactions`/`messages delete`/`chat.members`、以及裸 `api` 透传）统一成 `{ "ok": true, "identity", "data" }` 信封——**成功不再有 `code` 字段**；失败是 `{ "ok": false, "error": { "code", "message" } }`。旧版原生命令曾返回 `{ "code": 0, "data" }`，所以 `src/core/lark.ts` 用 `isLarkOk(res) = res?.ok===true || res?.code===0`（保留旧 `code` 做版本兼容）统一判定。**本文件下方凡写「看 `code===0`」的历史结论都已由 `isLarkOk` 覆盖、以此为准**；来龙去脉见 §11。
 3. **破坏性操作要加 `--yes`**（例如撤回消息），否则报 "requires confirmation"。
 
 ## 1. 身份：`--as user` / `--as bot`
@@ -57,7 +55,7 @@
 - **只服务内部群（`external=false`）**。外部群（`external=true`）：user 发消息被 `230027`；机器人加群被 `232033`（除非后台发布【允许加入外部群】）。
 - 已知内部群：市政厅工作群、工作人员、AgentTasks（话题群）、AgentNotify。
 - 【SeeDAO 2.0 社区群】是外部群（`external=true`）。注意 SeeDAO 的 `tudigong-user` 现在 `listen:"all"`，**内外群都监听 + 采集 + 同步名册**（框架默认 `all-internal` 只内部群，但当前配置是 all）。
-- **取名字**：`contact +get-user --as user` 只能查**本租户**用户（外部 / 跨租户 open_id 返回空名）。要拿外部成员名字用群成员接口 **`im chat.members get --params '{"chat_id":"oc_xx","member_id_type":"open_id","page_size":100}' --as user`**（原生命令、看 `code===0`、`data.items[].name`、翻页看 `has_more`/`page_token`），它对跨租户成员也给名（飞书对未公开真名的跨租户用户只给【用户XXXXXX】式匿名名，这已是能拿到的极限）。`lark.listChatMembers(chatId)` 封装了它（回 open_id→name 的 Map）。
+- **取名字**：`contact +get-user --as user` 只能查**本租户**用户（外部 / 跨租户 open_id 返回空名）。要拿外部成员名字用群成员接口 **`im chat.members get --params '{"chat_id":"oc_xx","member_id_type":"open_id","page_size":100}' --as user`**（原生命令、判成功走 `isLarkOk`（§11）、`data.items[].name`、翻页看 `has_more`/`page_token`），它对跨租户成员也给名（飞书对未公开真名的跨租户用户只给【用户XXXXXX】式匿名名，这已是能拿到的极限）。`lark.listChatMembers(chatId)` 封装了它（回 open_id→name 的 Map）。
 - **成员名册 directory（`chat_members` 表，migration v9）**：和 `profiles` **分开存**（profiles 是游戏化表，每日 AP 补底会给所有 profile 补到 10，所以**不能**把整个社区名册塞进 profiles，否则给一堆没互动的人发 LP）。`feishu-user` 的 `rescan`（现在 **5 分钟**一轮，`lark.json` 的 `discovery.refreshMinutes`）会 `listChatMembers` 同步**所有监听群**（不分内外）的全部成员（含从没发言的人）进 `chat_members`：`store.syncChatMembers(chatId, rosterMap)` 把在群的人 upsert 成 `present=1`、新人计 added、**离开的人 `present=0` 但保留不删**（回来再翻回 1，不算新增）。
   - **改名也会更新**：每轮同步拿的是当前花名册名字，`ON CONFLICT` 用新名覆盖旧名（非空才覆盖），改名计入 `renamed`（日志会报【改名 N 人】）。同步还会顺手刷新**已存在的 profile** 名字（`UPDATE ... WHERE open_id=? `，**只更新、不新建**，避免给非互动者建 profile 触发 LP），所以互动者改名后 `{{name}}`/AP footer/排行榜也跟着更新。
   - 显示名取名顺序（`silentMemberReport` 的 COALESCE）：**`chat_members` 名册（每 5 分钟刷新、能反映改名）排第一** → 采集 `sender_name`（消息发出时定格、会过时）→ profiles 名 → 最后 open_id。`store.memberName(openId)` 取名册里 `last_seen` 最新的名。事件实时查到的名缓存进 `chat_members`（`recordChatMember`，**不写 profiles**）。
@@ -72,6 +70,7 @@
 - 改机器人名字没有 API，只能后台改名 + 发布版本。
 - 在 Windows 上通过 `node <run.js>` 调 lark-cli，避开 `.cmd` 包装和中文 / emoji 参数的编码问题。
 - **`code=2200 / "Internal Error"` 是飞书服务端瞬时抖动（≈5xx），不是群改名导致**：群改名不改 `chat_id`，轮询按 `chat_id` 读，改名永远不会让读消息失败。判断是不是瞬时：同一群隔一会儿再读一次，`ok:true` 就是瞬时。`listMessages`/`listChats` 失败现在抛 `LarkApiError`（带 `code`/`log_id`/`retryable`，`isTransientLarkError` 判定 2200 / 非 JSON 崩溃 / timeout 为可重试）。`feishu-user` 轮询对瞬时错误：头几次只记 `WARN`、靠下一轮 4s 轮询自愈（游标只在成功后推进，不丢消息）；连续失败 ≥3 次或不可重试才升级 `ERROR` 并按 `2^n` 退避到最多 60s，避免刷屏。
+  - **⚠️ 2200 的文案会伪装成 scope 报错，别被骗去重新授权（2026-07-15 实测）**：同一次 2200 抖动里，飞书网关会对不同群随机吐出不同文案——`Internal Error` / `internal error` / **`check incr user_access_token scope fail`** 都见过，全是 `code=2200`。看到「scope fail」字样先别慌重登：真缺 scope 是**每一轮每个 user 轮询都固定报**、且是 `99991679`/`230027`（`missing_scope`/`user_unauthorized`），不是 `2200`。识别瞬时的铁证：①同一时间窗（如 13 秒内）**内外群一起挂**、文案还不一致；②`auth status` 显示 `tokenStatus: valid` 且 `im:message:readonly` / `im:message.group_msg:get_as_user` / `im:message.p2p_msg:get_as_user` 都在；③手动重读同一群 `ok:true`。三者满足就是飞书那头的事，`isTransientLarkError` 靠 `code===2200` 已正确判可重试并自愈（**注意**：其消息正则 `/internal error|timeout|.../` 并**不**匹配「check incr … scope fail」，全靠 code 分支兜住），无需任何操作。真要修才走 §10 覆盖式 `auth login`（现有全部 scope + `offline_access` 并集）。案发日志见 `logs/20260714_224700.log:117-120`。
 
 ## 7.5 群消失 / 被踢 / 错误信封外漏（2026-06-18 修，重点）
 
@@ -124,4 +123,25 @@
 - `drive file.view_records list`：**谁看了某文档 + 最近一次访问时间**（`viewer_id`/`name`/`last_view_time` 秒；一访问者一条、是【最近一次】不是逐次流）。**必须文档 owner 或可管理(admin) 才读得到，edit/read 一律 `forbidden`(1069603)**。wiki 文档用节点的 `obj_token`+`obj_type`（不是 node_token+wiki）。
 - `drive file.statistics get`：聚合 `uv/pv`（只有人数、没有【谁】），**edit 权就能读**。
 - 妙记 `minutes minutes get` 无任何 view/统计字段（拿不到访问记录）；**bot 加不进 wiki 空间**（成员只能用户/部门，`+member-add --member-type appid` 无效）→ 知识库访问采集**只能用 user(操作者) 身分**，且 操作者 要是该空间 admin（实测【数字城邦】是 admin 能读全空间）。
+
+## 11. lark-cli 1.0.69 信封统一 → 全命令看 `ok`、`isLarkOk` 兜底（2026-07-14 事故，重点）
+
+> **本节是本文件所有「信封 / 判成功」问题的权威结论。上文任何写「看 `code===0`」的地方都已被它覆盖。**
+
+- **症状**：升级 lark-cli 到 **1.0.69** 后，`serve` 日志每 5 分钟刷屏 `群成员同步【…】：本轮取到空名册（疑似临时失败），跳过本轮以免误判全员离开`，**每个群都空**。不是临时失败，是回归——所有群成员、wiki、日历、drive 等**原生命令拿到的数据整体为空**。
+- **根因**：1.0.69 把**所有命令**的输出信封统一了，成功信封**去掉了 `code` 字段**：
+
+  | | 旧（≤1.0.68） | 新（≥1.0.69） |
+  |---|---|---|
+  | 成功 | `{ code: 0, data }` | `{ ok: true, identity, data }`（**无 `code`**） |
+  | 失败 | `{ code, msg }` | `{ ok: false, error: { code, message, subtype, log_id } }` |
+
+  连**裸 `api` 透传**（`api GET/POST/PUT`）也一起改成 `ok`（推翻了旧 §0/§10 里「透传看 `code`」的说法）。旧代码 `listChatMembers` 的成功闸门是 `if (res?.code !== 0) break;`，`code` 消失后 `undefined !== 0` 恒为真 → 第一页没读就 break → 返回空 Map → 触发「空名册」跳过。
+- **修复**（`src/core/lark.ts`）：新增 `export function isLarkOk(res) { return res?.ok===true || res?.code===0; }`（`||` 保留旧 `code` 做版本回退兼容），把全部 **21 处** `res.code===0` / `res.code!==0` 成功判断统一改走它（`listChatMembers`/`event.attendees`/`wiki spaces`/`drive files`/`file.view_records`/建 wiki 节点/`createCalendarEvent`/`addReaction`/`pin`/`recall` 等）。**错误检测**（`LarkApiError`/`isChatGoneError`/`isChatInaccessibleError`/`isTransientLarkError`）本来就读 `res.error.code`/`res.error.message`，**无需改**——群解散 `232009`、被踢等判定照常（见 §7.5）。
+- **验证**：`npx tsc -p tsconfig.build.json` 绿 → `listChatMembers(围观群)` 真跑回 **409 人**（对得上 CLI 的 `member_total`），此前是 0；全量测试 279/279 过。
+- **部署**：serve 跑 `dist`，改核心档要 `npx tsc -p tsconfig.build.json` 重建 + **完整重启 serve** 才生效（`npm run build` 在本机被 rtk 改写报 `Missing script`，用 `npx tsc -p tsconfig.build.json`）。
+- **今后规矩**：新写任何 lark 调用的成功判断**一律 `isLarkOk(res)`，绝不写裸 `res.code`**；见到某类 lark 数据「整体为空 / 空名册刷屏」，先怀疑 lark-cli 又改信封。
+- **旁注（与本次无关）**：同时段 `[telegram] 推送失败…HTTP 429 retry after 32` 是 **Telegram Bot API 限流**（多半启动时通知打太密），代码已自带退避（约每 30s 静默重试）会自愈，**不是 lark-cli 升级引起的**，别去动 lark 代码。见 [[telegram-playbook]]。
+
+相关：[[local-db-playbook]]（成员同步落库）、[[activity-meetup-playbook]]（日历原生命令）、§7.5（群消失 / 错误信封）。
 

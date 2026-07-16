@@ -17,6 +17,7 @@
 - **档位独立**：`emit()` 在本地 `LOG_LEVEL` 闸门**之前**调 `pushLogLine`，所以 Telegram 用自己的 `TELEGRAM_LOG_LEVEL`——本地 info、Telegram 可 debug，互不影响。
 - **双进程各推各的**：supervisor 和 worker 都跑 `cmd==='serve'`、都 `enableLogSink()`，各一份缓冲，靠 `[sup]`/`[wkr]` 前缀区分（worker 看 `AGENT_WORKER`）。
 - **批量限频**（Telegram 单聊约 1 msg/s）：缓冲日志行，每 `flush_ms` 合并成**一条**发；单条 ≤4096（留头到 3500）；一批切多条时每条间隔 1100ms。**绝不一行一发**（必被 429 + 刷屏）。
+- **`HTTP 429 retry after N` 会自愈、别慌**：日志见 `[telegram] 推送失败，进入退避（约每 30s 重试一次、期间静默）：HTTP 429` 是 Telegram Bot API 限流（多半启动时一波通知打太密），代码已自带退避重试、会自己恢复，**本地文件日志始终完整**，不用管。**它跟 lark-cli 无关**——2026-07-14 lark-cli 升级同时段冒出来过，别误以为是飞书那边的问题去改 lark 代码（那次真正的 bug 是信封变更，见 [[lark-cli-playbook]] §11）。
 - **debug 洪流安全阀**：单进程缓冲超 800 行就压成头 50 + 尾 50 + 【省略 N 行】，避免一次发几百条。完整日志始终在本地文件。
 - **防递归**：`telegram.ts` 绝不 import/调 `log.*`，自身报错只 `process.stderr.write`（否则 推送失败→打日志→又推→死循环）。
 - **只在 serve 启用**：`enableLogSink()` 只在 serve 调；flush 定时器 `unref()`，所以一次性 CLI 命令不会把日志推到 Telegram（进程先退）。

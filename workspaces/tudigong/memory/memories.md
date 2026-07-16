@@ -56,15 +56,15 @@
 
 - 操作飞书前先读 `memory/lark-cli-playbook.md`（lark-cli 踩坑经验与命令速查）。
 - 对 SeeDAO 的每条 lark-cli 命令都要带 `--profile example_lark_profile`，否则回退旧应用、对 SeeDAO 群被 `230027` 拦。
-- 返回结构：`im +xxx` 便捷命令看 `ok`；原生命令（`reactions` / `messages delete` 等）看 `code===0`。
+- **返回结构（2026-07-14 起，lark-cli ≥1.0.69）：所有命令（便捷 `im +xxx`、原生 `reactions`/`messages delete`/`chat.members`、裸 `api` 透传）统一 `{ ok, identity, data|error }`，判成功一律 `ok===true`，代码走 `isLarkOk(res)=res?.ok===true||res?.code===0`（保留旧 `code` 兼容）。** 旧版原生命令看 `code===0` 的结论已过时；升级后「群成员同步空名册」全群刷屏就是没改这个，详见 `lark-cli-playbook.md §11`。
 - 话题群（如 AgentTasks）回复要用 `im +messages-reply --message-id om_xxx --reply-in-thread`，别用 `+messages-send`（会另开新话题）。
 - **话题回复必须带 thread 上下文 + 会话键按话题隔离（2026-06-17 修，细节见 lark-cli-playbook §2）**：bot 只收被 @ 的消息，话题原帖（@ 别的 agent）收不到，直接回会丢上下文；回复前用 `store.getThreadContext(thread_id)` 把同话题历史灌进 `respondAsync` 的 `context`，会话键加 `-${threadId}` 避免话题串味。
 - 【思考中】表情 emoji_type = `Status_PrivateMessage`（`Thinking` / `ThinkingFace` 无效）。
-- 撤回消息用 `im messages delete --message-id <om_xxx> --as bot --yes`（原生命令、看 `code===0`、必须 `--yes`；只能由发送者身份撤回——事件是 bot 发的就 `--as bot`）；lark-cli 没有编辑消息的命令，发错只能撤回重发。已封装成 `lark.recallMessage(messageId,{as,profile})` + CLI **`pnpm agent unsend <message_id> [--as bot|user]`**。`pnpm agent event` 发送成功后会打印 `message_id=…` 和现成的 `撤回：pnpm agent unsend <id>` 命令。
+- 撤回消息用 `im messages delete --message-id <om_xxx> --as bot --yes`（原生命令、判成功走 `isLarkOk`（见上 / §11）、必须 `--yes`；只能由发送者身份撤回——事件是 bot 发的就 `--as bot`）；lark-cli 没有编辑消息的命令，发错只能撤回重发。已封装成 `lark.recallMessage(messageId,{as,profile})` + CLI **`pnpm agent unsend <message_id> [--as bot|user]`**。`pnpm agent event` 发送成功后会打印 `message_id=…` 和现成的 `撤回：pnpm agent unsend <id>` 命令。
 - 在话题群建新话题：直接 `im +messages-send`（不带 reply）就会开一个新话题，标题写在内容首行（飞书没有单独设置话题标题的接口）；富文本用 `--markdown`。
 - 给 SeeDAO 飞书群发帖 / 回复用简体中文 + 大陆用语；中文强调 / 书名 / 标签一律用【】。
 - 多行 / emoji 内容通过临时 node 脚本用 `execFileSync` 当参数传，避开 shell 引号转义与编码问题。
-- **群消失 / 被踢的智慧处理（2026-06-18，详见 lark-cli-playbook §7.5）**：`232009` = 群已解散（永久，立即停轮+标记）；被踢/无权限 = 不可访问（连续 3 次才停轮、被拉回会自动恢复）。两个根因坑：`larkExec` 的 `execFileSync` 要设 `stdio:['ignore','pipe','pipe']` 否则 lark-cli 错误信封漏到日志；`listChatMembers` 改成对确定性错误抛错（原本绝不抛错 → 解散检测是死代码），且空名册=临时失败要跳过别误判全员离开。
+- **群消失 / 被踢的智慧处理（2026-06-18，详见 lark-cli-playbook §7.5）**：`232009` = 群已解散（永久，立即停轮+标记）；被踢/无权限 = 不可访问（连续 3 次才停轮、被拉回会自动恢复）。两个根因坑：`larkExec` 的 `execFileSync` 要设 `stdio:['ignore','pipe','pipe']` 否则 lark-cli 错误信封漏到日志；`listChatMembers` 改成对确定性错误抛错（原本绝不抛错 → 解散检测是死代码），且空名册=临时失败要跳过别误判全员离开。**⚠️ 但空名册也可能是伪装的回归**：2026-07-14 lark-cli 升 1.0.69 改信封（成功去掉 `code`），成功闸门恒 break → 全群空名册刷屏，那次不是临时失败而是 bug，修法见 `lark-cli-playbook.md §11`。
 
 ## 开发规范（日志 / 注释）
 
