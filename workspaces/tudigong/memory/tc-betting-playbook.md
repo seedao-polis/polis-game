@@ -71,8 +71,16 @@
 8. grantPt 发给各赢家；无输家照样跑（决策2，不特判）；noBonusWhenNoLoser=true 时无输家只退本金
 ```
 
-- **纯函数、可独立单测**（`src/core/tc.test.ts` 23 个用例覆盖平手 / 单人 / 全同选项 / dust / 计数器原子性）。
-- **浮点注意**：`Math.floor(x*10)/10` 受 JS 浮点影响——`5.25` 下舍后 dust=0、`7.35` 上进后 dust=0.1（**不是**直觉的 0.05）。测试预期值按实际浮点行为写，别照算术直觉。
+- **纯函数、可独立单测**（`src/core/tc.test.ts` 覆盖平手 / 单人 / 全同选项 / dust / 计数器原子性）。`distributePool`（层一层二 + floor + dust）**被社区预测共用**，改它两个模块一起动，见 [[community-prediction-playbook]]。
+
+### 5.1 ⚠️ dust 精度：本篇旧结论是错的（2026-07-16 更正）
+
+**旧版本这里写过**：「`5.25` 下舍后 dust=0、`7.35` 上进后 dust=0.1（**不是**直觉的 0.05）……测试预期值按实际浮点行为写，别照算术直觉」。**这条是错的，且正是 bug 活下来的原因**——它把缺陷描述成 JS 的固有行为、还叫后人别信算术直觉，于是 `tc.test.ts` 里三个用例把错值写成期望（有个用例名还自称 `(float rounding)`），bug 有测试覆盖却照样存活一年。
+
+- **真正的根因不是浮点，是量化**：旧写法 `Math.round((pool-paid)*10)/10` 把零头**取整到 0.1**，而零头按定义就是 0.1 这个 floor 步长的**余数**——不管有没有浮点噪声都必然被磨平。浮点只决定磨向哪边：`7.35-7.3` 的真值 0.05 被进位成 0.1，`5.25-5.2` 的同样 0.05 被舍成 0。**直觉的 0.05 才是对的。**
+- **现写法**：`Math.max(0, Math.round((pool-paid)*1e6)/1e6)`。**取整精度必须比 0.1 步长细**；`Math.max(0,…)` 保留原本想防的事（噪声让减法变 -1e-15），因为 payout 全 floor，distributed 不可能合法超过 pool。日志别再 `toFixed(1)` 二次四舍五入（直接 `${dust}`）。
+- **教训（比 dust 本身重要）**：**测试跟着实现的观察值写，就只是把 bug 钉死**。期望值要从**规格**推（pool − Σpayout 该是多少），实现与规格不符时改实现、不是改期望。playbook 里写「别照直觉」之前先问：是直觉错了，还是实现错了。
+- dust **只进日志、不影响任何发放**，所以这次修复不动任何人的 LP。
 
 ---
 
@@ -132,7 +140,7 @@ agent tc create --title <标题> --type <discrete|continuous> --options <A,B,C �
 - **测试**：`node --import tsx --test "src/**/*.test.ts"`。上线时 205/205 通过（原 182 + TC 新增 23）。
 - **端对端留待 serve 环境验证**（无网 / 无凭证环境测不了）：`[TC_CREATE]` 真发群、投注扣款 + 原帖更新、到期结算 `grantPt`、`updateMessage` 对真实飞书 API 的兼容性。
 - **研究 / 计划 / 施工**：`thoughts/shared/{research,plan,coding}/2026-07-09-betting-survey-tc-module-*.md`（含完整需求决策、算法伪码、DDL、对接点总表）。
-- **实现与计划的 3 处偏差**：① 测试放 `src/core/tc.test.ts`（非 `__tests__/`，跟随既有惯例）；② dust 测试预期按浮点实际值修正（见 §5）；③ `noBonusWhenNoLoser` 配置路径是 `cfg.lark.tc`（非 `cfg.tc`）。
+- **实现与计划的 3 处偏差**：① 测试放 `src/core/tc.test.ts`（非 `__tests__/`，跟随既有惯例）；② ~~dust 测试预期按浮点实际值修正~~ **这条已于 2026-07-16 撤销**——当时是把 bug 写成了期望值，dust 真值就是算术直觉的 0.05，见 §5.1；③ `noBonusWhenNoLoser` 配置路径是 `cfg.lark.tc`（非 `cfg.tc`）。
 
 ---
 

@@ -65,6 +65,16 @@
 - 指令命中后频道写 `activities('command', {command,args})`（badge/level 的数据源）。
 - 命令注册在 `commands.ts` 的 `COMMANDS` 数组（加一个对象即可，help 自动列出）；命令能拿 `ctx.senderOpenId`。
 
+### 6.1 账本 = 事实来源（按 ref 反查，2026-07-16）
+
+`pt_ledger` 每行带 `ref_message_id`（发奖锚定的那条消息，如 TC/BET 原帖 `om_xxx`）。三个按 ref 的查法，用途别混：
+
+- `hasPtGrantForRef(reason, ref)` → **幂等闸门**（这条消息发过这种奖没有）。
+- `ptGrantsForRef(reason, ref)` → **回全部 `{openId, delta}`，按 id 排序**（2026-07-16 加）。用于**把已发生的发放读回来**而不是重算——`agent predict refresh <num>` 重绘已结算原帖就靠它（见 [[community-prediction-playbook]] §2）。
+- `recentPtLedger(openId, n)` → 某人最近流水。
+
+**原则：帖子是账本的渲染，账本才是事实。** 有人质疑金额，先 `sqlite3 .agent/shared.db "select * from pt_ledger where ref_message_id='om_…'"` 再下结论——2026-07-16 BET-2 那次「+5% 是不是算错」就是这样 3 分钟证伪的（钱一直对，见 [[community-prediction-playbook]] §4）。重绘历史消息也一律从账本读，**别重算**：日后改公式才不会把旧帖改成另一个数。
+
 ## 7. 部署 / 注意
 
 - **要生效跑 `pnpm agent update`**（build + 给 serve 发 SIGHUP 热重载；新 worker 开 DB 自动跑迁移）。`pnpm build` 只编译，不会让运行中的 serve 换代码。

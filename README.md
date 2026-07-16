@@ -55,6 +55,8 @@ agent events                                  列出已定义的事件
 agent event <编号|id> [--test] [--to <oc/ou>] [--dry-run]   手动触发一个事件
 agent meetup create|edit|cancel|digest|list [...]   活动 / Meetup 模块：预约飞书会议（含视频会议 + 循环）、编辑 / 取消、手动播报今日活动、列表（社区成员也可 @ 或自然语言预约；详见 activity-meetup-playbook）
 agent tc list|show|cancel|settle|create [...]   意向调查模块 TC：列出 / 查看 / 撤销退款 / 强制结算 / 建提案（社区成员 @ 城邦土地神自然语言发起、群内 @ 投注（按群关联）、加权平均（社区意向）结算按 LP 占比瓜分奖池；CLI create 只写 DB 不发飞书，端对端走 @bot；详见 tc-betting-playbook）
+agent predict list|show|refresh|cancel|announce|create [...]   社区预测模块 BET：列出 / 查看 / 重绘原帖 / 撤销退款 / 宣布结果 / 建提案（仿 TC 但**仅离散选项**，结果由持有【社区预测裁判】徽章者人工宣布，不自动结算；奖池＝总投注×1.05（5% 给赢家），另额外铸造奖池×10% 注入公益宝箱；refresh 用当前模板重绘已发原帖，settled 从 LP 账本读回不重算；详见 community-prediction-playbook）
+agent chest create|balance|deposit|withdraw [...]   宝箱模块：owner 专属的虚拟 LP 账户（创建需【宝箱怪的朋友】徽章，存入 / 转出仅 owner）；【公益宝箱】每次社区预测结算自动注资
 agent badge import <json_file>               导入徽章定义（JSON 单对象或数组；模板见 create-badge skill）
 agent badge award <徽章> <对象...> [--note <文本>] [--dry-run]  给一个或多个成员发放徽章（对象=open_id 或飞书显示名）
 agent badge list [对象]                       列出全部徽章定义，或某成员持有的徽章
