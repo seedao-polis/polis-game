@@ -608,6 +608,96 @@ export function insertDocxImage(
   }
 }
 
+/** Newly-inserted image block: its block_id plus the uploaded media's file_token. */
+export interface InsertedImageBlock {
+  blockId: string;
+  fileToken: string;
+}
+
+/**
+ * Upload a local image and append it as an image block at the END of a docx via `docs +media-insert`,
+ * returning the created block_id and media file_token. Unlike {@link insertDocxImage} the caller gets
+ * the block_id, so the block can subsequently be relocated (e.g. moved into a table cell with
+ * {@link moveDocxBlocksAfter}). `filePath` must be relative to the current working directory (lark-cli
+ * rejects absolute out-of-tree paths). `width` sets the display width in px (height auto-scales for
+ * PNG/JPEG/GIF). Returns null on any failure; never throws.
+ */
+export function insertDocxImageBlock(
+  documentId: string,
+  filePath: string,
+  opts: { profile?: string; width?: number } = {}
+): InsertedImageBlock | null {
+  try {
+    const args = ['docs', '+media-insert',
+      '--doc', documentId,
+      '--file', filePath,
+      '--type', 'image',
+      '--as', 'user',
+      '--format', 'json'];
+    if (opts.width) args.push('--width', String(opts.width));
+    const res = larkExec(args, { profile: opts.profile });
+    if (res?.ok !== true) return null;
+    const blockId = typeof res?.data?.block_id === 'string' ? res.data.block_id : '';
+    const fileToken = typeof res?.data?.file_token === 'string' ? res.data.file_token : '';
+    return blockId ? { blockId, fileToken } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Move existing blocks to sit immediately after `anchorBlockId` (becoming its siblings, i.e. children
+ * of the anchor's parent) via `docs +update --command block_move_after`. Passing the empty paragraph
+ * inside a table cell as the anchor relocates the sources INTO that cell. Returns true on success,
+ * false on any failure; never throws.
+ */
+export function moveDocxBlocksAfter(
+  documentId: string,
+  anchorBlockId: string,
+  srcBlockIds: string[],
+  opts: { profile?: string } = {}
+): boolean {
+  if (!anchorBlockId || srcBlockIds.length === 0) return false;
+  try {
+    const res = larkExec(
+      ['docs', '+update',
+        '--api-version', 'v2',
+        '--doc', documentId,
+        '--command', 'block_move_after',
+        '--block-id', anchorBlockId,
+        '--src-block-ids', srcBlockIds.join(','),
+        '--as', 'user',
+        '--format', 'json'],
+      { profile: opts.profile }
+    );
+    return res?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fetch a docx's full body as the block-XML string (with block ids), used to locate blocks for
+ * subsequent targeted edits. Returns '' on any failure; never throws.
+ */
+export function fetchDocxRawContent(documentId: string, opts: { profile?: string } = {}): string {
+  try {
+    const res = larkExec(
+      ['docs', '+fetch',
+        '--doc', documentId,
+        '--scope', 'full',
+        '--detail', 'with-ids',
+        '--as', 'user',
+        '--format', 'json'],
+      { profile: opts.profile }
+    );
+    const content = res?.data?.document?.content;
+    return typeof content === 'string' ? content : '';
+  } catch {
+    return '';
+  }
+}
+
 /**
  * List the files and folders directly under a Drive folder (the user's root when folderToken is
  * empty), paging until exhausted. Native command — success is code===0, entries in data.files.

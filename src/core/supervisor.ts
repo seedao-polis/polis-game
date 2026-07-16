@@ -17,6 +17,7 @@ import { settleTc } from './tc-settlement.js';
 import { chatMemberOpenIds } from './store/members.js';
 import { buildNewcomerWelcomePost } from './self-intro.js';
 import { generateMeetupWikiMarkdown } from './meetup-wiki.js';
+import { refreshBadgeWiki } from './badge-wiki.js';
 import { checkUserTokenExpiry } from './token-watch.js';
 import { purgeExpiredMemories, listKnownChatIds } from './store/memory.js';
 import { aggregateGroupTopics } from './group-intel.js';
@@ -711,6 +712,36 @@ function scheduleDailyMeetupWikiUpdate(): void {
   }, next.getTime() - now.getTime());
 }
 
+// ── daily badge wiki fallback refresh (05:00) ───────────────
+// Safety net so the "徽章列表" wiki page re-syncs from the DB catalogue once a day even if a badge
+// definition changed outside the CLI trigger points (e.g. a direct DB edit). The CLI import / delete
+// paths already refresh on change; this only covers drift. Deterministic render + overwrite, no LLM.
+
+/**
+ * Overwrite the "徽章列表" wiki page at 05:00 each day from the current badge catalogue. A pure
+ * fallback for changes that bypassed the `badge import` / `badge delete` triggers. Self-reschedules
+ * to 05:00 the next day.
+ */
+function scheduleDailyBadgeWikiUpdate(): void {
+  const now = new Date();
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 5, 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+
+  setTimeout(() => {
+    try {
+      const profile = eventSendProfile();
+      if (refreshBadgeWiki({ profile })) {
+        log.info('05:00 徽章列表 wiki 已刷新。');
+      } else {
+        log.warn('05:00 徽章列表 wiki 刷新失败或未配置 badgeWikiDocId。');
+      }
+    } catch (e) {
+      log.error('05:00 徽章列表 wiki 刷新失败：', (e as Error).message);
+    }
+    setTimeout(scheduleDailyBadgeWikiUpdate, 0); // re-anchor to the next 05:00
+  }, next.getTime() - now.getTime());
+}
+
 // ── TC settlement scheduler (every minute) ──────────────────
 // Polls for expired active TC proposals and settles them.
 // Runs immediately on startup (setTimeout 0) to catch proposals that expired during downtime.
@@ -866,6 +897,7 @@ export function runSupervisor(opts: SupervisorOptions): Promise<void> {
   scheduleSessionJanitor();
   scheduleDailyMeetupDigest();     // daily 08:00 today's meetup broadcast → 围观群
   scheduleDailyMeetupWikiUpdate(); // daily 08:01 overwrite "SeeDAO 活动日历" wiki page
+  scheduleDailyBadgeWikiUpdate();  // daily 05:00 fallback refresh "徽章列表" wiki page
   scheduleWelcomeDigest();         // 08:30/14:30/20:30 batched newcomer welcome → 围观群
   scheduleTcSettlement();         // every minute: scan for expired TC proposals and settle them
   startChild();

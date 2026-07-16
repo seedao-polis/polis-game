@@ -33,5 +33,7 @@
   "activityWikiNodeToken": "ExampleWikiNodeToken",
   "activityWikiDocId": "ExampleWikiDocId",
   "visitorMilestoneWikiNodeToken": "wikcnExampleVisitorNode",
-  "visitorMilestoneWikiDocId": "doxcnExampleVisitorDoc"
+  "visitorMilestoneWikiDocId": "doxcnExampleVisitorDoc",
+  "badgeWikiNodeToken": "wikcnExampleBadgeNode",
+  "badgeWikiDocId": "doxcnExampleBadgeDoc"
 }

@@ -54,6 +54,7 @@ import {
   listUpcomingMeetups,
 } from '../core/store/meetups.js';
 import { generateMeetupWikiMarkdown, refreshMeetupWiki } from '../core/meetup-wiki.js';
+import { refreshBadgeWiki } from '../core/badge-wiki.js';
 
 // Load .env (Node >=20.12 built-in) so secrets like TELEGRAM_* reach process.env without a dotenv
 // dependency. Must run before anything reads the env; tolerant of a missing .env (env may come from
@@ -710,6 +711,8 @@ async function cmd_badge(argv: string[]): Promise<void> {
       '  agent badge import <json_file> [--profile <p>]      导入徽章定义（JSON 单对象或数组）',
       '  agent badge award <badge-ref> <target> [--profile <p>] [--note <text>] [--dry-run]  发放徽章',
       '  agent badge list [target]                           列出徽章（无参数=全部定义，有参数=成员持有）',
+      '  agent badge delete <badge-ref> [--profile <p>]      删除徽章定义（连同其持有记录）',
+      '  agent badge wiki-sync [--profile <p>]               手动把徽章列表刷到飞书 wiki 页面',
     ].join('\n'));
     process.exit(1);
   }
@@ -781,6 +784,8 @@ async function cmd_badge(argv: string[]): Promise<void> {
       imported++;
     }
     console.log(`共导入 ${imported} 条徽章定义。`);
+    // Mirror the updated catalogue to the "徽章列表" wiki page (non-fatal on failure / when unconfigured).
+    if (imported > 0) syncBadgeWikiAfterChange(profile);
     return;
   }
 
@@ -973,8 +978,55 @@ async function cmd_badge(argv: string[]): Promise<void> {
     return;
   }
 
+  // badge delete <badge-ref>
+  if (sub === 'delete') {
+    const badgeRef = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
+    if (!badgeRef) {
+      log.error('用法: agent badge delete <badge-ref> [--profile <p>]');
+      process.exit(1);
+    }
+    const badge = store.getBadge(badgeRef);
+    if (!badge) {
+      log.error(`找不到徽章【${badgeRef}】。用 agent badge list 查看可用徽章。`);
+      process.exit(1);
+    }
+    const removed = store.deleteBadge(badge.badgeId);
+    if (!removed) {
+      log.error(`删除失败：徽章【${badge.badgeId}】未被删除（可能已不存在）。`);
+      process.exit(1);
+    }
+    console.log(`已删除徽章定义：${badge.badgeId}（${badge.headline || badge.name}），并清除其持有记录。`);
+    syncBadgeWikiAfterChange(profile);
+    return;
+  }
+
+  // badge wiki-sync — manually rebuild the "徽章列表" wiki page from the current catalogue.
+  if (sub === 'wiki-sync') {
+    const ok = refreshBadgeWiki({ profile });
+    if (ok) console.log('徽章列表 wiki 页面已刷新。');
+    else {
+      log.error('徽章列表 wiki 刷新失败或未配置 badgeWikiDocId。');
+      process.exit(1);
+    }
+    return;
+  }
+
   log.error(`未知 badge 子命令：${sub}。用 agent badge help 查看用法。`);
   process.exit(1);
+}
+
+/**
+ * Push the current badge catalogue to the "徽章列表" wiki page after a definition create / update /
+ * delete. Best-effort: logs the outcome but never throws or exits, so a wiki hiccup can't fail the
+ * underlying badge operation (which has already committed to the DB).
+ */
+function syncBadgeWikiAfterChange(profile?: string): void {
+  try {
+    if (refreshBadgeWiki({ profile })) log.info('徽章列表 wiki 页面已自动刷新。');
+    else log.warn('徽章列表 wiki 未刷新（未配置 badgeWikiDocId 或写入失败）。');
+  } catch (e) {
+    log.warn(`徽章列表 wiki 刷新异常：${(e as Error).message}`);
+  }
 }
 
 async function cmd_daily_reset(argv: string[]): Promise<void> {

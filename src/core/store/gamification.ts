@@ -303,21 +303,15 @@ export function findOpenIdsByName(name: string): Array<{ openId: string; name: s
   return rows.map((r) => ({ openId: r.open_id, name: r.name }));
 }
 
-/**
- * Retrieve a badge definition by badge_id or name (badge_name). Returns the full row including
- * all v17 fields, or undefined if no match is found.
- */
-export function getBadge(ref: string): {
+/** Full badge definition row (all v17 fields). Shared by getBadge / listBadgeDefinitions. */
+export interface BadgeDefinition {
   badgeId: string; name: string; description: string; emoji: string;
   headline: string; file: string; title: string; type: string; role: string;
   endorser: string; duration: string; category: string; event: string;
-} | undefined {
-  const db = getLpDb();
-  const row = db.prepare(`
-    SELECT badge_id, name, description, emoji, headline, file, title, type, role, endorser, duration, category, event
-    FROM badges WHERE badge_id = ? OR name = ? LIMIT 1
-  `).get(ref, ref) as Record<string, unknown> | undefined;
-  if (!row) return undefined;
+}
+
+/** Map a raw badges row to a BadgeDefinition, coalescing every optional column to ''. */
+function rowToBadgeDefinition(row: Record<string, unknown>): BadgeDefinition {
   return {
     badgeId: row['badge_id'] as string,
     name: row['name'] as string,
@@ -335,10 +329,55 @@ export function getBadge(ref: string): {
   };
 }
 
+/**
+ * The full badge catalogue with every v17 field, ordered by creation time. Unlike {@link listBadges}
+ * (which projects only the columns the profile view needs), this returns complete definitions so the
+ * wiki renderer can show type / duration / description without a second query.
+ */
+export function listBadgeDefinitions(): BadgeDefinition[] {
+  const rows = getLpDb()
+    .prepare('SELECT badge_id, name, description, emoji, headline, file, title, type, role, endorser, duration, category, event FROM badges ORDER BY created_at')
+    .all() as Record<string, unknown>[];
+  return rows.map(rowToBadgeDefinition);
+}
+
+/**
+ * Delete a badge definition by badge_id or name, together with every holding of it in user_badges
+ * (the FK would otherwise block the delete). Deleting a badge is a catalogue-level operation — the
+ * grants disappear with it. Returns true when a definition was removed, false when the ref matched
+ * nothing. Runs in a single transaction so the badge and its holdings are removed atomically.
+ */
+export function deleteBadge(ref: string): boolean {
+  return lpTx(() => {
+    const db = getLpDb();
+    const row = db.prepare('SELECT badge_id FROM badges WHERE badge_id = ? OR name = ? LIMIT 1').get(ref, ref) as { badge_id?: string } | undefined;
+    if (!row?.badge_id) return false;
+    db.prepare('DELETE FROM user_badges WHERE badge_id = ?').run(row.badge_id);
+    db.prepare('DELETE FROM badges WHERE badge_id = ?').run(row.badge_id);
+    return true;
+  });
+}
+
+/**
+ * Retrieve a badge definition by badge_id or name (badge_name). Returns the full row including
+ * all v17 fields, or undefined if no match is found.
+ */
+export function getBadge(ref: string): BadgeDefinition | undefined {
+  const db = getLpDb();
+  const row = db.prepare(`
+    SELECT badge_id, name, description, emoji, headline, file, title, type, role, endorser, duration, category, event
+    FROM badges WHERE badge_id = ? OR name = ? LIMIT 1
+  `).get(ref, ref) as Record<string, unknown> | undefined;
+  return row ? rowToBadgeDefinition(row) : undefined;
+}
+
 export function leaderboard(limit = 10): Array<{ openId: string; name: string; ptBalance: number }> {
   const db = getLpDb();
+  // Exclude treasure-chest virtual accounts (chests.chest_id): they are LP storage, not participants,
+  // and would otherwise crowd out real members once a chest accumulates a large balance.
   const rows = db.prepare(`
     SELECT open_id, name, pt_balance FROM profiles
+    WHERE open_id NOT IN (SELECT chest_id FROM chests)
     ORDER BY pt_balance DESC
     LIMIT ?
   `).all(limit) as Record<string, unknown>[];

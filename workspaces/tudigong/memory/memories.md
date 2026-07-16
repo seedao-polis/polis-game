@@ -17,7 +17,7 @@
 | 事件系统、推播、迎新、定时 + 随机触发 | `event-system-playbook.md` |
 | 新建一个事件（填模板） | `event-creation-prompt-template.md` |
 | LP 点数经济、评分机制（按交流判定）、每日签到 / 补底 | `pt-gamification-playbook.md` |
-| 徽章导入 / 发放 / 查询 | `badge-system-playbook.md` |
+| 徽章导入 / 发放 / 查询 / 删除；徽章列表 wiki 自动同步（badge-wiki.ts 定义变更即刷 + 05:00 supervisor 兜底、7 栏模版 徽章·名称·类型·事件·说明·效果·期限） | `badge-system-playbook.md` |
 | 社区推播里程碑事件（人数 / 报名 / 徽章公告） | `community-notify-events-playbook.md` |
 | 运营数据日报 / 月报（深色图表） | `ops-report-playbook.md` |
 | 社区动态周报（每周四 21:00 → 飞书 wiki 建页、Markdown 五面向、写 wiki 的 scope 与截断坑）；**手动写单篇文档到 wiki**（不走周报管线、serve 运行时安全） | `weekly-report-playbook.md` |

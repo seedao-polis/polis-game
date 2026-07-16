@@ -102,6 +102,10 @@ export interface LarkFile {
   visitorMilestoneWikiNodeToken?: string;
   /** Docx obj_token for the "访客里程碑" page; used by appendDocxContent to overwrite the page. */
   visitorMilestoneWikiDocId?: string;
+  /** Wiki node token for the "徽章列表" page (used to construct the wiki URL). */
+  badgeWikiNodeToken?: string;
+  /** Docx obj_token for the "徽章列表" page; used by appendDocxContent to overwrite the page. */
+  badgeWikiDocId?: string;
 }
 
 export interface KimiProfile {
