@@ -77,7 +77,7 @@ window.PROFILE_DATA = {
       { name: '课程报名里程碑推播', status: '上线', desc: '课程报名跨 10/25/40/50/60/75/90 人时推播围观群。' },
       { name: '围观群人数里程碑推播', status: '上线', desc: '围观群人数每达 100 整数倍时自动推播。' },
       { name: '市政厅提案决议通知', status: '上线', desc: '市政厅做出决议时手动触发推播运营群。' },
-      { name: '点赞狂魔里程碑', status: '上线', desc: '用户累计点赞跨 6 的倍数时，奖励 LP+20 并推播围观群。' },
+      { name: '点赞狂魔里程碑', status: '上线', desc: '成员一周内点赞达 66 次时，奖励 LP+20 并推播围观群，每人每周一次。' },
       { name: '热门消息自动置顶', status: '上线', desc: '消息获 ≥N 人不同表情反应时自动置顶（阈值由配置驱动）。' },
       { name: 'A2A 暗线广播（代理协作）', status: '上线', desc: '飞书 bot 互不可见，通过 data/peer-bus 暗线信箱传递协作 cue。' },
       { name: '多人多群记忆隔离', status: '上线', desc: '四层命名空间（global / group / user / group_user），严格隔离，A 无法读取 B 的记忆。' },

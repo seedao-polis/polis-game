@@ -70,11 +70,13 @@
 
 ## 11. 点赞狂魔 `like-maniac-notify`（2026-07-03）
 
-社区成员累计点赞（表情反应）跨 **6 的倍数**时触发，目标 = 围观群，奖励 **LP+20**。这是第一个以【表情反应】为来源信号的事件，需要先建一整套【反应采集】机制。
+社区成员**在一个逻辑周内**点赞（表情反应）达 **66 次**时触发，目标 = 围观群，奖励 **LP+20**，每人每周只发一次。这是第一个以【表情反应】为来源信号的事件，需要先建一整套【反应采集】机制。
+
+> **⚠️ 本节旧版写的是「累计跨 6 的倍数」，那是初版规则，代码早已改成【一周内 66 次】，2026-07-17 才发现记忆和公开档案都还停在旧规格（`docs/data.js` 也一起改了）。判据以代码 `LIKE_MANIAC_WEEKLY_THRESHOLD` 与事件正文为准——事件正文「此事件在社区成员一周内点赞达 66 次时发生」一直是对的。**
 
 - **数据来源（关键发现）**：`im +chat-messages-list` **不带 `--no-reactions`** 时，每条消息内联返回 `reactions.details[]`——含 `emoji_type`、`operator.operator_id`（点赞者 open_id）、`operator.operator_type`（`user`/`app`）、`action_time`（unix 秒）。所以**不用逐条消息额外调 API**，轮询消息列表就能拿到反应。主轮询循环用 `--no-reactions` 抑制它省流量；`listMessages(chatId,{includeReactions:true})`（`src/core/lark.ts`）保留并解析成 `LarkMessage.reactions: MessageReaction[]`。
 - **累计计数**：新表 **`chat_reactions`（migration v21）**，PK `(message_id, reactor_open_id, emoji_type)`——同一人对同一条消息同一表情**只算一次**（`recordChatReaction` 用 `INSERT OR IGNORE`、返回是否新插入）。某人累计点赞数 = `memberReactionCount(openId)` = `COUNT(*) by reactor`（`src/core/store/reactions.ts`）。
-- **触发轮询 `syncChatReactions`**（`feishu-user.ts`，挂 discovery cadence、跟 syncMembers 同周期、排在其后好让名字先入库）：对每个**非工作群**（`getChatTier(chatId)!=='work'`）取**最近 18 则**消息（`REACTION_SCAN_MESSAGES`、对应模板【近 18 则讯息】）的反应，逐条 `recordChatReaction`，累计本轮每人新增数；某人 `floor(now/6) > floor((now-delta)/6)` 即跨越 6 的倍数 → `fireEvent('like-maniac-notify', {actorOpenId, vars:{member_name}})`。
+- **触发轮询 `syncChatReactions`**（`feishu-user.ts`，挂 discovery cadence、跟 syncMembers 同周期、排在其后好让名字先入库）：对每个**非工作群**（`getChatTier(chatId)!=='work'`）取**最近 18 则**消息（`REACTION_SCAN_MESSAGES`、对应模板【近 18 则讯息】）的反应，逐条 `recordChatReaction`，累计本轮每人新增数；对本轮有新增的人算 `weeklyMemberReactionCount(openId, 本逻辑周)`，达 `LIKE_MANIAC_WEEKLY_THRESHOLD`（=66）且本周没发过 → `fireEvent('like-maniac-notify', {actorOpenId, vars:{member_name}})`。**每人每周一次的闸门落在 `like_maniac_weeks` 账本**（`recordLikeManiacWeek` 幂等），不是内存里的跨越判断——内存判断一重启就会重发，且迟到的跨周反应会误触发。
 - **首轮基线 guard**：第一轮只**播种**已存在的历史反应（记库、不触发里程碑），用 state cursor `feishu-reactions-seed-<profile>`（`lastPosition===1`=已播种、跨重启保留）标记；否则启动即把一堆旧反应判成跨越、群里刷屏。对照 §7 的【上一轮 vs 本轮】通用模式，只是多了首轮播种。
 - **排除项**：`operator_type!=='user'`（滤掉 bot/app 反应）、`reactor===botOpenId`（bot 自己）、`emoji_type ∈ {reactionEmoji, queuedReactionEmoji}`（`Status_PrivateMessage`/`OnIt` 是「思考中/排队」进度指示，非真点赞）。**操作者不排除**（他也是居民，符合【只排除 bot】惯例）。
 - **事件定义**：静态 `scope:'global'`、`overlays:[]`、`imageHeight:128`、`gapLines:1`，底图 `assets/events/like-maniac-notify-bg.png`（图床 `i.meee.com.tw/wR0g7BZ.png` 落地，1254²，不叠字）。标题 `点赞狂魔 {{member_name}} 出现了`（**去掉模板里的引号**，遵 §3【标题纯文字】）；正文把 `member_name` 当**粗体文字**（不是可点 @，为保运营者写的粗体句式，@ 无法嵌进 md 粗体）。`prepare()` 只挂 `afterSend` 发 LP+20 给 `opts.actorOpenId`（发成功才发奖）。
@@ -83,6 +85,14 @@
 ## 12. 热门消息自动置顶（2026-07-03，**不是事件、是飞书运营动作**）
 
 某消息被**去重 ≥N 人**按表情反应就**自动置顶**（Feishu Pin），跟 §11 的表情采集共用同一次 `listMessages({includeReactions:true})` 抓取，但**独立于事件系统**（不发图、不发公告、不进 events.ts，纯 `im pins` 操作）。生产目标=**围观群**，阈值 **3**、**仅当天(逻辑日)消息**。
+
+> **⚠️ 本功能曾静默死了两周（2026-07-04 → 07-17），根因是 lark-cli 1.0.69 把 `create_time` 人性化 → 裸 `Number()` = NaN → 「仅当天」闸门对每条消息判否。完整根因与两个命令家族的模型见 [[lark-cli-playbook]] §11.1。**
+> **本节旧版把它写成「功能正常」，是又一次「playbook 把错的写成规格」。诊断口径：**
+> - **别信 playbook、别信帖子，先查 DB。** `pinned_messages` 全表只有一行、`pinned_at` 停在 07-04，一眼就能看出功能死了；而日志「置顶 0 条」看起来完全正常。
+> - **反应入库和置顶判定在同一个循环、同一份 `msg.reactions` 上**。所以「点赞进得来但没置顶」＝扫描看得见消息，只可能是 pin 的四个前置条件之一挡的，不是采集问题。
+> - **没有 `热门消息置顶失败` 警告 ≠ 没尝试**。那条 warn 只在 `pinMessage()` 返回 false 时打；条件判断挡掉时**一声不吭**。现已给「时间解析不出来」补了 warn 分支。
+
+
 
 - **飞书 Pin API（实测于运营小天地，已清理）**：`im pins create --data '{"message_id":"om_xxx"}' --as bot`（建，看 `code===0`）/ `im pins list --params '{"chat_id":"oc_xxx"}'`（查）/ `im pins delete --params '{"message_id":"om_xxx"}' --yes`（移除，**`--yes` 是命令旗标、不能塞 params**，我踩过一次）。bot / user 身份都行，需 scope `im:message.pins:write_only`（SeeDAO 应用已具备），**bot 必须在群里**否则失败。封装成 `lark.pinMessage/unpinMessage(messageId,{as,profile})`（best-effort 返回 boolean，绝不抛）。
 - **配置驱动、不写死群 id**：`configs/chat-policies.json` 每群加 `"autoPinMinReactors": 3` 即启用（缺省/0=不启用）；helper `getAutoPinThreshold(chatId)`（`src/core/configs.ts`）。目前只在**围观群**开。要加群改 config 即可、但**改 config 要重启 serve**（chat-policies 有缓存）。
@@ -129,17 +139,61 @@
 - `SELF_INTRO_REWARD_PT=60`、`SELF_INTRO_GRANT_REASON='welcome:self-intro'`（也是幂等键）。文案 `SELF_INTRO_BODY_LINES` 为**逐字固定**：「欢迎你自我介绍一下自己… 怎么来到 SeeDAO：/ 对参与 SeeDAO 的期待：/ 可以给予 SeeDAO 的支持：」+ 「只要自我介绍完成，就能获得 60 LP 奖励（社区积分点数，可用于社区各项活动中）。」**改文案只动这里**。
 - `buildNewcomerWelcomePost(joiners)`→ `sendPost` 用的 `{title,content:PostElement[][]}`：首段 `{tag:'at'}` @ 每位新人（**上限 12**，超出用「等 N 位新朋友」概括），随后固定文案。无有效 open_id 返回 null。
 - `isRecordSelfIntroCommand(text)`：剥前导 @mention/`[/!]` 前缀后 `^收录自介(\s|$)`（整词，"收录自介绍"/"帮我收录自介" 不算）。
-- `handleRecordSelfIntro({commandMessageId,eventParentId,senderOpenId,profile})`：**仅 `isAdmin` 白名单**（configs/admins.json）可发。**关键（2026-07-13 修）**：事件信封**没有 parent_id/root_id**，所以拿「收录自介」这条消息的 `commandMessageId` **fetch 它自己**（`getMessageById`）→ `resolveSelfIntroTarget` 取 `rootId||parentId`（rootId＝话题**第一条**＝自介开场白，「一路回溯到最初那条讯息」的语义就靠它）→ 再 `getMessageById(targetId)` 取自介作者。`store.hasPtGrantForRef(reason,targetId)` 幂等（**按自介消息 id、每条只发一次**）；`grantPt(author,60,reason,targetId)`。成功回复＝`已收录 X 的自我介绍，发放 60 LP 🎉` + **`buildStatusFooter(author,60)`**（发奖后算，出 `\n\n[乔伊] 🌱 LP : 119.9 → 179.9 (+60.0)` 标准状态行，别自己拼「当前 LP」）。无权限/追溯不到/追到的是 app 机器人消息/已收录 都返回对应提示、不抛。**旧版直接用 `ev.parent_id` → 事件里恒空 → 永远回「请引用」**（土地神迎新 2026-07-13 实测踩到，乔伊自介收录不了）。
+- `handleRecordSelfIntro({commandMessageId,eventRootId,eventParentId,senderOpenId,profile})`：**仅 `isAdmin` 白名单**（configs/admins.json）可发。`resolveSelfIntroTarget` 取 `eventRootId||eventParentId`（rootId＝回复链**第一条**＝自介开场白，「一路回溯到最初那条讯息」的语义就靠它），信封没带才退回 `getMessageById(commandMessageId)` 兜底 → 再 `getMessageById(targetId)` 取自介作者。`store.hasPtGrantForRef(reason,targetId)` 幂等（**按自介消息 id、每条只发一次**）；`grantPt(author,60,reason,targetId)`。成功回复＝`已收录 X 的自我介绍，发放 60 LP 🎉` + **`buildStatusFooter(author,60)`**（发奖后算，出 `\n\n[乔伊] 🌱 LP : 119.9 → 179.9 (+60.0)` 标准状态行，别自己拼「当前 LP」）。无权限/追溯不到/追到的是 app 机器人消息/已收录 都返回对应提示、不抛。
+
+  > **⚠️ 2026-07-17 订正一条错记忆（本文旧版把错的写成了规格，害了两次）**
+  > 旧版写「事件信封**没有 parent_id/root_id**，所以必须 fetch 命令消息自己」。**前半句只对了一半，后半句是错的**。实测 213 个信封：
+  > - `parent_id` **一个都没有**（这个观察是对的）；
+  > - 但 `reply_to`、`root_id`、`thread_id` **都在**（37/213 带 reply_to+root_id，正好等于回复类消息数）。
+  >
+  > **真相是两种形状字段名不同**，不是信封没东西：
+  > | 来源 | 直接父消息 | 链根 |
+  > |---|---|---|
+  > | OpenAPI `GET /im/v1/messages/<id>`、list API | **`parent_id`** | `root_id` |
+  > | 事件流 `event consume` 信封 | **`reply_to`** | `root_id` |
+  >
+  > 2026-07-13 那次真正的 bug 是**把 OpenAPI 的字段名套到了事件信封上**（读 `ev.parent_id` → 恒空）。当时结论下成「信封没东西」，于是加了一次本来不需要的 `getMessageById` 往返，还把这句话写进 playbook 和记忆。后果：2026-07-17 群里回复场景踩了同一个根因（`feishu-bot.ts` 同样读 `ev.parent_id`，回复指向的原文全丢，土地神拿「你怎么看这个发言」去点评了另一条自介）；排查时**两个 subagent 都被这句注释骗**，双双建议「加 getMessageById 回捞」——去调 API 拿一个信封里本来就有的字段。
+  >
+  > 现在统一走 `replyLinkageFromEvent(ev)`（`src/core/lark.ts`），字段名由 `src/core/lark.test.ts` 用**真实信封**钉死（含一条「只有 reply_to、没有 root_id 可兜底」的测试，专防 root_id 兜底把错字段名掩盖过去）。
 
 **迎新触发＝攒一波、定时统一 @（2026-07-13 改：不再每 5 分钟即时发）**：每 5 分钟太密、时间又长，改成**累积到固定时段统一欢迎**：
 - **入队（`feishu-user.ts` 成员同步轮）**：只在**围观群** `VISITOR_WATCH_CHAT_ID` + `watchPrev>0`（跳过某群首次同步把全体旗标为 joined 的 bulk）+ `r.joinedMembers.length>0` 时 `store.enqueuePendingWelcome(chatId, joinedMembers)`（**不再即时 `sendPost`**）。`joinedMembers` 每人只在首次出现时出现、入队 `INSERT OR IGNORE`（PK `chat_id+open_id`）→ 不会重复；离开又回来（行仍在）不算 joined。新表 **`pending_welcome`（migration v33、per-soul db）**、store `enqueue/list/clearPendingWelcome`（members.ts）。
 - **播报（`supervisor.ts scheduleWelcomeDigest`，每天 08:30 / 14:30 / 20:30）**：`nextWelcomeDigestTime` 取三时段中最近的一次、fire 后 re-anchor；`runWelcomeDigest` 读队列 → **只留仍在群的**（`chatMemberOpenIds([chatId])` 过滤，期间进又退的丢掉）→ `buildNewcomerWelcomePost(joiners, 50)` 一条消息 @ 全部（cap 50 只防病态 @ 风暴）→ `sendPost` as bot → `clearPendingWelcome` 清空整队。空队列静默。**需 `--sup`**（同 meetup/ops 播报，`--bot --sup` 标准模式：--sup 的采集器跑成员同步入队、supervisor 跑播报）。确定性发送**不过 outbound-guard**（guard 只在 `mcp-server.ts` LLM 发送路径）。
 - 改时段动 `WELCOME_DIGEST_TIMES`；改单批 @ 上限动 `WELCOME_DIGEST_MAX_MENTIONS`；`buildNewcomerWelcomePost(joiners, maxMentions=12)` 第二参可调 cap。
 
-**`收录自介` 触发（群，`feishu-bot.ts`）**：在 LLM 前、TC-bet 拦截之后加确定性 pre-intercept：`isRecordSelfIntroCommand(text)` → `handleRecordSelfIntro({commandMessageId: messageId, eventParentId: ev.parent_id, …})` → `send` 回复。bot 只收到被 @ 的消息，运营在**自介所在话题里**（回复 / 引用自介，或话题下）@ 土地神写「收录自介」即可——**不需精确引用**，框架 fetch 命令消息拿 `root_id` 自动回溯到自介开场白。`eventParentId` 只是给「事件恰好带了 parent_id」的兜底 hint。
+**`收录自介` 触发（群，`feishu-bot.ts`）**：在 LLM 前、TC-bet 拦截之后加确定性 pre-intercept：`isRecordSelfIntroCommand(text)` → `handleRecordSelfIntro({commandMessageId: messageId, eventRootId, eventParentId, …})`（后两者来自 `replyLinkageFromEvent(ev)`）→ `send` 回复。bot 只收到被 @ 的消息，运营在**自介所在话题里**（回复 / 引用自介，或话题下）@ 土地神写「收录自介」即可——**不需精确引用**，信封自带的 `root_id` 直接回溯到自介开场白，**不用再 fetch 命令消息**（见上方订正框）。
 
 **关掉旧 LLM 干欢迎**：`HEARTBEAT.md` 城邦巡查行删「新加入成员尚未被招呼」并注明「迎新已由框架自动处理，心跳不要再手动欢迎」；「框架自动跑的」加迎新一行；`heartbeat.ts` 提示词示例把「招呼新成员」换成「引导长期潜水成员…迎新已由框架自动处理」。
 
 **已删 P2P `welcome-party` DM（2026-07-13，用户要求）**：原「首次 @ 机器人 → 私信迎新图文」入口整个移除——`events.ts` 删 `registerEvent('welcome-party')` 块 + 清空 `TRIGGERS`（原唯一规则 `first_interaction_welcome`，`souls:['tudigong']`、闸门 `hasSuccessfulDispatch('welcome-party',openId)`）。触发框架 `checkAndFireTriggers`/`TRIGGERS: TriggerRule[]=[]` 保留为扩展点（feishu-bot.ts 仍调、空数组 no-op）。孤儿资源 `assets/events/welcome-party/base.png` 留在磁盘（无引用、无害，要清可删）。迎新现在**只有**围观群确定性群发一条路径。
 
 **改了核心档（feishu-user/feishu-bot/lark/gamification/events/db/store.members/supervisor/self-intro）要 `npx tsc -p tsconfig.build.json`（本机 rtk 改写 `npm run build`→Missing script，用 npx tsc）重建 dist + 完整重启 serve 才生效**（supervisor 排程不热重载，改时段/新增 v33 迁移必**完整重启** serve）。测试 `src/core/self-intro.test.ts`（含 `pending_welcome` 队列）。
+
+---
+
+## 16. 群里「回复某条消息 + @ 土地神」的上下文（2026-07-17 事故修复）
+
+**症状**：白鱼**回复**阿坚 3.5 小时前的长发言、@ 土地神问「你怎么看这个发言」，土地神跑去点评了**另一条无关的自我介绍**（李沁/Gloria），阿坚吐槽「看来土地神并没有 get 到是哪条消息」。
+
+**根因不是 LLM 幻觉，是框架确定性喂错料**，三层叠加：
+1. `feishu-bot.ts` 读 `ev.parent_id`（OpenAPI 字段名，信封里**根本不存在**）→ 回复线索在入口被丢光。信封其实有 `reply_to`/`root_id`（详见 §15 订正框）。
+2. `threadId` 为空（普通回复**不是**话题，这里代码没错）→ 落到 `getRecentChatMessages(chatId,{limit:8})`，纯按时间取 8 条，**对回复关系完全无感**。阿坚那条排第 ~30 位，窗口够不到。
+3. 8 格里还有 3 格是噪声（2 条 `system` 入群通知 + 1 条土地神自己的欢迎 post），而李沁的自介连发两遍占了 2 格 → 上下文里唯一像样的「发言」就是自介。**换成任何人都会答成自介。**
+
+**修法（`src/core/reply-context.ts`，纯函数、可测）**：
+- `replyLinkageFromEvent(ev)` 拿 `reply_to || root_id`（`lark.ts`）。**优先 reply_to 不是 root_id**：深回复链里用户指的是他回复的那条，不是链子的开头。
+- `buildReplyContext(rows, replyTarget, replier, resolveName)`：把被回复的原文**钉在窗口之上**，标成`【X 正在回复 Y 的这条消息，问题就是针对它】`。**必须独立于 8 条窗口固定注入**——这就是死因，靠扩大窗口治不好。
+- 引用块**独立字符预算**（`MAX_QUOTE_CHARS=1200`，超长截断），与窗口的 `MAX_CONTEXT_CHARS=2000` 分开：长引用既不会挤掉窗口、也不会被窗口挤掉。
+- 原文**从 DB 取**（`store.getMessageRow`），不调 API：群消息是 user 轮询全量采集的，被回复的原文基本都在库里；取不到就静默降级成只有窗口。
+- `renderContext` 补 `CONTEXT_SKIP_MSG_TYPES={'system'}`（入群通知不是对话）+ 连发去重。**别照抄 `feishu-user.ts` 的 `CONTEXT_MSG_TYPES`**：那个集合不含 `post`，而自介/长文都是 post，照抄会误杀真内容。
+- ⚠️ **去重要按「同作者 + 前 60 字」，不能逐字比对**：实际连发的两条自介是 627 / 632 字（中间编辑过），**不是**字节相同，逐字比对完全无效。初版就写成了逐字，且单测用两条**完全相同**的字符串把自己测绿了——测试自我实现。用真实长度（600+ 字）当测试数据才暴露出来，配一条「同作者不同发言不能被误杀」的反向用例。
+- 非话题窗口加 `sinceMs` 时间截止（`RECENT_CONTEXT_MAX_AGE_MS=24h`，锚在**触发消息自己的时间戳**、不用 `Date.now()`，否则测试会腐坏）。实测 11 个群里 4 个的最近 8 条横跨 >72h（最长 17.8 天），却被贴上「最近的对话上下文」。话题（`getThreadContext`）**不加**时间窗——一个话题就是一场对话，隔多久都算。
+
+**DB**：migration **v38** 给 `messages` 加 `reply_to_id`/`root_id` 两列 + partial index，并从 `raw` 回填历史（`json_extract`）。两条采集路径都要写：`feishu-bot.ts`（事件流，字段 `reply_to`）+ `feishu-user.ts`（轮询，`listMessages` 解析 OpenAPI 的 `parent_id`）。
+
+**⚠️ 两条采集路径（排查时被 subagent 带偏过，实测钉死）**：
+- **事件流**（有 `raw`，213 条）：bot **只收到 @ 它的消息**，带 `thread_id`/`reply_to`/`root_id`。
+- **user 轮询**（无 `raw`，4174 条）：**全量**采集群消息，带 `message_position`/`sender_name`，`thread_id` 几乎全丢（2/4174）。
+- `configs/agents.json` 里 `tudigong-user` 是 `enabled:false`，**但它照跑不误**——`agent.ts:141-147` 明写「启动模式 `--bot/--user/--both` 才是权威，与 per-agent `enabled` 无关」，且 `--sup` 会（`AGENT_COLLECTOR_SOUL`）把该 soul 的 user 频道强拉起来当 collect-only 采集器。**别拿 `enabled:false` 推断「这条路没在跑」。**
+
+**测试**：`src/core/reply-context.test.ts`（用真实事故时间线复刻：窗口够不到原文 → 引用块仍在）+ `src/core/lark.test.ts`（用**真实信封**钉字段名）。⚠️ 写这类测试要做**突变验证**：头条那条「读真实信封」测试其实挡不住字段名改回 `parent_id`——因为真实信封里 `reply_to === root_id`，root_id 兜底把错字段名掩盖了。必须补一条「只有 `reply_to`、没有 `root_id` 可兜底」的用例才真正挡得住。

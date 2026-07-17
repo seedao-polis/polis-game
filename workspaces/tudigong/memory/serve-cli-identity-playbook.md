@@ -41,6 +41,7 @@ create-agent skill 已配套更新：`SKILL.md` 第 4 条 essential_principle、
 ## 五、改的时候要注意（how to apply / 坑）
 
 - **人格档改了什么时候生效**：`prepare()` 每次都会重写 `.kimi-code/AGENTS.md`，但执行器 `--continue` 在**会话创建当下**就把 AGENTS.md 定格、续接不重读（与 skill 缓存同理，见 `agent-skill-playbook.md`）。所以人格档（SOUL/USER/…）改动**只对新会话生效**，已有的 per-(chat,user) 会话要重启 / 隔离后才套用。
+  - ⚠️ **这条只管 `AGENTS.md`（人格 / 系统提示词），别外推到 `mcp.json`（工具宣告 + `env`）**——`mcp.json` **每轮都重读**、MCP server 子进程每轮重启，实测定案（见 [[agent-executor-playbook]] §4.1）。两者性质不同：人格在会话创建时写进对话历史，工具宣告则是每个新进程的启动期行为。**曾经差点因为把这条外推到 `mcp.json`，而放弃「往 env 塞每轮 ref」这条正确路线**（[[pt-gamification-playbook]] §4.1）。
 - **`agent.ts` 改了**：必须 `pnpm build` + 重启对应 serve worker（热重启 `pnpm agent update` 需要 serve 带 `--sup`；没带 `--sup` 的 worker 要手动停了重起）。
 - **不要用 open_id 去特判操作者**：判断 serve/CLI 只认 `source`。想"操作者在飞书里也走内部模式"是反需求——本约定就是要避免它。
 - **新增 channel 要归类**：以后若加新的对外 channel，记得在 `prepare()` 的 `isServe` 判断里把它算进 serve，否则会被误当 CLI（当成操作者）。

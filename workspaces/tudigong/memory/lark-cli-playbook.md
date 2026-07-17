@@ -125,9 +125,10 @@
 - `drive file.statistics get`：聚合 `uv/pv`（只有人数、没有【谁】），**edit 权就能读**。
 - 妙记 `minutes minutes get` 无任何 view/统计字段（拿不到访问记录）；**bot 加不进 wiki 空间**（成员只能用户/部门，`+member-add --member-type appid` 无效）→ 知识库访问采集**只能用 user(操作者) 身分**，且 操作者 要是该空间 admin（实测【数字城邦】是 admin 能读全空间）。
 
-## 11. lark-cli 1.0.69 信封统一 → 全命令看 `ok`、`isLarkOk` 兜底（2026-07-14 事故，重点）
+## 11. lark-cli 1.0.69 的**两处**静默破坏：信封统一 + `create_time` 人性化（2026-07-14 / 07-17 两起事故，重点）
 
-> **本节是本文件所有「信封 / 判成功」问题的权威结论。上文任何写「看 `code===0`」的地方都已被它覆盖。**
+> **本节是本文件所有「信封 / 判成功」与「CLI 输出格式」问题的权威结论。上文任何写「看 `code===0`」的地方都已被它覆盖。**
+> **⚠️ 本节曾经只写了信封那一半，害得三天后又踩了 `create_time` 那一半（§11.1）——同一次升级改了两处，当时只查到一处就收工了。看到 CLI 升级，别只验证你正在查的那个症状。**
 
 - **症状**：升级 lark-cli 到 **1.0.69** 后，`serve` 日志每 5 分钟刷屏 `群成员同步【…】：本轮取到空名册（疑似临时失败），跳过本轮以免误判全员离开`，**每个群都空**。不是临时失败，是回归——所有群成员、wiki、日历、drive 等**原生命令拿到的数据整体为空**。
 - **根因**：1.0.69 把**所有命令**的输出信封统一了，成功信封**去掉了 `code` 字段**：
@@ -144,5 +145,27 @@
 - **今后规矩**：新写任何 lark 调用的成功判断**一律 `isLarkOk(res)`，绝不写裸 `res.code`**；见到某类 lark 数据「整体为空 / 空名册刷屏」，先怀疑 lark-cli 又改信封。
 - **旁注（与本次无关）**：同时段 `[telegram] 推送失败…HTTP 429 retry after 32` 是 **Telegram Bot API 限流**（多半启动时通知打太密），代码已自带退避（约每 30s 静默重试）会自愈，**不是 lark-cli 升级引起的**，别去动 lark 代码。见 [[telegram-playbook]]。
 
-相关：[[local-db-playbook]]（成员同步落库）、[[activity-meetup-playbook]]（日历原生命令）、§7.5（群消失 / 错误信封）。
+## 11.1 第二半：`+` 便捷命令会「人性化」时间字段（2026-07-17 事故）
+
+- **症状**：热门消息自动置顶（§12 of [[community-notify-events-playbook]]）从 2026-07-04 起**整整两周一次没触发**。点赞照常入库、日志每轮「置顶 0 条热门消息」、**没有任何失败警告**。DB `pinned_messages` 全表只有一行。
+- **根因**：1.0.69 除了改信封，还把 `im +chat-messages-list` **顶层**的 `create_time` / `update_time` 从 epoch 改成人性化字符串 `"2026-07-17 14:51"`（无秒、无时区）。`Number("2026-07-17 14:51")` = `NaN` → `feishu-user.ts` 的置顶闸门 `if (Number.isFinite(createMs) && createMs >= todayStartMs)` 对**每条**消息判否。**那个 if 没有 else，所以不打日志、不报错，只是安静地什么都不做。**
+- **核心模型：lark-cli 有两个命令家族，行为不同**：
+
+  | 家族 | 例子 | 时间字段 |
+  |---|---|---|
+  | **`+` 便捷命令** | `im +chat-messages-list`、`calendar +agenda` | 多一层**展示层**，会人性化 |
+  | **native 点命令 / `api` 透传** | `im pins list`、`api GET /im/v1/messages` | **原样透传** API 值 |
+
+- **展示层是逐字段的、不一致**：同一次 `im +chat-messages-list` 响应里，顶层 `create_time` 被人性化，嵌套的 `reactions.details[].action_time` 却仍是原始 epoch 秒。**哪个字段安全没法靠推理，只能实测。**
+- **同一条消息、同一个字段名，取法不同格式就不同**（实测 `om_x100b6aaaeb6ae4a8ddb573cbc6ba672`）：`event consume` 事件流信封与 `api GET /im/v1/messages` 都给 `'1784277594633'`（epoch 毫秒），`im +chat-messages-list` 给 `'2026-07-17 16:39'`。→ 所以 `feishu-bot.ts` 读事件流 `ev.create_time` 的那处**没受影响**（曾被静态推理误判成同款 bug，用 `messages.raw` 里存的真实事件信封实测证伪）。原始值单位也按 endpoint 各异：`im pins` 毫秒、`drive files` 秒。
+- **修法**：`src/core/lark.ts` 的 `larkTimeToMs()` **从第一个 lark commit 起就同时吃野外全部五种形状**：epoch 秒 / epoch 毫秒（`normalizeEpochMs` 以 `1e12` 分界）/ `"YYYY-MM-DD HH:MM"` / ISO8601 带时区 / 不可解析→0。ingest 路径（`transcript.ts`、`agent.ts`）一直在用它，所以 `messages` 表时间一直是对的；**只有几处图省事写裸 `Number()` 的调用点漏改**。凡吃 CLI 输出的时间，**一律 `larkTimeToMs()`**。
+- **⚠️ 但不能机械替换**：`chat_reactions.action_time` 存的是**秒**、查询也按秒，而 `larkTimeToMs` 返回**毫秒**——直接换会弄坏点赞狂魔的周窗口查询。那里得写 `Math.floor(larkTimeToMs(x)/1000)`。同一个 `LarkMessage` 里 `actionTime` 是秒、`createTime` 是毫秒，本身就是坑。
+- **两个反模式（本次真正的教训）**：
+  - `if (Number.isFinite(x) && …)` → 格式变了 = NaN = **「这道闸门不适用」**（fail-open，守卫静默失效）
+  - `Number(x) || 0` → 格式变了 = **一个看起来很合理的 0**（fail-closed，且证据被抹掉）
+
+  两者都把「格式变了」翻译成「无事发生」。fail-closed 让你丢一个功能，fail-open 让你出一次事故。**给这类闸门补 else 分支打日志**，否则下次照样两周无感。
+- **今后规矩**：升级 lark-cli 后**先跑 `pnpm lark:contract`**（`scripts/lark-contract-check.mjs`）。它刻意**不是**字段快照——快照会把当前的坏格式一起钉住；它拿真实输出喂进我们真正在用的 `larkTimeToMs()`，断言解析结果落在 2020–2100 的合理区间。格式再变，只要解析器还吃得下就算过，吃不下才红。（那个年份区间不是摆设：`"Jul 17 16:39"` 能被 `Date.parse` 解析，但解成 2001 年，只有区间检查抓得住。）**1.0.71 已发布**，CLI 每次调用都在 `_notice` 里催升级——**别盲升**。
+
+相关：[[local-db-playbook]]（成员同步落库）、[[activity-meetup-playbook]]（日历原生命令）、§7.5（群消失 / 错误信封）、[[community-notify-events-playbook]] §12（被这个 bug 打死两周的置顶功能）。
 

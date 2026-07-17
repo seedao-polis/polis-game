@@ -47,8 +47,25 @@
 ## 4. 状态列 footer
 
 - 每条**走 LLM 的回复**末尾，由 code（非 LLM）追加：`🌱 LP : <扣费前> → <扣费后> (<delta>)`，**数字一律 `toFixed(1)` 显示到小数第一位**，例 `🌱 LP : 120.0 → 119.9 (-0.1)`；delta=0 时**只显示余额、不带括号**：`🌱 LP : <余额>`（如 `🌱 LP : 119.9`）。（emoji 🌱、冒号前留一个空格、不变时不显示括号——格式承袭 2026-06-16 定案，仅把 🍎 AP 改成 🌱 LP 并加一位小数。）
-- `store.buildStatusFooter(openId, delta)`：读扣费后余额当【后】，`后 - delta` 回推【前】，三个数都过 `toFixed(1)`；频道传 `-LLM_AP_COST`（=-0.1）。**无条件加在 LLM 回复**（与有没有问 LP 无关）；纯指令不加（签到指令自己加）；gating 文案不加。
+- `store.buildStatusFooter(openId, delta)`：读扣费后余额当【后】，`后 - delta` 回推【前】，三个数都过 `toFixed(1)`。**无条件加在 LLM 回复**（与有没有问 LP 无关）；纯指令不加（签到指令自己加）；gating 文案不加。
 - 不同行为扣不同点数就传不同 delta，footer 自动适配。
+- ⚠️ **【前】是 `后 - delta` 回推出来的，不是查回来的**——所以 `delta` 只要漏算了本回合任何一笔异动，**连【前】都会跟着错**，不只是括号里的数字不准。这是 §4.1 那个 bug 的根源。
+
+### 4.1 尾注＝整回合净变化（按 ref 回读账本，非手动累加）
+
+**LLM 在回合中能自己动 LP**：MCP 工具 `pt_grant`（`src/tools/mcp-server.ts`）对所有 soul 开放，模型一轮内想调几次调几次，每次都真写 `pt_ledger`。旧版尾注的 `delta` 是频道里一个**手动维护的局部变量**（`category.grant - cost`），只认识框架自己记的两笔帐，**LLM 动的全部漏算** → 【前】【delta】双双失真。
+
+**修法：不再手动累加，改从账本回读整回合净变化。**
+
+- `netPtChangeForRef(refMessageId, openId)`（`store/gamification.ts`）＝ `SUM(delta) WHERE ref_message_id=? AND user_open_id=? AND reason != 'first_contact'`。频道 `feishu-bot.ts`/`feishu-user.ts` 用它取代 `netDelta`，**缺 `messageId` 时优雅退回旧算法**（降级不劣于现况）。
+- **回合 ref 怎么传进 MCP 子进程**：`RespondInput.messageId` → `Agent.buildMcpConfig(turnRef)` → `buildAgentMcpConfig` 写 `mcp.json` 的 `env.AGENT_TURN_REF` → `mcp-server.ts` 模块顶层读 → `pt_grant` 拿它当 ref。**跟 `AGENT_SOUL`/`LARK_PROFILE` 同一套模式**。可行的前提是**执行器每轮重读 `mcp.json`**——已实测定案，见 [[agent-executor-playbook]] §4.1。
+- **ref 由框架注入、不让 LLM 自报**：这样不管模型配不配合，这笔帐一定被正确标记。同「必须发生的步骤别赖 LLM」那条通用教训。
+- **条件写入不残留**：`buildAgentMcpConfig` 用 `if (opts.turnRef)` 写 key，心跳 / peer / CLI 路径不传就不写，新进程读不到——**不会串到上一轮的 ref**。
+- **⚠️ `reason != 'first_contact'` 这条过滤漏写会静默出错**：首见礼 +120 **带着同一个 ref**（`recordInteraction(openId,name,chatId,messageId)` → `ensureProfileRaw(…,messageId)` → `ledgerRaw(…,'first_contact',ref)`），天真 SUM 会把它算进去，新人第一轮尾注变成 `0.0 → 119.9 (+119.9)`。**运营方拍板：排除，维持 `120.0 → 119.9 (-0.1)`。** 漏写不报错、tsc 不挡、运行时无征兆——**只能靠单测钉住**（`store.test.ts` 已加，含 fail-then-pass 验证过）。
+- 索引 **v37** `idx_ledger_ref`（`pt_ledger(ref_message_id) WHERE ref_message_id IS NOT NULL`）——每轮都按 ref 查一次，原本只有 `idx_ledger_user`。
+- **设计取舍**：尾注**只显示净值不显示明细**（运营方拍板）。平常单笔回合显示与过去完全一样，只有 LLM 真的动过 LP 的回合数字才是复合的。
+- **范围外**（刻意不做）：LLM 滥发 LP 的风控 / 每轮上限——本改动只让这些操作**被正确显示**，不限制它们；通知「被连动改分的第三人」——`user_open_id` 不是对话者的异动本就不该算进他的尾注，通知第三人是既有缺口、非本改动引入。
+- 研究 / 计划 / 施工：`thoughts/shared/{research,plan,coding}/2026-07-16-lp-net-change-per-turn*.md`（研究附录 A 有执行器 env 每轮重读的实测与可重跑探针）。
 
 ## 5. 每日签到（命令 sign）
 
@@ -67,10 +84,11 @@
 
 ### 6.1 账本 = 事实来源（按 ref 反查，2026-07-16）
 
-`pt_ledger` 每行带 `ref_message_id`（发奖锚定的那条消息，如 TC/BET 原帖 `om_xxx`）。三个按 ref 的查法，用途别混：
+`pt_ledger` 每行带 `ref_message_id`（发奖锚定的那条消息，如 TC/BET 原帖 `om_xxx`；**LLM 回复回合则是触发那条消息**，见 §4.1）。四个按 ref 的查法，用途别混：
 
 - `hasPtGrantForRef(reason, ref)` → **幂等闸门**（这条消息发过这种奖没有）。
-- `ptGrantsForRef(reason, ref)` → **回全部 `{openId, delta}`，按 id 排序**（2026-07-16 加）。用于**把已发生的发放读回来**而不是重算——`agent predict refresh <num>` 重绘已结算原帖就靠它（见 [[community-prediction-playbook]] §2）。
+- `ptGrantsForRef(reason, ref)` → **回全部 `{openId, delta}`，按 id 排序**。用于**把已发生的发放读回来**而不是重算——`agent predict refresh <num>` 重绘已结算原帖就靠它（见 [[community-prediction-playbook]] §2）。**按 `(reason, ref)` 复合键**，服务「重绘某一种奖励」。
+- `netPtChangeForRef(ref, openId)` → **某人在这个 ref 下的净变化总和，不分 reason（但排除 `first_contact`）**。服务 LLM 回合尾注（§4.1）。**别跟 `ptGrantsForRef` 搞混**：一个是「不分原因求和」、一个是「按原因取明细」，两者都要留。
 - `recentPtLedger(openId, n)` → 某人最近流水。
 
 **原则：帖子是账本的渲染，账本才是事实。** 有人质疑金额，先 `sqlite3 .agent/shared.db "select * from pt_ledger where ref_message_id='om_…'"` 再下结论——2026-07-16 BET-2 那次「+5% 是不是算错」就是这样 3 分钟证伪的（钱一直对，见 [[community-prediction-playbook]] §4）。重绘历史消息也一律从账本读，**别重算**：日后改公式才不会把旧帖改成另一个数。
