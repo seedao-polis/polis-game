@@ -27,6 +27,7 @@ import {
   pinMessage,
   unpinMessage,
   downloadMessageResource,
+  larkTimeToMs,
   type LarkMessage,
 } from '../core/lark.js';
 import { renderMessageBody } from '../core/attachments.js';
@@ -371,8 +372,16 @@ export class FeishuUserChannel implements Channel {
             }
             // Auto-pin: a today's message reacted to by >= threshold distinct people gets pinned once.
             if (pinThreshold > 0 && humanReactors.size >= pinThreshold && !store.isMessagePinned(msg.messageId)) {
-              const createMs = Number(msg.createTime);
-              if (Number.isFinite(createMs) && createMs >= todayStartMs) {
+              // createTime arrives either as an epoch or as a formatted "YYYY-MM-DD HH:MM" string
+              // depending on the lark-cli version; larkTimeToMs normalises both (0 = unparseable).
+              // An unparseable time must be loud: this gate fails closed, so a silent skip disables
+              // auto-pinning entirely with no other symptom.
+              const createMs = larkTimeToMs(msg.createTime);
+              if (createMs === 0) {
+                log.warn(
+                  `热门消息置顶跳过【${chat.name || chat.chatId}】：无法解析消息时间 create_time=${msg.createTime}，message_id=${msg.messageId}`
+                );
+              } else if (createMs >= todayStartMs) {
                 if (pinMessage(msg.messageId, { as: 'bot', profile })) {
                   store.recordPinnedMessage(msg.messageId, chat.chatId, humanReactors.size);
                   pinned += 1;
@@ -869,13 +878,19 @@ export class FeishuUserChannel implements Channel {
                 userOpenId: senderOpenId,
                 chatId,
                 source: this.name,
+                messageId: msg.messageId || undefined,
               });
               // Classify the reply, grant bonus LP if applicable, then build the footer with the net delta.
               const { category, reply: judged } = judgeReply(reply, strategy);
               if (category.grant > 0) {
                 store.grantPt(senderOpenId, category.grant, category.reason, msg.messageId || undefined);
               }
-              const netDelta = category.grant - cost;
+              // Prefer the ledger's own per-turn total (SUM over ref_message_id) so any LP change the
+              // model made mid-turn via the pt_grant MCP tool is reflected too; fall back to the
+              // framework's own two-entry delta when there is no message id to key the lookup off of.
+              const netDelta = msg.messageId
+                ? store.netPtChangeForRef(msg.messageId, senderOpenId)
+                : category.grant - cost;
               reply = store.stripStatusFooter(judged) + store.buildStatusFooter(senderOpenId, netDelta, category.footerLabel || undefined);
             } catch (e) {
               log.error('agent 回复失败（已回退通用回复）：', (e as Error).message);
@@ -942,6 +957,8 @@ export class FeishuUserChannel implements Channel {
               sender_type: msg.senderType,
               sender_tenant_key: msg.senderTenantKey,
               thread_id: msg.threadId,
+              reply_to_id: msg.replyToId,
+              root_id: msg.rootId,
               thread_message_position: msg.threadMessagePosition,
               message_position: msg.position,
             });
@@ -958,8 +975,8 @@ export class FeishuUserChannel implements Channel {
 
         // ③ Trigger check: only respond when permitted for this chat type.
         // External chats only trigger when interactExternal is enabled; collection (①) is always on.
-        const createMs = Number(msg.createTime);
-        const tooOld = Number.isFinite(createMs) && createMs < this.startedAtMs - STARTUP_GRACE_MS;
+        const createMs = larkTimeToMs(msg.createTime);
+        const tooOld = createMs > 0 && createMs < this.startedAtMs - STARTUP_GRACE_MS;
         const canInteract = !external || cfg.interactExternal;
         if (!tooOld && msg.msgType === 'text' && canInteract) {
           const { hit, text } = isTriggered(msg);

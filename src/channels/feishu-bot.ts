@@ -12,6 +12,8 @@ import {
   listMessages,
   createCalendarEvent,
   recurringSeriesKey,
+  larkTimeToMs,
+  replyLinkageFromEvent,
   type EventConsumer,
 } from '../core/lark.js';
 import { renderMessageBody, attachmentMarker } from '../core/attachments.js';
@@ -20,6 +22,7 @@ import { flushTelegramSync } from '../core/telegram.js';
 import { dispatchCommand } from '../core/commands.js';
 import * as store from '../core/store.js';
 import { append as appendTranscript } from '../core/transcript.js';
+import { buildReplyContext } from '../core/reply-context.js';
 import { checkAndFireTriggers } from '../core/events.js';
 import { loadLpStrategy, judgeReply } from '../core/lp-strategy.js';
 import { loadConfigs, userOpenIdForProfile } from '../core/configs.js';
@@ -59,6 +62,8 @@ import {
 
 // After a restart, only respond to messages sent after the startup time; allow some slack for clock skew to avoid replying to historical messages on restart.
 const STARTUP_GRACE_MS = 5000;
+/** How far back the non-topic context window may reach. Older messages are not "最近的对话". */
+const RECENT_CONTEXT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 // LP cost per LLM reply in this channel.
 const LLM_PT_COST = 0.1;
@@ -136,25 +141,8 @@ export class FeishuBotChannel implements Channel {
         ? `${cfg.id}-${cid}-${senderOpenId}-${tid}`
         : `${cfg.id}-${cid}-${senderOpenId}`;
 
-    // Render captured history into a compact "name：text" transcript (oldest→newest) for the prompt.
-    // sender_name in the DB is often empty, so fall back to the directory. Keep the newest messages
-    // within a char budget so a long thread never blows up the prompt.
-    const MAX_CONTEXT_CHARS = 2000;
-    const renderContext = (rows: store.MessageRow[]): string => {
-      const lines: string[] = [];
-      let total = 0;
-      for (let i = rows.length - 1; i >= 0; i--) {
-        const m = rows[i];
-        const text = (m.text || '').trim();
-        if (!text) continue;
-        const name = m.senderName?.trim() || store.memberName(m.senderOpenId) || '某成员';
-        const line = `${name}：${text}`;
-        if (total + line.length > MAX_CONTEXT_CHARS && lines.length) break;
-        total += line.length;
-        lines.unshift(line); // keep chronological order while iterating newest→oldest
-      }
-      return lines.join('\n');
-    };
+    // Context assembly (recent window + pinned reply quote) lives in core/reply-context.ts.
+    const resolveName = (openId: string): string => store.memberName(openId);
 
     // ── serial reply worker ─────────────────────────────────────
     // Replies are generated one at a time (a kimi turn can run minutes). Receiving stays async, so a
@@ -263,13 +251,19 @@ export class FeishuBotChannel implements Channel {
               chatId: job.chatId,
               source: channelName,
               turnNumber,
+              messageId: job.messageId,
             });
             // Classify the reply, grant bonus LP if applicable, then build the footer with the net delta.
             const { category, reply: judged } = judgeReply(reply, strategy);
             if (category.grant > 0) {
               store.grantPt(job.senderOpenId, category.grant, category.reason, job.messageId ?? undefined);
             }
-            const netDelta = category.grant - cost;
+            // Prefer the ledger's own per-turn total (SUM over ref_message_id) so any LP change the
+            // model made mid-turn via the pt_grant MCP tool is reflected too; fall back to the
+            // framework's own two-entry delta when there is no message id to key the lookup off of.
+            const netDelta = job.messageId
+              ? store.netPtChangeForRef(job.messageId, job.senderOpenId)
+              : category.grant - cost;
             reply = store.stripStatusFooter(judged) + store.buildStatusFooter(job.senderOpenId, netDelta, category.footerLabel || undefined);
             replyOk = true;
 
@@ -611,7 +605,9 @@ export class FeishuBotChannel implements Channel {
       // envelope confirmed sender_id; thread_id field name is verified defensively here (debug log
       // surfaces the real shape on the first topic message).
       const threadId: string = ev.thread_id ?? ev.message?.thread_id ?? ev.thread?.thread_id ?? '';
-      log.debug(`事件字段：thread_id=${ev.thread_id ?? '∅'} chat_type=${ev.chat_type ?? '∅'} parent_id=${ev.parent_id ?? ev.message?.parent_id ?? '∅'}`);
+      // Reply linkage — see replyLinkageFromEvent for why the envelope's field names are a trap.
+      const { replyToId, rootId } = replyLinkageFromEvent(ev);
+      log.debug(`事件字段：thread_id=${ev.thread_id ?? '∅'} chat_type=${ev.chat_type ?? '∅'} reply_to=${ev.reply_to ?? '∅'} root_id=${ev.root_id ?? '∅'}`);
       // p2p (1:1 DM) vs group: a p2p reply goes out as a plain direct message; a group reply stays in the thread.
       const isP2p: boolean = ev.chat_type === 'p2p';
 
@@ -628,8 +624,14 @@ export class FeishuBotChannel implements Channel {
       }
 
       // Only respond to messages sent after startup: skip old messages from before startup (including backlog accumulated while offline and reconnect re-deliveries) to avoid replying to history on restart.
-      const createMs = Number(ev.create_time);
-      if (Number.isFinite(createMs) && createMs < startedAtMs - STARTUP_GRACE_MS) {
+      // The event envelope carries a raw epoch, unlike the humanised time the `+` CLI shortcuts return;
+      // larkTimeToMs accepts either, so this gate survives a change of shape on the event stream too.
+      // Unparseable (0) deliberately leaves the gate open — dropping a live message is worse than a
+      // stale reply — but it must be logged: an unparseable time here means replying to the backlog.
+      const createMs = larkTimeToMs(ev.create_time);
+      if (createMs === 0) {
+        log.warn(`无法解析事件时间 create_time=${ev.create_time}，本条跳过启动前过滤（可能回复到旧消息）`);
+      } else if (createMs < startedAtMs - STARTUP_GRACE_MS) {
         log.info(`· 略过启动前的旧消息（${preview(text)}）`);
         return;
       }
@@ -657,6 +659,8 @@ export class FeishuBotChannel implements Channel {
             text,
             mentions: [],
             thread_id: threadId || undefined,
+            reply_to_id: replyToId || undefined,
+            root_id: rootId || undefined,
             raw: JSON.stringify(ev),
           });
         } catch { /* best-effort */ }
@@ -759,12 +763,11 @@ export class FeishuBotChannel implements Channel {
 
       // 收录自介 pre-intercept: deterministic, operator-only, bypasses the LLM. When an operator replies
       // to (or in the topic of) a newcomer's self-intro with "@我 收录自介", the self-intro's author is
-      // awarded 60 LP, once per self-intro. The raw event envelope has no parent_id/root_id/thread_id, so
-      // handleRecordSelfIntro fetches the command message (by its own id) to trace back to the opening
-      // self-intro; the eventParentId is only a best-effort hint for envelopes that do carry one.
+      // awarded 60 LP, once per self-intro. The envelope's own root_id already points at the opening
+      // self-intro of the chain, so it is passed straight through; handleRecordSelfIntro only falls back
+      // to fetching the command message when the envelope carried no linkage.
       if (isRecordSelfIntroCommand(text)) {
-        const eventParentId: string = ev.parent_id ?? ev.message?.parent_id ?? '';
-        const reply = handleRecordSelfIntro({ commandMessageId: messageId ?? '', eventParentId, senderOpenId, profile });
+        const reply = handleRecordSelfIntro({ commandMessageId: messageId ?? '', eventRootId: rootId, eventParentId: replyToId, senderOpenId, profile });
         log.info(`收录自介：${preview(reply)}`);
         send(messageId, chatId, reply, isP2p);
         return;
@@ -800,10 +803,23 @@ export class FeishuBotChannel implements Channel {
       // an enhancement, never block a reply on it.
       let context = '';
       try {
+        // The chat fallback is capped by age as well as count: "the last 8 rows" of a quiet chat can
+        // be days or weeks old, and handing those to the model as 最近的对话上下文 is a lie. Anchored on
+        // this message's own timestamp; when that is unparseable (createMs === 0) the age cap is
+        // dropped rather than guessed. A topic's backstory stays uncapped — a thread is one
+        // conversation however long it took.
         const rows = threadId
           ? store.getThreadContext(threadId, { limit: 15, excludeMessageId: messageId })
-          : store.getRecentChatMessages(chatId, { limit: 8, excludeMessageId: messageId });
-        context = renderContext(rows);
+          : store.getRecentChatMessages(chatId, {
+              limit: 8,
+              excludeMessageId: messageId,
+              sinceMs: createMs ? createMs - RECENT_CONTEXT_MAX_AGE_MS : undefined,
+            });
+        // The replied-to message is the referent and is routinely older than the window reaches, so it
+        // is pinned above the window rather than left to it.
+        const replyTarget = replyToId ? store.getMessageRow(replyToId) : null;
+        if (replyToId && !replyTarget) log.debug(`回复目标未采集到，无法引用原文：${replyToId}`);
+        context = buildReplyContext(rows, replyTarget, resolveName(senderOpenId) || '对方', resolveName);
       } catch { /* best-effort */ }
 
       // Attachment backfill: a file sent as its own message carries no @mention, so the bot never
@@ -814,15 +830,15 @@ export class FeishuBotChannel implements Channel {
       // into another chat's reply. Best-effort: never block a reply on it.
       if (msgType === 'text') {
         try {
-          const triggerMs = Number(ev.create_time);
+          const triggerMs = larkTimeToMs(ev.create_time);
           const RECENT_WINDOW_MS = 30 * 60 * 1000;
           const recent = listMessages(chatId, { pageSize: 15, sort: 'desc', profile });
           const inlined = recent
             .filter((m) => m.messageId !== messageId)
             .filter((m) => m.msgType === 'file' || m.msgType === 'image' || m.msgType === 'media')
             .filter((m) => {
-              const t = Number(m.createTime);
-              if (!Number.isFinite(triggerMs) || !Number.isFinite(t)) return true; // best-effort when times are missing
+              const t = larkTimeToMs(m.createTime);
+              if (triggerMs === 0 || t === 0) return true; // best-effort when times are missing
               return triggerMs - t < RECENT_WINDOW_MS && t - triggerMs < 2 * 60 * 1000; // within ~30min before (small skew after)
             })
             .slice(0, 3)

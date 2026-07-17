@@ -84,7 +84,9 @@ export function isRecordSelfIntroCommand(text: string): boolean {
 export interface RecordSelfIntroCtx {
   /** id of the 收录自介 command message itself (om_xxx) — reliably present in the event envelope */
   commandMessageId: string;
-  /** parent_id straight off the raw event, IF it happened to carry one (usually empty — see below) */
+  /** root_id off the event envelope: the first message of the reply chain — the self-intro itself */
+  eventRootId?: string;
+  /** the envelope's direct parent (`reply_to`); used when there is no root_id */
   eventParentId?: string;
   /** open_id of whoever issued the 收录自介 command (must be an operator) */
   senderOpenId: string;
@@ -93,20 +95,30 @@ export interface RecordSelfIntroCtx {
 }
 
 /**
- * Resolve the self-intro message an operator's 收录自介 command targets. The raw `event consume`
- * envelope carries NO parent_id/root_id/thread_id, so we fetch the command message itself to recover
- * them, and prefer root_id — the FIRST message of the topic / reply chain, i.e. the self-intro that
- * opened it — so writing 收录自介 anywhere in the newcomer's self-intro topic traces back to that
- * opening message. Falls back to parent_id (the immediate quote) and, last, to any parent_id that did
- * ride along on the event. Returns '' when nothing resolvable (or it points at the command itself).
+ * Resolve the self-intro message an operator's 收录自介 command targets. Prefer root_id — the FIRST
+ * message of the reply chain, i.e. the self-intro that opened it — so writing 收录自介 anywhere in the
+ * newcomer's self-intro topic traces back to that opening message; then the direct parent.
+ *
+ * Mind the field names, they differ by source: the event envelope carries `root_id` + `reply_to` (and
+ * no parent_id at all), while the OpenAPI message resource calls the same two `root_id` + `parent_id`.
+ * The envelope's own linkage is authoritative and free, so it is used first; the getMessageById fetch
+ * is only a fallback for envelopes that carried none. Returns '' when nothing is resolvable (or it
+ * points at the command itself).
  */
-function resolveSelfIntroTarget(commandMessageId: string, eventParentId: string, profile?: string): string {
+function resolveSelfIntroTarget(
+  commandMessageId: string,
+  eventRootId: string,
+  eventParentId: string,
+  profile?: string
+): string {
+  const fromEvent = eventRootId || eventParentId;
+  if (fromEvent && fromEvent !== commandMessageId) return fromEvent;
   if (commandMessageId) {
     const cmd = getMessageById(commandMessageId, { as: 'bot', profile });
     const t = cmd?.rootId || cmd?.parentId || '';
     if (t) return t === commandMessageId ? '' : t;
   }
-  return eventParentId && eventParentId !== commandMessageId ? eventParentId : '';
+  return '';
 }
 
 /**
@@ -116,14 +128,14 @@ function resolveSelfIntroTarget(commandMessageId: string, eventParentId: string,
  * permission, resolves the target, checks the author + idempotency, grants, and returns the reply text.
  */
 export function handleRecordSelfIntro(ctx: RecordSelfIntroCtx): string {
-  const { commandMessageId, eventParentId, senderOpenId, profile } = ctx;
+  const { commandMessageId, eventRootId, eventParentId, senderOpenId, profile } = ctx;
 
   // 1) operator whitelist — only trusted operators may award the reward (prevents self-farming).
   if (!senderOpenId || !isAdmin(senderOpenId)) {
     return '「收录自介」仅限运营使用～';
   }
   // 2) trace back to the self-intro message (topic/reply root).
-  const targetId = resolveSelfIntroTarget(commandMessageId, eventParentId ?? '', profile);
+  const targetId = resolveSelfIntroTarget(commandMessageId, eventRootId ?? '', eventParentId ?? '', profile);
   if (!targetId) {
     return `请「回复 / 引用」该成员的自我介绍消息（或在其自我介绍所在的话题下），再 @我 写「收录自介」，即可为对方发放 ${SELF_INTRO_REWARD_PT} LP。`;
   }

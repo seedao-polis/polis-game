@@ -34,6 +34,13 @@ export interface LarkMessage {
   senderTenantKey?: string;
   /** Thread identifier for threaded messages */
   threadId?: string;
+  /**
+   * Message this one replies to. The OpenAPI message resource names this `parent_id`; the
+   * `event consume` envelope names the same value `reply_to`. Undefined on an original post.
+   */
+  replyToId?: string;
+  /** First message of the reply chain (`root_id` in both shapes). */
+  rootId?: string;
   /** Position of this message within its thread */
   threadMessagePosition?: number;
   /** Emoji reactions on this message; only populated when listMessages is called with includeReactions. */
@@ -997,12 +1004,40 @@ export function listMessages(
       senderType: senderFields.senderType,
       senderTenantKey: senderFields.senderTenantKey,
       threadId: typeof m.thread_id === 'string' ? m.thread_id : undefined,
+      replyToId: typeof m.parent_id === 'string' ? m.parent_id : undefined,
+      rootId: typeof m.root_id === 'string' ? m.root_id : undefined,
       threadMessagePosition: m.thread_message_position != null
         ? Number(m.thread_message_position)
         : undefined,
       ...(opts.includeReactions ? { reactions: extractReactions(m) } : {}),
     };
   });
+}
+
+/** Reply linkage extracted from an event envelope. Both fields are '' on an original post. */
+export interface EventReplyLinkage {
+  /** the message being replied to */
+  replyToId: string;
+  /** the first message of the reply chain */
+  rootId: string;
+}
+
+/**
+ * Extract reply linkage from an `event consume` envelope.
+ *
+ * THE FIELD NAMES DIFFER BY SOURCE — this is the whole reason this function exists. The OpenAPI
+ * message resource (GET /im/v1/messages/<id>, and the list API) names the direct parent `parent_id`;
+ * this envelope names the same value `reply_to` and has no `parent_id` key at all. Reading the API
+ * name off an envelope therefore yields '' on every single reply, silently, which is exactly how a
+ * reply's referent went missing: the model was handed "你怎么看这个发言" with nothing to bind 这个 to.
+ *
+ * reply_to is preferred over root_id: in a deep chain the user points at what they replied to, not at
+ * the line that opened the chain. They coincide when the parent is itself an original post.
+ */
+export function replyLinkageFromEvent(ev: Record<string, any>): EventReplyLinkage {
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+  const rootId = str(ev?.root_id);
+  return { replyToId: str(ev?.reply_to) || rootId, rootId };
 }
 
 /** A single message fetched by id: its author, text, and thread/reply linkage. */
@@ -1024,9 +1059,13 @@ export interface LarkMessageDetail {
 /**
  * Fetch one message by its message_id (om_xxx) via the native GET endpoint, as the bot identity.
  * Returns the author's open_id, a best-effort plain-text body, and the parent/root/thread linkage — or
- * null on any error / not-found (so callers degrade gracefully). The parent_id/root_id/thread_id fields
- * are NOT present on the raw `event consume` envelope, so fetching the message is how a reply's target
- * (or a topic's opening message) is recovered. Used to resolve the author of a quoted/replied-to message.
+ * null on any error / not-found (so callers degrade gracefully).
+ *
+ * This returns the OpenAPI shape, which names the direct parent `parent_id`. An `event consume`
+ * envelope names that same value `reply_to` and carries it inline (see replyLinkageFromEvent), so an
+ * event handler does NOT need this fetch to learn what a message replied to — prefer the envelope and
+ * keep this for looking up a message the handler only has an id for (e.g. resolving a quoted message's
+ * author, or linkage for an id that arrived from somewhere other than the event stream).
  */
 export function getMessageById(
   messageId: string,

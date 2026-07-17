@@ -915,6 +915,29 @@ CREATE TABLE IF NOT EXISTS chests (
 CREATE INDEX IF NOT EXISTS idx_chests_owner ON chests(owner_open_id);
 `;
 
+// Index for per-turn LP aggregation lookups: SUM(delta) WHERE ref_message_id = ? AND
+// user_open_id = ?, run once per LLM reply (see netPtChangeForRef in store/gamification.ts).
+// Partial index — most ledger rows outside a ref'd flow (TC/predict/chest/LLM turns) have no
+// ref_message_id at all, so indexing only the non-null rows keeps it small.
+const SCHEMA_V37 = `
+CREATE INDEX IF NOT EXISTS idx_ledger_ref ON pt_ledger(ref_message_id) WHERE ref_message_id IS NOT NULL;
+`;
+
+// Reply linkage. A Feishu reply carries reply_to (the message being replied to) and root_id (the
+// first message of the reply chain) on the event envelope; both were previously kept only inside
+// the raw JSON blob, so nothing could join on them and a reply's referent was unrecoverable.
+// Note there is no parent_id on this envelope shape — reply_to is the direct parent.
+// Backfilled from raw for rows captured before the columns existed.
+const SCHEMA_V38 = `
+ALTER TABLE messages ADD COLUMN reply_to_id TEXT;
+ALTER TABLE messages ADD COLUMN root_id TEXT;
+UPDATE messages
+   SET reply_to_id = json_extract(raw, '$.reply_to'),
+       root_id     = json_extract(raw, '$.root_id')
+ WHERE raw IS NOT NULL AND raw <> '' AND json_valid(raw);
+CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to_id) WHERE reply_to_id IS NOT NULL;
+`;
+
 /** Apply ordered, idempotent schema migrations tracked in schema_migrations. */
 function runMigrations(db: Db): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -962,6 +985,8 @@ function runMigrations(db: Db): void {
     { version: 34, description: 'predict_counter + predict_proposals (community prediction, discrete-only, judge-announced settlement)', sql: SCHEMA_V34 },
     { version: 35, description: 'predict_bets (community prediction bet records)', sql: SCHEMA_V35 },
     { version: 36, description: 'chests (owned virtual LP accounts, e.g. 公益宝箱)', sql: SCHEMA_V36 },
+    { version: 37, description: 'index pt_ledger.ref_message_id (per-turn LP aggregation lookups)', sql: SCHEMA_V37 },
+    { version: 38, description: 'messages.reply_to_id / root_id (reply linkage, backfilled from raw)', sql: SCHEMA_V38 },
   ];
   for (const m of migrations) {
     if (applied.has(m.version)) continue;

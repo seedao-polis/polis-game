@@ -20,6 +20,10 @@ export interface TranscriptMessage {
   sender_type?: string;
   sender_tenant_key?: string;
   thread_id?: string;
+  /** Message this one replies to: `parent_id` on the OpenAPI shape, `reply_to` on the event envelope. */
+  reply_to_id?: string;
+  /** First message of the reply chain (`root_id` in both shapes). */
+  root_id?: string;
   thread_message_position?: number;
   message_position?: number;
   updated?: boolean;
@@ -45,6 +49,8 @@ export function append(chatId: string, msg: TranscriptMessage): boolean {
     text: msg.text,
     mentions: msg.mentions,
     threadId: msg.thread_id,
+    replyToId: msg.reply_to_id,
+    rootId: msg.root_id,
     threadMessagePosition: msg.thread_message_position,
     messagePosition: msg.message_position,
     createTime: larkTimeToMs(msg.create_time),

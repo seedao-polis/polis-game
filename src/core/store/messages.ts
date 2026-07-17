@@ -12,6 +12,10 @@ export interface MessageRow {
   text: string;
   mentions: string[];
   threadId?: string;
+  /** Message this one replies to (Feishu `reply_to`). Empty on an original post. */
+  replyToId?: string;
+  /** First message of the reply chain (Feishu `root_id`). Equals replyToId when the parent is itself an original post. */
+  rootId?: string;
   threadMessagePosition?: number;
   messagePosition?: number;
   createTime: number;
@@ -62,9 +66,9 @@ export function insertMessage(m: MessageRow): boolean {
     INSERT OR IGNORE INTO messages(
       message_id, chat_id, sender_open_id, sender_id_type, sender_type,
       sender_tenant_key, sender_name, msg_type, text, mentions,
-      thread_id, thread_message_position, message_position,
+      thread_id, reply_to_id, root_id, thread_message_position, message_position,
       create_time, updated, deleted, raw
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     m.messageId,
     m.chatId,
@@ -77,6 +81,8 @@ export function insertMessage(m: MessageRow): boolean {
     m.text,
     JSON.stringify(m.mentions),
     m.threadId ?? null,
+    m.replyToId ?? null,
+    m.rootId ?? null,
     m.threadMessagePosition ?? null,
     m.messagePosition ?? null,
     Number.isFinite(m.createTime) ? Math.trunc(m.createTime) : 0,
@@ -103,6 +109,8 @@ function rowToMessage(row: Record<string, unknown>): MessageRow {
       catch { return []; }
     })(),
     threadId: (row['thread_id'] as string | null) ?? undefined,
+    replyToId: (row['reply_to_id'] as string | null) ?? undefined,
+    rootId: (row['root_id'] as string | null) ?? undefined,
     threadMessagePosition: (row['thread_message_position'] as number | null) ?? undefined,
     messagePosition: (row['message_position'] as number | null) ?? undefined,
     createTime: (row['create_time'] as number) ?? 0,
@@ -137,6 +145,15 @@ export function searchMessages(query: string, limit = 20): MessageRow[] {
   return rows.map(rowToMessage);
 }
 
+/** Look up one captured message by id. Returns null when it was never captured (or was deleted). */
+export function getMessageRow(messageId: string): MessageRow | null {
+  if (!messageId) return null;
+  const row = getDb().prepare(
+    'SELECT * FROM messages WHERE message_id = ? AND deleted = 0'
+  ).get(messageId) as Record<string, unknown> | undefined;
+  return row ? rowToMessage(row) : null;
+}
+
 /**
  * Return the messages of a single thread (topic), oldest→newest, for feeding the agent the
  * conversation backstory. The bot only receives @-mentioned events, but the user-poll path
@@ -161,18 +178,30 @@ export function getThreadContext(
 /**
  * Return the most recent messages of a chat, oldest→newest. Used as a fallback context window for
  * non-topic chats (which have no thread_id). An optional excludeMessageId drops the current message.
+ *
+ * sinceMs (absolute epoch ms) drops anything older. Without it "the last 8 rows" can reach back
+ * arbitrarily far in a quiet chat — measured across live chats, 4 of 11 had their last 8 messages
+ * spanning over 72 hours, one of them 17 days — and the caller then labels them to the model as
+ * "最近的对话上下文". An absolute cutoff rather than a max-age keeps this a pure query: the caller
+ * anchors it on the triggering message's own timestamp, so it never depends on wall-clock now.
  */
 export function getRecentChatMessages(
   chatId: string,
-  opts: { limit?: number; excludeMessageId?: string } = {}
+  opts: { limit?: number; excludeMessageId?: string; sinceMs?: number } = {}
 ): MessageRow[] {
   if (!chatId) return [];
   const limit = opts.limit ?? 8;
   const rows = getDb().prepare(
     `SELECT * FROM messages
        WHERE chat_id = ? AND deleted = 0 AND (? IS NULL OR message_id <> ?)
+         AND (? IS NULL OR create_time >= ?)
        ORDER BY create_time DESC LIMIT ?`
-  ).all(chatId, opts.excludeMessageId ?? null, opts.excludeMessageId ?? null, limit) as Record<string, unknown>[];
+  ).all(
+    chatId,
+    opts.excludeMessageId ?? null, opts.excludeMessageId ?? null,
+    opts.sinceMs ?? null, opts.sinceMs ?? null,
+    limit,
+  ) as Record<string, unknown>[];
   return rows.map(rowToMessage).reverse(); // oldest→newest
 }
 
