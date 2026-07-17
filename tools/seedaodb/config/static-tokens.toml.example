@@ -1,0 +1,13 @@
+# Static token -> open_id table, used only when SEEDAODB_AUTH_MODE=static (local development
+# and integration tests -- no network access to Feishu is involved). Do not use this mode
+# against untrusted clients in production; use SEEDAODB_AUTH_MODE=feishu instead.
+#
+# Copy to `config/static-tokens.toml` and pick your own token values.
+
+[[token]]
+token = "dev-admin-token"
+open_id = "ou_replace_with_real_admin_open_id"
+
+[[token]]
+token = "dev-operator-token"
+open_id = "ou_replace_with_real_operator_open_id"

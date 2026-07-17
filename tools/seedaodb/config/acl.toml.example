@@ -1,0 +1,34 @@
+# Role-based access control. Copy to `config/acl.toml` and fill in real open_ids.
+#
+# A missing or malformed ACL file is a hard startup failure: this service never falls back to
+# an empty, all-permissive ACL. `default_role` must either name a role defined below or be the
+# literal string "deny".
+
+# Role applied to any identity that authenticated successfully (valid Feishu/static token) but
+# has no matching [[user]] entry below. Set to "deny" to reject everyone not explicitly listed.
+default_role = "readonly"
+
+[roles.admin]
+read = ["soul", "shared"]
+write = ["soul", "shared"]
+
+[roles.operator]
+read = ["soul", "shared"]
+# Day-to-day operations can write the per-soul database but not the shared ledger/profile
+# database, since raw writes to "shared" can bypass the host project's own bookkeeping
+# (pt_ledger/profiles.pt_balance consistency) -- see the research doc, section 4, risk 2.
+write = ["soul"]
+
+[roles.readonly]
+read = ["soul", "shared"]
+write = []
+
+# open_id -> role. Sync the "admin" list from the host project's configs/admins.json by hand;
+# seedaodb intentionally does not read that file directly (see README, "Decoupling").
+[[user]]
+open_id = "ou_replace_with_real_admin_open_id"
+role = "admin"
+
+[[user]]
+open_id = "ou_replace_with_real_operator_open_id"
+role = "operator"

@@ -1,0 +1,31 @@
+# Named datasource registry. Copy to `config/datasources.toml` and point `url` at the real
+# database files -- this example intentionally uses placeholder paths, not the real .agent/*.db
+# files, so nothing here accidentally points at production data.
+#
+# API requests address a datasource by `name`, never by file path or connection string. This is
+# what lets a datasource be repointed at a different backend later (e.g. `mysql://...`) purely
+# through this file, with zero changes to callers.
+
+[[datasource]]
+name = "soul"
+# Placeholder path -- replace with the real path to the per-soul SQLite database, e.g.
+# "sqlite:///absolute/path/to/repo/.agent/tudigong.db?mode=rw".
+url = "sqlite:///absolute/path/to/placeholder/soul.db?mode=rw"
+# Whether this datasource is opened with SQLITE_OPEN_READONLY at the connection level. This is
+# independent of (and enforced in addition to) the per-user read/write permissions in acl.toml:
+# even a user with write access cannot write here if this is `true`.
+readonly = false
+busy_timeout_ms = 5000
+
+[[datasource]]
+name = "shared"
+# Placeholder path -- replace with the real path to the shared ledger/profile SQLite database,
+# e.g. "sqlite:///absolute/path/to/repo/.agent/shared.db?mode=rw".
+url = "sqlite:///absolute/path/to/placeholder/shared.db?mode=rw"
+readonly = false
+busy_timeout_ms = 5000
+
+# Future MySQL migration only changes the `url` on the relevant entry above (and requires
+# building with `--features mysql-backend`, see README) -- the datasource `name` and every
+# caller stay the same, e.g.:
+# url = "mysql://user:pass@10.0.0.5:3306/tudigong"
