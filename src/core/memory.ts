@@ -53,10 +53,24 @@ export function appendJournal(soul: string, text: string): void {
   fs.appendFileSync(f, `- ${nowTime()} ${text.trim()}\n`, 'utf8');
 }
 
-/** Read today's journal (for persona injection) */
+/**
+ * Runaway guard for the journal injected into the system prompt. The journal is the soul's own diary
+ * and legitimately spans every chat of the day, so it is kept whole on disk; this only bounds what a
+ * pathological day can push into the prompt. Sized well above real days (observed: ~1KB typical, 6.6KB
+ * busiest) so it is a rail, not a behaviour change.
+ */
+const MAX_JOURNAL_PROMPT_CHARS = 12000;
+
+/** Read today's journal (for persona injection), newest entries kept if it is pathologically long. */
 export function todayJournal(soul: string): string {
   const f = journalFile(soul);
-  return fs.existsSync(f) ? fs.readFileSync(f, 'utf8').trim() : '';
+  if (!fs.existsSync(f)) return '';
+  const raw = fs.readFileSync(f, 'utf8').trim();
+  if (raw.length <= MAX_JOURNAL_PROMPT_CHARS) return raw;
+  // Keep the tail (the most recent entries) and cut on a line boundary.
+  const tail = raw.slice(raw.length - MAX_JOURNAL_PROMPT_CHARS);
+  const nl = tail.indexOf('\n');
+  return `（今天较早的日誌已略）\n${nl >= 0 ? tail.slice(nl + 1) : tail}`;
 }
 
 /** Read all key memories (for persona injection) */
