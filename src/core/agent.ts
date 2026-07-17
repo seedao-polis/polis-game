@@ -56,6 +56,11 @@ export interface RespondInput {
   /** 1-based ordinal of this reply within the session; injected into the prompt (serve only) so the
    *  persona can self-pace turn-based behaviors (e.g. an interviewer reporting progress every few rounds). */
   turnNumber?: number;
+  /** Feishu message id of the triggering message. Threaded through to the MCP tool subprocess as
+   *  AGENT_TURN_REF, so a pt_grant call the model makes mid-turn is tagged with this turn's ref and
+   *  aggregated into the reply footer's net change (see netPtChangeForRef). Omitted for paths with
+   *  no triggering message (heartbeat / peer / CLI) — those keep today's un-ref'd pt_grant behavior. */
+  messageId?: string;
 }
 
 export interface AgentOptions {
@@ -100,12 +105,15 @@ export class Agent {
     return path.join(base, 'chats', safe);
   }
 
-  /** Build the MCP config (framework tools) attached to kimi. Returns undefined if not yet built. */
-  private buildMcpConfig(): string | undefined {
+  /** Build the MCP config (framework tools) attached to kimi. Returns undefined if not yet built.
+   *  turnRef (the triggering message id) is threaded through as AGENT_TURN_REF so a pt_grant call
+   *  made during this turn is tagged with it; omitted for calls with no triggering message. */
+  private buildMcpConfig(turnRef?: string): string | undefined {
     return buildAgentMcpConfig({
       soul: this.name,
       larkProfile: this.opts.larkProfile,
       feishuChatId: this.opts.feishuChatId,
+      turnRef,
     });
   }
 
@@ -128,7 +136,7 @@ export class Agent {
     fs.writeFileSync(path.join(cfgDir, 'AGENTS.md'), soul.systemPrompt, 'utf8');
 
     // Framework tools: kimi-code loads project-local .kimi-code/mcp.json at session start.
-    const mcpConfig = this.buildMcpConfig();
+    const mcpConfig = this.buildMcpConfig(input.messageId);
     const mcpPath = path.join(cfgDir, 'mcp.json');
     if (mcpConfig) fs.writeFileSync(mcpPath, mcpConfig, 'utf8');
     else fs.rmSync(mcpPath, { force: true });

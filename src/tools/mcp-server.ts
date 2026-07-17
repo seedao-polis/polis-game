@@ -27,6 +27,7 @@ const MAX_BROADCASTS_PER_HOUR_PER_CHAT = 3;
 const SOUL = process.env.AGENT_SOUL || 'default';
 const DEFAULT_CHAT = process.env.AGENT_FEISHU_CHAT || '';
 const LARK_PROFILE = process.env.LARK_PROFILE || undefined;
+const TURN_REF = process.env.AGENT_TURN_REF || undefined;
 
 function textResult(text: string) {
   return { content: [{ type: 'text' as const, text }] };
@@ -136,7 +137,7 @@ server.registerTool(
     },
   },
   async ({ openId, amount, reason }) => {
-    const newBalance = store.grantPt(openId, amount, reason);
+    const newBalance = store.grantPt(openId, amount, reason, TURN_REF);
     return textResult(`已为 ${openId} ${amount >= 0 ? '增加' : '扣除'} ${Math.abs(amount)} LP，新余额：${newBalance.toFixed(1)}`);
   }
 );

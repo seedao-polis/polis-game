@@ -302,3 +302,46 @@ test('buildStatusFooter: delta=-0.1, no label → before→after (-0.1), no labe
   assert.ok(!footer.includes('访谈中'), 'no label text');
   assert.ok(!footer.includes('画重点'), 'no label text');
 });
+
+// ── netPtChangeForRef (per-turn LP aggregation) ─────────────────────────────
+
+test('netPtChangeForRef excludes the first_contact welcome grant tagged under the same ref', () => {
+  const u = uid();
+  const ref = 'om_first_turn';
+  // Mirrors production: recordInteraction() seeds the +120 first_contact grant under this turn's
+  // own message id (feishu-bot.ts:670 / feishu-user.ts:970 call it with the triggering messageId).
+  store.recordInteraction(u, 'Newcomer', 'oc_chat', ref);
+  assert.equal(store.getProfile(u)?.ptBalance, 120, 'sanity: first-contact grant landed');
+  // Framework's own cost debit for this same turn, same ref.
+  store.spendPt(u, 0.1, 'llm_reply', ref);
+  // The turn's net change must be -0.1 (the cost only), NOT +119.9 (which would fold in the
+  // welcome gift) — this is the regression this test pins down.
+  assert.equal(store.netPtChangeForRef(ref, u), -0.1);
+});
+
+test('netPtChangeForRef sums every entry under one ref, including mid-turn pt_grant calls', () => {
+  const u = uid();
+  const ref = 'om_turn_2';
+  store.grantPt(u, 120, 'seed'); // baseline balance, no ref — must not be counted
+  store.spendPt(u, 0.1, 'llm_reply', ref);       // framework cost
+  store.grantPt(u, 0.1, 'judge_interview', ref); // framework judge grant
+  store.grantPt(u, 5, 'pt_grant', ref);          // LLM-driven pt_grant mid-turn (a credit)
+  store.grantPt(u, -2, 'pt_grant', ref);         // another pt_grant, this time a debit
+  // Net = -0.1 + 0.1 + 5 - 2 = 3.0
+  assert.equal(store.netPtChangeForRef(ref, u), 3);
+});
+
+test('netPtChangeForRef scopes strictly to the given ref and user', () => {
+  const u = uid();
+  const other = uid();
+  store.grantPt(u, 10, 'reward', 'om_a');
+  store.grantPt(u, 999, 'reward', 'om_b');      // different ref — must not leak in
+  store.grantPt(other, 999, 'reward', 'om_a');  // same ref, different user — must not leak in
+  assert.equal(store.netPtChangeForRef('om_a', u), 10);
+});
+
+test('netPtChangeForRef returns 0 for an empty ref or a ref with no matching rows', () => {
+  const u = uid();
+  assert.equal(store.netPtChangeForRef('', u), 0);
+  assert.equal(store.netPtChangeForRef('om_nonexistent', u), 0);
+});

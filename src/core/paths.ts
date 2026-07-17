@@ -94,11 +94,17 @@ export function buildAgentMcpConfig(opts: {
   soul: string;
   larkProfile?: string;
   feishuChatId?: string;
+  /** Feishu message id of the triggering turn; exposed to the MCP tool subprocess as
+   *  AGENT_TURN_REF so pt_grant can tag its ledger writes with this turn's ref. Omitted for
+   *  contexts with no triggering message (heartbeat / peer / CLI) — mirrors the optionality of
+   *  AGENT_FEISHU_CHAT / LARK_PROFILE below. */
+  turnRef?: string;
 }): string | undefined {
   if (!fs.existsSync(MCP_SERVER_JS)) return undefined;
   const env: Record<string, string> = { AGENT_SOUL: opts.soul };
   if (opts.feishuChatId) env.AGENT_FEISHU_CHAT = opts.feishuChatId;
   if (opts.larkProfile) env.LARK_PROFILE = opts.larkProfile;
+  if (opts.turnRef) env.AGENT_TURN_REF = opts.turnRef;
   const larkRun = resolveLarkRun();
   if (larkRun) env.LARK_RUN = larkRun;
   if (process.env.APPDATA) env.APPDATA = process.env.APPDATA;

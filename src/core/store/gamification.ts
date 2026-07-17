@@ -158,6 +158,29 @@ export function ptGrantsForRef(
   return rows.map((r) => ({ openId: String(r.user_open_id), delta: Number(r.delta) }));
 }
 
+/**
+ * Net LP change for a user across every pt_ledger row tagged with a given ref_message_id — i.e.
+ * everything that happened during one interaction turn, whoever booked it (the framework's own
+ * cost/grant/refund, or an LLM-driven pt_grant MCP call). Backs the reply footer's "this turn's
+ * net change", replacing the framework's own two-entry running total so anything the model does
+ * mid-turn via pt_grant is reflected too.
+ *
+ * The first-contact welcome grant is deliberately excluded: it shares this turn's ref_message_id
+ * (recordInteraction seeds it with the triggering message id) but is a one-off welcome gift, not
+ * something this turn earned — folding it in would turn a newcomer's first footer into
+ * "0.0 → 119.9 (+119.9)" instead of the intended "120.0 → 119.9 (-0.1)".
+ */
+export function netPtChangeForRef(refMessageId: string, openId: string): number {
+  if (!refMessageId || !openId) return 0;
+  const row = getLpDb()
+    .prepare(
+      `SELECT COALESCE(SUM(delta), 0) AS net FROM pt_ledger
+       WHERE ref_message_id = ? AND user_open_id = ? AND reason != 'first_contact'`,
+    )
+    .get(refMessageId, cid(openId)) as { net: number } | undefined;
+  return Number(row?.net ?? 0);
+}
+
 /** A user's most recent LP ledger entries (newest first) — backs the "recent changes" query. */
 export function recentPtLedger(
   openId: string,
