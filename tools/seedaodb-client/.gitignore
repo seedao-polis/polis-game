@@ -1,0 +1,7 @@
+/target/
+.env
+
+# Local login state, in case SEEDAODB_CLIENT_TOKEN_FILE is ever pointed at a path inside this
+# directory instead of its default per-user config directory location.
+token.json
+*.token.json
