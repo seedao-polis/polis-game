@@ -18,6 +18,7 @@
     "mcp": "node dist/tools/mcp-server.js",
     "mcp:dev": "tsx src/tools/mcp-server.ts",
     "typecheck": "tsc --noEmit",
+    "lark:contract": "node scripts/lark-contract-check.mjs",
     "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "test:watch": "node --import tsx --test --watch \"src/**/*.test.ts\""
   },
