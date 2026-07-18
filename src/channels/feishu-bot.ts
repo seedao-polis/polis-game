@@ -14,7 +14,9 @@ import {
   recurringSeriesKey,
   larkTimeToMs,
   replyLinkageFromEvent,
+  listThreadMessages,
   type EventConsumer,
+  type LarkMessage,
 } from '../core/lark.js';
 import { renderMessageBody, attachmentMarker } from '../core/attachments.js';
 import { log, preview } from '../core/log.js';
@@ -572,7 +574,10 @@ export class FeishuBotChannel implements Channel {
       }
     };
 
-    const handleEvent = (ev: Record<string, any>): void => {
+    // handleOpts.backfill marks a message replayed by the post-reconnect scan (see runBackfill): it
+    // bypasses the startup-age gate (the whole point is to process something older than startup) and
+    // relies on the persistent handled_messages dedupe instead of the in-memory event_id `seen` set.
+    const handleEvent = (ev: Record<string, any>, handleOpts: { backfill?: boolean } = {}): void => {
       if (ev.type && ev.type !== 'im.message.receive_v1') return;
       const msgType: string = ev.message_type ?? 'text';
       if (!HANDLED_MSG_TYPES.has(msgType)) {
@@ -580,7 +585,7 @@ export class FeishuBotChannel implements Channel {
         return;
       }
       const eventId: string | undefined = ev.event_id;
-      if (eventId) {
+      if (eventId && !handleOpts.backfill) {
         if (seen.has(eventId)) return;
         seen.add(eventId);
       }
@@ -629,14 +634,25 @@ export class FeishuBotChannel implements Channel {
       // Unparseable (0) deliberately leaves the gate open — dropping a live message is worse than a
       // stale reply — but it must be logged: an unparseable time here means replying to the backlog.
       const createMs = larkTimeToMs(ev.create_time);
-      if (createMs === 0) {
+      if (handleOpts.backfill) {
+        // Backfill deliberately processes pre-startup messages; the age gate would drop them.
+      } else if (createMs === 0) {
         log.warn(`无法解析事件时间 create_time=${ev.create_time}，本条跳过启动前过滤（可能回复到旧消息）`);
       } else if (createMs < startedAtMs - STARTUP_GRACE_MS) {
         log.info(`· 略过启动前的旧消息（${preview(text)}）`);
         return;
       }
 
-      log.info(`收到 [${ev.chat_type ?? 'group'}] ${preview(text)}`);
+      // Persistent dedupe (survives restarts, unlike the in-memory `seen`): the reconnect/restart
+      // backfill and any cross-restart event redelivery must not re-answer a message already handled.
+      // Marked here, after the age gate, so a normal pre-startup skip does NOT mark it — leaving it
+      // available for the backfill to pick up if it was genuinely missed.
+      if (messageId) {
+        if (store.wasMessageHandled(messageId)) return;
+        store.markMessageHandled(messageId);
+      }
+
+      log.info(`收到 [${ev.chat_type ?? 'group'}]${handleOpts.backfill ? '（补扫）' : ''} ${preview(text)}`);
 
       // Extract the sender open_id from the event envelope (field names vary by SDK version).
       const senderOpenId: string =
@@ -948,7 +964,108 @@ export class FeishuBotChannel implements Channel {
         '。Ctrl+C 结束。'
     );
 
-    const consumer: EventConsumer = consumeEvents(profile, handleEvent);
+    // Post-(re)connect backfill: recover @-mentions the event stream missed during a stall or while
+    // the worker was down. The event stream re-delivers nothing on reconnect and thread replies never
+    // enter the poll DB, so without this a mention that lands in a silent window is lost. Two sources:
+    //   1) DB-only, top-level: the poll collector captured them (raw IS NULL) but only the event path
+    //      replies, so they sit unanswered — recovered with no API call.
+    //   2) API rescan of recently-engaged threads: thread replies the poll cannot see.
+    // Bounded and best-effort; the outbound-guard is the final backstop against re-spam. Note the
+    // residual gap: a reply to a fully dormant thread (no other DB linkage) is not discoverable here —
+    // that case is bounded instead by the event-stream recycle (RECYCLE_MS).
+    const BACKFILL_LOOKBACK_MS = 30 * 60 * 1000;
+    const BACKFILL_THREAD_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+    const BACKFILL_MAX = 30;
+    let backfilling = false;
+    const synthAndHandle = (m: {
+      messageId?: string; chatId?: string; chatType?: string; msgType?: string; content?: string;
+      createTimeMs: number; senderOpenId?: string; senderType?: string;
+      threadId?: string; replyToId?: string; rootId?: string;
+    }): boolean => {
+      if (!m.messageId || !m.chatId || store.wasMessageHandled(m.messageId)) return false;
+      const ev: Record<string, any> = {
+        type: 'im.message.receive_v1',
+        message_id: m.messageId,
+        chat_id: m.chatId,
+        chat_type: m.chatType ?? 'group',
+        message_type: m.msgType ?? 'text',
+        content: m.content ?? '',
+        create_time: String(m.createTimeMs),
+        sender_id: m.senderOpenId ?? '',
+        sender_type: m.senderType,
+        thread_id: m.threadId,
+        reply_to: m.replyToId,
+        root_id: m.rootId,
+      };
+      try {
+        handleEvent(ev, { backfill: true });
+        return true;
+      } catch (e) {
+        log.warn('补扫单条处理失败（忽略）：', (e as Error).message);
+        return false;
+      }
+    };
+    const runBackfill = async (reason: string): Promise<void> => {
+      if (backfilling) return; // never overlap; a slow API scan must not stack up across reconnects
+      backfilling = true;
+      try {
+        const self = cfg.selfOpenId;
+        if (!self) { log.warn('事件补扫跳过：未知 bot open_id'); return; }
+        const nowMs = Date.now();
+        // Never look back past the feature's own epoch: before handled_messages existed nothing was
+        // marked, so pre-deploy @-mentions would all look unhandled and be re-answered. This makes the
+        // first run a no-op on history.
+        const epochMs = store.backfillEpochMs();
+        const sinceMs = Math.max(nowMs - BACKFILL_LOOKBACK_MS, epochMs);
+        let processed = 0;
+
+        // 1) top-level @-mentions the poll captured but the event stream missed — DB only.
+        for (const row of store.unhandledPolledMessagesSince(sinceMs, 100)) {
+          if (processed >= BACKFILL_MAX) break;
+          if (!row.mentions.includes(self)) continue;
+          if (row.senderType === 'app') continue;
+          if (synthAndHandle({
+            messageId: row.messageId, chatId: row.chatId, msgType: row.msgType, content: row.text,
+            createTimeMs: row.createTime, senderOpenId: row.senderOpenId, senderType: row.senderType,
+            threadId: row.threadId, replyToId: row.replyToId, rootId: row.rootId,
+          })) processed += 1;
+        }
+
+        // 2) thread replies (never in the poll DB): rescan recently-engaged threads via API. Thread
+        // DISCOVERY reaches back a week to surface dormant threads (whose only DB linkage is days old),
+        // but a thread message is only PROCESSED when newer than sinceMs — so the epoch floor there,
+        // not the discovery window, is what keeps history from being re-answered.
+        const keys = store.recentThreadScanKeysSince(nowMs - BACKFILL_THREAD_WINDOW_MS, 40);
+        for (const key of keys) {
+          if (processed >= BACKFILL_MAX) break;
+          let msgs: LarkMessage[] = [];
+          try { msgs = listThreadMessages(key, { pageSize: 20, order: 'desc', profile }); } catch { continue; }
+          for (const m of msgs) {
+            if (processed >= BACKFILL_MAX) break;
+            const tMs = larkTimeToMs(m.createTime);
+            if (tMs === 0 || tMs < sinceMs) continue; // only the recent window
+            if (!m.mentions.includes(self) || m.senderType === 'app') continue;
+            if (synthAndHandle({
+              messageId: m.messageId, chatId: m.chatId, msgType: m.msgType, content: m.content,
+              createTimeMs: tMs, senderOpenId: m.senderOpenId, senderType: m.senderType,
+              threadId: m.threadId, replyToId: m.replyToId, rootId: m.rootId,
+            })) processed += 1;
+          }
+        }
+        if (processed > 0) log.info(`事件补扫（${reason}）：补处理 ${processed} 条漏收的 @ 消息`);
+        else log.debug(`事件补扫（${reason}）：无漏收`);
+      } catch (e) {
+        log.warn('事件补扫失败（忽略）：', (e as Error).message);
+      } finally {
+        backfilling = false;
+      }
+    };
+
+    // onReady fires on every (re)connect, including the first — so backfill covers both a mid-run
+    // reconnect gap and anything missed while the worker was down before startup.
+    const consumer: EventConsumer = consumeEvents(profile, handleEvent, {
+      onReady: () => { void runBackfill('reconnect'); },
+    });
 
     // Re-run any replies a previous restart interrupted (clear orphaned reactions, refund LP, retry).
     recover();

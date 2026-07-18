@@ -206,6 +206,70 @@ export function getRecentChatMessages(
 }
 
 /**
+ * When the handled_messages feature (SCHEMA_V39) was applied, in ms. The backfill must never process
+ * messages older than this: before the feature existed nothing was marked handled, so every historical
+ * @-mention would look unhandled and be re-answered on first startup. Anchoring the backfill floor here
+ * makes the first post-deploy run a no-op on history and correct from then on. Falls back to now (fully
+ * conservative) if the row is somehow absent.
+ */
+export function backfillEpochMs(): number {
+  const row = getDb().prepare(
+    'SELECT applied_at FROM schema_migrations WHERE version = 39'
+  ).get() as { applied_at?: number } | undefined;
+  return row?.applied_at ? row.applied_at * 1000 : Date.now();
+}
+
+/** True once the bot has acted on this inbound message (see handled_messages / SCHEMA_V39). */
+export function wasMessageHandled(messageId: string): boolean {
+  if (!messageId) return false;
+  return getDb().prepare('SELECT 1 FROM handled_messages WHERE message_id = ?').get(messageId) !== undefined;
+}
+
+/** Mark an inbound message as acted-on. Idempotent (INSERT OR IGNORE). */
+export function markMessageHandled(messageId: string): void {
+  if (!messageId) return;
+  getDb().prepare('INSERT OR IGNORE INTO handled_messages(message_id) VALUES (?)').run(messageId);
+}
+
+/**
+ * Top-level messages the poll path captured (raw IS NULL — never arrived as an event) that the bot
+ * has NOT yet handled, since sinceMs. These are @-mentions the event stream missed while stalled: the
+ * poll collector still recorded them, but only the event path replies, so they went unanswered. The
+ * mention filter is left to the caller (mentions are parsed from the JSON column). Newest first, capped.
+ */
+export function unhandledPolledMessagesSince(sinceMs: number, limit = 50): MessageRow[] {
+  const rows = getDb().prepare(
+    `SELECT m.* FROM messages m
+       WHERE m.create_time >= ? AND m.deleted = 0
+         AND (m.raw IS NULL OR m.raw = '')
+         AND NOT EXISTS (SELECT 1 FROM handled_messages h WHERE h.message_id = m.message_id)
+       ORDER BY m.create_time DESC LIMIT ?`
+  ).all(Math.trunc(sinceMs), limit) as Record<string, unknown>[];
+  return rows.map(rowToMessage);
+}
+
+/**
+ * Keys for re-scanning recently-engaged threads: the distinct thread_id AND root_id values seen in
+ * messages since sinceMs. Both forms are accepted by listThreadMessages (it resolves an om_ root id to
+ * its thread), and events populate these inconsistently — some thread replies carry root_id but no
+ * thread_id — so unioning the two widens coverage. Newest-first, capped. A dormant thread whose ONLY
+ * recent activity is an un-captured missed reply cannot appear here (nothing links it in the DB); that
+ * residual gap is bounded by the event-stream recycle (see RECYCLE_MS), not recovered here.
+ */
+export function recentThreadScanKeysSince(sinceMs: number, limit = 40): string[] {
+  const rows = getDb().prepare(
+    `SELECT key, MAX(t) AS mt FROM (
+        SELECT thread_id AS key, create_time AS t FROM messages
+          WHERE thread_id IS NOT NULL AND thread_id <> '' AND create_time >= ? AND deleted = 0
+        UNION ALL
+        SELECT root_id AS key, create_time AS t FROM messages
+          WHERE root_id IS NOT NULL AND root_id <> '' AND create_time >= ? AND deleted = 0
+     ) GROUP BY key ORDER BY mt DESC LIMIT ?`
+  ).all(Math.trunc(sinceMs), Math.trunc(sinceMs), limit) as Array<{ key: string }>;
+  return rows.map((r) => r.key);
+}
+
+/**
  * Return every non-deleted message whose create_time falls in the half-open window [fromSec, toSec),
  * oldest→newest. Powers the daily ops-report narrative: callers group by chat_id and classify each
  * chat's tier (getChatTier) to decide which content may be summarized.

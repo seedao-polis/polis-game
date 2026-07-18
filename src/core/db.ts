@@ -938,6 +938,19 @@ UPDATE messages
 CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to_id) WHERE reply_to_id IS NOT NULL;
 `;
 
+// Records which inbound @-mention messages the bot has already acted on, keyed by the Feishu
+// message_id. The in-memory event_id dedupe (feishu-bot's `seen` Set) is per-process and cannot tell
+// the post-reconnect / post-restart backfill scan which messages were already answered — without this
+// table the backfill would re-answer everything recent every time it runs. Written once the message
+// passes the intake gates; checked by both the live handler (cross-restart redelivery) and the
+// backfill (skip-already-handled).
+const SCHEMA_V39 = `
+CREATE TABLE IF NOT EXISTS handled_messages (
+  message_id TEXT PRIMARY KEY,
+  handled_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+`;
+
 /** Apply ordered, idempotent schema migrations tracked in schema_migrations. */
 function runMigrations(db: Db): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -987,6 +1000,7 @@ function runMigrations(db: Db): void {
     { version: 36, description: 'chests (owned virtual LP accounts, e.g. 公益宝箱)', sql: SCHEMA_V36 },
     { version: 37, description: 'index pt_ledger.ref_message_id (per-turn LP aggregation lookups)', sql: SCHEMA_V37 },
     { version: 38, description: 'messages.reply_to_id / root_id (reply linkage, backfilled from raw)', sql: SCHEMA_V38 },
+    { version: 39, description: 'handled_messages (dedupe backfilled/redelivered @-mentions across restarts)', sql: SCHEMA_V39 },
   ];
   for (const m of migrations) {
     if (applied.has(m.version)) continue;

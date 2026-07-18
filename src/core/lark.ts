@@ -15,6 +15,8 @@ const MAX_BUFFER = 20 * 1024 * 1024;
 
 export interface LarkMessage {
   messageId: string;
+  /** Owning chat (present on thread-list / chat-list responses; used by backfill to route the message). */
+  chatId?: string;
   position: number;
   content: string;
   msgType: string;
@@ -988,30 +990,62 @@ export function listMessages(
     throw new LarkApiError('读取消息失败', res);
   }
   const items: any[] = res.data?.messages ?? [];
-  return items.map((m) => {
-    const senderFields = extractSenderFields(m.sender);
-    return {
-      messageId: m.message_id,
-      position: Number.parseInt(m.message_position, 10),
-      content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
-      msgType: m.msg_type,
-      createTime: m.create_time,
-      sender: m.sender ?? {},
-      mentions: extractMentions(m),
-      senderName: extractSenderName(m.sender),
-      senderOpenId: senderFields.senderOpenId,
-      senderIdType: senderFields.senderIdType,
-      senderType: senderFields.senderType,
-      senderTenantKey: senderFields.senderTenantKey,
-      threadId: typeof m.thread_id === 'string' ? m.thread_id : undefined,
-      replyToId: typeof m.parent_id === 'string' ? m.parent_id : undefined,
-      rootId: typeof m.root_id === 'string' ? m.root_id : undefined,
-      threadMessagePosition: m.thread_message_position != null
-        ? Number(m.thread_message_position)
-        : undefined,
-      ...(opts.includeReactions ? { reactions: extractReactions(m) } : {}),
-    };
-  });
+  return items.map((m) => mapLarkMessage(m, opts.includeReactions));
+}
+
+/** Map one raw message object (from the list / thread-list API) to a LarkMessage. */
+function mapLarkMessage(m: any, includeReactions?: boolean): LarkMessage {
+  const senderFields = extractSenderFields(m.sender);
+  return {
+    messageId: m.message_id,
+    chatId: typeof m.chat_id === 'string' ? m.chat_id : undefined,
+    position: Number.parseInt(m.message_position, 10),
+    content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+    msgType: m.msg_type,
+    createTime: m.create_time,
+    sender: m.sender ?? {},
+    mentions: extractMentions(m),
+    senderName: extractSenderName(m.sender),
+    senderOpenId: senderFields.senderOpenId,
+    senderIdType: senderFields.senderIdType,
+    senderType: senderFields.senderType,
+    senderTenantKey: senderFields.senderTenantKey,
+    threadId: typeof m.thread_id === 'string' ? m.thread_id : undefined,
+    replyToId: typeof m.parent_id === 'string' ? m.parent_id : undefined,
+    rootId: typeof m.root_id === 'string' ? m.root_id : undefined,
+    threadMessagePosition: m.thread_message_position != null
+      ? Number(m.thread_message_position)
+      : undefined,
+    ...(includeReactions ? { reactions: extractReactions(m) } : {}),
+  };
+}
+
+/**
+ * List the messages of one thread (topic reply chain), for the post-reconnect backfill to recover
+ * @-mentions the event stream missed. Accepts a thread id (omt_) or any message id (om_) in that
+ * thread — the CLI resolves an om_ to its thread. Unlike the chat-container list (listMessages),
+ * this is the ONLY way to see thread replies: they never appear in the chat-level message list.
+ * Returns [] on any error (backfill is best-effort and must never throw into the event loop).
+ */
+export function listThreadMessages(
+  threadOrMessageId: string,
+  opts: { pageSize?: number; order?: 'asc' | 'desc'; profile?: string } = {}
+): LarkMessage[] {
+  if (!threadOrMessageId) return [];
+  const res = larkExec(
+    [
+      'im', '+threads-messages-list',
+      '--thread', threadOrMessageId,
+      '--order', opts.order ?? 'desc',
+      '--page-size', String(opts.pageSize ?? 20),
+      '--no-reactions',
+      '--format', 'json',
+    ],
+    { profile: opts.profile }
+  );
+  if (!res.ok) return [];
+  const items: any[] = res.data?.messages ?? [];
+  return items.map((m) => mapLarkMessage(m, false));
 }
 
 /** Reply linkage extracted from an event envelope. Both fields are '' on an original post. */
@@ -1672,6 +1706,23 @@ const BASE_BACKOFF_MS = 3000;
 const MAX_BACKOFF_MS = 60000;
 const STABLE_MS = 5000;
 
+// Proactive recycle window. A half-open connection (the socket to the bus daemon still ESTABLISHED
+// but no longer delivering) leaves the child neither exiting nor erroring, so the exit-driven
+// reconnect never fires and the stream goes silently deaf — the failure mode behind the missed 22:27
+// message. lark-cli emits NO idle keepalive (verified: over 45s a live consumer prints only its ready
+// marker then nothing), so "time since we last heard from the child" cannot tell a stall apart from a
+// genuinely quiet chat — a watchdog on that signal would recycle all night. Instead the child is given
+// a bounded `--timeout`: it self-exits cleanly (exit 0, reason: timeout) every RECYCLE_MS, the exit
+// handler reconnects, and any half-open stall is thereby capped at RECYCLE_MS instead of lasting until
+// the next real disconnect. The ~3s reconnect gap each cycle is covered by the post-connect backfill
+// scan (see the consumer's onReconnect). Not too frequent: each cycle re-runs this key's server-side
+// subscribe/unsubscribe, so recycling every few minutes would churn it. Overridable via
+// LARK_EVENT_RECYCLE_MS (ops tuning; also lets a test drive a fast recycle), floored at 10s.
+const RECYCLE_MS = (() => {
+  const n = Number(process.env.LARK_EVENT_RECYCLE_MS);
+  return Number.isFinite(n) && n >= 10_000 ? n : 20 * 60 * 1000;
+})();
+
 /** Interpret lark-cli error reports (ok:false objects) from the event subprocess stderr, extracting a readable message and fix hint. */
 function parseConsumeError(stderr: string): { message: string; hint?: string } | null {
   const trimmed = stderr.trim();
@@ -1697,30 +1748,48 @@ function parseConsumeError(stderr: string): { message: string; hint?: string } |
  * keeping stdin as a pipe (event consume treats closing stdin as a stop signal),
  * parse JSON line by line and pass it to onEvent. On connection failure, print the specific error and reconnect
  * with exponential backoff. Returns a stoppable handle.
+ *
+ * The child is spawned with `--timeout` so it self-exits cleanly every RECYCLE_MS and the exit handler
+ * reconnects — this caps any silent half-open stall (see RECYCLE_MS). opts.onReady fires each time the
+ * child prints its `[event] ready event_key=<key>` marker, i.e. on every (re)connect, so the caller can
+ * backfill the events that may have been missed during the preceding gap.
  */
 export function consumeEvents(
   profile: string | undefined,
   onEvent: (ev: Record<string, any>) => void,
-  opts: { eventKey?: string } = {}
+  opts: { eventKey?: string; onReady?: () => void } = {}
 ): EventConsumer {
   const run = resolveLarkRun();
   if (!run) {
     throw new Error('找不到 lark-cli run.js（npm i -g @larksuite/cli 或设 LARK_RUN）');
   }
   const eventKey = opts.eventKey ?? 'im.message.receive_v1';
+  const timeoutArg = `${Math.round(RECYCLE_MS / 1000)}s`;
   let running = true;
   let child: ChildProcess | undefined;
   let backoffMs = BASE_BACKOFF_MS;
+
+  // A child that ran at least STABLE_MS (including every clean --timeout recycle) reconnects fast at
+  // the base interval; a fast failure (bad scope / already-connected) backs off to avoid flooding.
+  const reconnect = (startedAt: number): void => {
+    backoffMs = Date.now() - startedAt < STABLE_MS ? Math.min(backoffMs * 2, MAX_BACKOFF_MS) : BASE_BACKOFF_MS;
+    process.stderr.write(`  ${Math.round(backoffMs / 1000)} 秒后重连…\n`);
+    setTimeout(() => { if (running) start(); }, backoffMs);
+  };
 
   const start = (): void => {
     const profileArgs = profile ? ['--profile', profile] : [];
     const startedAt = Date.now();
     let stderrBuf = '';
+    let exited = false;
+    // --timeout makes the child self-terminate cleanly (exit 0, reason: timeout) every RECYCLE_MS,
+    // which the exit handler treats like any disconnect and reconnects, bounding half-open stalls.
     child = spawn(
       process.execPath,
-      [run, ...profileArgs, 'event', 'consume', eventKey, '--as', 'bot'],
+      [run, ...profileArgs, 'event', 'consume', eventKey, '--as', 'bot', '--timeout', timeoutArg],
       { stdio: ['pipe', 'pipe', 'pipe'] }
     );
+    const self = child;
 
     if (child.stdout) {
       const rl = readline.createInterface({ input: child.stdout });
@@ -1738,12 +1807,29 @@ export function consumeEvents(
       });
     }
     // Both info and errors from the event subprocess go through stderr (including ok:false subscription/permission validation errors);
-    // accumulate first, then interpret it as a whole when the subprocess exits, printing the real error message and fix hint.
-    child.stderr?.on('data', (d: Buffer) => {
-      stderrBuf += d.toString();
+    // accumulate for the exit-time error report, but also scan line by line for the ready marker that
+    // signals a (re)established subscription — the trigger for the caller's post-reconnect backfill.
+    if (child.stderr) {
+      const erl = readline.createInterface({ input: child.stderr });
+      erl.on('line', (line) => {
+        stderrBuf += line + '\n';
+        if (opts.onReady && line.includes(`ready event_key=${eventKey}`)) {
+          try { opts.onReady(); } catch { /* backfill is best-effort, never crash the consumer */ }
+        }
+      });
+    }
+    // spawn/runtime failure surfaces as 'error' (e.g. ENOENT) and may not be followed by 'exit';
+    // without this handler an unhandled 'error' would crash the whole worker. Reconnect like an exit.
+    child.on('error', (err) => {
+      if (!running || exited) return;
+      exited = true;
+      process.stderr.write(`事件子进程错误（${eventKey}）：${(err as Error).message}\n`);
+      reconnect(startedAt);
     });
     child.on('exit', (code) => {
-      if (!running) return;
+      if (!running || exited) return;
+      exited = true;
+      if (self.stdout) self.stdout.destroy();
       const errInfo = parseConsumeError(stderrBuf);
       if (errInfo) {
         process.stderr.write(`事件连接失败（${eventKey}）：${errInfo.message}\n`);
@@ -1751,15 +1837,7 @@ export function consumeEvents(
       } else if (code) {
         process.stderr.write(`事件连接结束（code=${code}）\n`);
       }
-      // Fast failures (usually subscription/permission issues that reconnecting won't fix) use exponential backoff to avoid flooding every 3 seconds;
-      // if a connection that was stable for a while then drops, reconnect quickly using the base interval.
-      if (Date.now() - startedAt < STABLE_MS) {
-        backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
-      } else {
-        backoffMs = BASE_BACKOFF_MS;
-      }
-      process.stderr.write(`  ${Math.round(backoffMs / 1000)} 秒后重连…\n`);
-      setTimeout(start, backoffMs);
+      reconnect(startedAt);
     });
   };
 
@@ -1768,7 +1846,9 @@ export function consumeEvents(
   return {
     stop(): void {
       running = false;
-      child?.kill();
+      // SIGTERM (the default), never SIGKILL: a hard kill skips lark-cli's OAPI unsubscribe and leaks
+      // the server-side subscription ("subscription already exists" / duplicate delivery on restart).
+      child?.kill('SIGTERM');
     },
     child(): ChildProcess | undefined {
       return child;
