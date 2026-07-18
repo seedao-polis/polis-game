@@ -197,3 +197,33 @@
 - `configs/agents.json` 里 `tudigong-user` 是 `enabled:false`，**但它照跑不误**——`agent.ts:141-147` 明写「启动模式 `--bot/--user/--both` 才是权威，与 per-agent `enabled` 无关」，且 `--sup` 会（`AGENT_COLLECTOR_SOUL`）把该 soul 的 user 频道强拉起来当 collect-only 采集器。**别拿 `enabled:false` 推断「这条路没在跑」。**
 
 **测试**：`src/core/reply-context.test.ts`（用真实事故时间线复刻：窗口够不到原文 → 引用块仍在）+ `src/core/lark.test.ts`（用**真实信封**钉字段名）。⚠️ 写这类测试要做**突变验证**：头条那条「读真实信封」测试其实挡不住字段名改回 `parent_id`——因为真实信封里 `reply_to === root_id`，root_id 兜底把错字段名掩盖了。必须补一条「只有 `reply_to`、没有 `root_id` 可兜底」的用例才真正挡得住。
+
+---
+
+## 17. 事件流 silent stall 导致漏收 @ 消息 + 话题感知补扫（2026-07-17 第二次事故）
+
+**症状**：用户637073 在旧话题里 @ 土地神 `follow SeeAlpha`（22:27），土地神**毫无反应**。日志显示 19:37 那个 serve 实例在 **21:51→22:39 整整 47 分钟一行日志都没有**，那条消息落在静默窗内、连「收到」都没打——**投递层就没收到**，不是收到不处理。22:39 重启换新 consumer 后事件流自愈（P2P 受控测试 6 秒被收到）。
+
+**根因（逐行核实 `src/core/lark.ts:consumeEvents`）**：
+1. **事件流会 silent stall 且无检测**。`event consume` 连的是共享常驻 **event bus daemon**（`lark-cli event status` 看，pid 长期不换、跑了 7.5 天）。半开连接时子进程**不退不报错**→只有 `on('exit')` 的重连逻辑永不触发→静默哑掉。原代码**没有 stall watchdog、没有 `child.on('error')`**。
+2. **lark-cli 不吐 keepalive**（45s 实测：只在首连打 `[event] ready event_key=<key>` 然后一片空白）→「距上次收到任何行多久」**无法**区分 stall 和安静时段，watchdog 会误杀。
+3. **话题内 @ 只有事件流一条命**：轮询用 `im +chat-messages-list`（container=chat）**看不到 thread reply**（实测库里所有话题回覆都是 event 来源、`message_position`=None/thread_id 常 NULL）。事件流一漏，轮询兜不住。
+4. 重启也救不回：`event consume` 无 offset 补发，且启动旧消息闸门（`STARTUP_GRACE_MS=5000`）把重启前的消息当「启动前旧消息」丢掉。
+5. supervisor 只监控 worker **进程存活**（`process.kill(pid,0)`），看不到进程**内**事件流哑没哑。
+
+**修复 G1（`lark.ts` consumeEvents）——把 stall 上界压死**：
+- 给 spawn 加 **`--timeout`**（`RECYCLE_MS`=20min，env `LARK_EVENT_RECYCLE_MS` 可调、floor 10s）：子进程每 20min 干净退出（code 0 reason:timeout）→ 既有 exit 重连 → 全新连接 + 重建订阅。**任意半开 stall ≤20min**，不依赖 keepalive。
+- 补 `child.on('error')`（防未处理 error 崩 worker）；`stop()` 用 **SIGTERM 不用 SIGKILL**（横幅明警：kill -9 漏 OAPI 退订、泄漏服务端订阅→重启报 "subscription already exists"/重复投递）。
+- 新增 `onReady`（扫 stderr `ready event_key=` 标记，每次首连+重连触发）= G2 挂载点。
+- **G1 本身就能避免本次事故**：47min stall 会在 20min（22:11）被回收成新连接，22:27 时连接已健康 → 正常投递。
+
+**修复 G2（`feishu-bot.ts` runBackfill，挂 onReady）——漏收补扫 catch-all**：
+- ① **顶层漏收**：`store.unhandledPolledMessagesSince`（`raw IS NULL`=poll 采到但事件漏、未 handled、@ 机器人）→ **纯 DB 零 API**。
+- ② **话题漏收**：`store.recentThreadScanKeysSince`（thread_id ∪ root_id、7 天发现窗）→ **`listThreadMessages`**（新增，`im +threads-messages-list`，仓库首次用；事件流/CLI 的 content 都是**已解析纯文本**，与事件同构，synth envelope 直接喂 handleEvent）。
+- 去重：持久表 **`handled_messages`（migration v39）**；handleEvent **过启动闸门后** `markMessageHandled`（过闸门前 skip 的旧消息不标记，留给 backfill）；backfill 传 `{backfill}` **豁免闸门**。
+- ⚠️**防刷屏 epoch 守卫**：`backfillEpochMs`=v39 `applied_at`。首次上线 `handled_messages` 空，若无守卫会把近 30min 已回过的 @ **全部重回**（实测线上有 18 条会被误重回）。`sinceMs=max(now-30min, epoch)`→首次上线≈now→**0 候选=no-op**。上限 `BACKFILL_MAX=30` + outbound-guard 兜底。
+- ⚠️**已知边界（诚实记录）**：**休眠话题**（DB 里无任何 thread_id/root_id 关联）G2 发现不了——事件信封对话题回覆的关联字段**不一致**（白鱼那条显式「回复」带 root_id，07-11 那批直接发在话题里连 root_id 都无）。本次事故 thread 正是如此，靠 **G1 兜底**。backfill 的 API 路径可靠落库 root_id → 话题**逐渐自我可发现**。
+
+**测试**：`src/core/backfill-queries.test.ts`（raw-NULL 过滤、handled 排除、thread key 合并、epoch）+ G1 用 `LARK_EVENT_RECYCLE_MS=15s` 实测回收→重连→onReady 三次。
+
+**⚠️ 手动补回漏收消息的套路**（本次已做）：`im +threads-messages-list --thread <omt_/om_> --order desc` 拿漏收消息的 `message_id`/`sender open_id`（外部群 user 身份发消息报 **230027**，改发 **P2P 私信** bot 测活性）→ 订阅类走 `store.subscribeMeetupTag`（在 **`.agent/tudigong.db` soul 库**不是 shared.db，migration v24）→ `im +messages-reply --message-id <id> --reply-in-thread --as bot` 补话题内回覆（文案抄别人的：`XXX，已为你订阅标签【SeeAlpha】…`）→ 记 journal。**bot 的 open_id** 从事故信封 `mentions[].id`（name=城邦土地神）拿：`ou_f670987e73829c00db5c49d81deb9479`；`cfg.selfOpenId` 是代码里的来源。
