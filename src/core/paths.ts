@@ -108,6 +108,13 @@ export function buildAgentMcpConfig(opts: {
   const larkRun = resolveLarkRun();
   if (larkRun) env.LARK_RUN = larkRun;
   if (process.env.APPDATA) env.APPDATA = process.env.APPDATA;
+  // Explicit passthrough of the PostgreSQL connection settings (rather than relying on the MCP
+  // subprocess inheriting the parent's full environment, which the kimi-code launcher's actual
+  // behavior here — merge vs replace — was not verified): without this, the MCP tool subprocess
+  // (which the LP-mutating pt_grant tool runs inside) could silently fall back to SQLite even
+  // though the framework process itself is PostgreSQL-backed.
+  if (process.env.AGENT_PG_URL) env.AGENT_PG_URL = process.env.AGENT_PG_URL;
+  if (process.env.AGENT_PG_POOL_MAX) env.AGENT_PG_POOL_MAX = process.env.AGENT_PG_POOL_MAX;
   return JSON.stringify({
     mcpServers: {
       agent: {

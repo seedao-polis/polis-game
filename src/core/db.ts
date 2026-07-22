@@ -1,8 +1,308 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { DatabaseSync as Db } from 'node:sqlite';
+import pg, { types as pgTypes, type Pool as PgPool, type PoolClient, type PoolConfig } from 'pg';
 import { RUNTIME_DIR } from './paths.js';
+import { log } from './log.js';
+import { classifySlowQuery as classifySlowQueryImpl, type SlowQueryCause, type SlowQueryTiming } from './db-slow-query.js';
+import {
+  PgCircuitBreaker,
+  PgUnavailableError,
+  isPgUnavailableError,
+  PG_UNAVAILABLE_REPLY_ZH,
+  shouldCountAsCircuitFailure,
+} from './circuit-breaker.js';
+
+// Re-exported for backward compatibility: db-slow-query.test.ts and any other call site imports
+// classifySlowQuery from db.js. The implementation itself lives in db-slow-query.ts so
+// circuit-breaker.ts can use the same arithmetic without importing db.ts (which would cycle back,
+// since db.ts is the module that constructs the circuit breakers below).
+export { PgUnavailableError, isPgUnavailableError, PG_UNAVAILABLE_REPLY_ZH };
+export function classifySlowQuery(t: SlowQueryTiming, thresholdMs = PG_SLOW_QUERY_MS): SlowQueryCause {
+  return classifySlowQueryImpl(t, thresholdMs);
+}
+
+// node-postgres defaults NUMERIC (OID 1700) and BIGINT/int8 (OID 20) columns to JS strings (arbitrary
+// precision / values that could exceed Number.MAX_SAFE_INTEGER). Every NUMERIC/BIGINT column this
+// schema uses (LP amounts, unix-second timestamps, auto-increment ids) stays comfortably inside
+// Number's safe range, so both are coerced back to `number` here — once, at module load, before any
+// Pool is constructed — to match node:sqlite's existing (always-number) behavior. Must not be set a
+// second time anywhere else in the codebase.
+pgTypes.setTypeParser(1700, (v: string) => parseFloat(v));
+pgTypes.setTypeParser(20, (v: string) => parseInt(v, 10));
+
+// Observability thresholds for the PostgreSQL backend (env-tunable). A query slower than
+// AGENT_PG_SLOW_QUERY_MS logs a warning with the truncated SQL text; a transaction holding its pooled
+// connection longer than AGENT_PG_SLOW_TX_MS logs a warning when it ends (a long-lived transaction
+// both starves the small pool and blocks server-side vacuum). The routine backend-selection line is
+// demoted to debug inside the MCP subprocess so each LLM turn does not mint its own log file under
+// logs/; warnings and errors keep their normal level in every process.
+const PG_SLOW_QUERY_MS = Number(process.env.AGENT_PG_SLOW_QUERY_MS) || 2000;
+const PG_SLOW_TX_MS = Number(process.env.AGENT_PG_SLOW_TX_MS) || 30000;
+const IS_MCP_PROCESS = /mcp-server/.test(process.argv[1] ?? '');
+
+/** Read a millisecond knob from the environment, preserving an explicit 0 (= feature disabled). */
+function envMs(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+// Client-side failure bounds for the PostgreSQL backend (env-tunable; 0 disables one). The database
+// is reached over a WAN link, where a single lost packet turns into TCP retransmission backoff and a
+// query can hang for a minute or more while the server itself sits idle. Left unbounded, every such
+// stall is absorbed silently: connect() waits forever, the statement waits forever, and a transaction
+// holding that connection squats on the pool for the whole stall. statement_timeout (server-side) is
+// set below query_timeout (client-side) so the server cancels first and the caller sees a real
+// PostgreSQL error instead of a client-side abort with the statement still running on the server.
+// Deliberately NOT set: idle_in_transaction_session_timeout — tx() bodies legitimately await external
+// I/O (Feishu calls) between statements, and bounding that would abort correct transactions.
+const PG_CONNECT_TIMEOUT_MS = envMs('AGENT_PG_CONNECT_TIMEOUT_MS', 8000);
+const PG_STATEMENT_TIMEOUT_MS = envMs('AGENT_PG_STATEMENT_TIMEOUT_MS', 15000);
+const PG_IDLE_TIMEOUT_MS = envMs('AGENT_PG_IDLE_TIMEOUT_MS', 60000);
+
+/** One-line summary of a SQL statement for log output: whitespace collapsed, length capped. */
+function sqlPreview(sql: string): string {
+  return sql.replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+
+// Distinguishes "PostgreSQL was slow" from "the reply arrived promptly but Node's event loop was
+// blocked so the promise could not resolve" — a blocked loop inflates end-to-end query timings while
+// the database itself is fast. An unref'd ticker accumulates every loop stall it observes into a
+// monotonic counter; the counter's delta across a phase is that phase's share of blocked time,
+// correct even when the stall came as several separate chunks (timers fire before poll callbacks in
+// an event-loop turn, so the final chunk is counted before the query's own resolution runs). Started
+// lazily with the first pool so SQLite-only souls and one-shot CLI runs are unaffected (unref keeps
+// it from holding any process alive).
+//
+// The floor exists because timer scheduling has a few ms of inherent jitter that would otherwise
+// accumulate into phantom "blocked" time and wrongly excuse a genuinely slow database. It is kept low
+// (rather than at a round 100ms) so fine-grained CPU contention — hundreds of sub-100ms stalls while
+// dozens of lark-cli subprocesses run — is measured instead of silently rounded down to zero.
+const LOOP_TICK_MS = 250;
+const LOOP_LAG_FLOOR_MS = 20;
+let _lastLoopTick = 0;
+let _cumLoopBlockedMs = 0;
+let _maxLoopLagMs = 0;
+function ensureLoopLagSampler(): void {
+  if (_lastLoopTick) return;
+  _lastLoopTick = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    const lag = now - _lastLoopTick - LOOP_TICK_MS;
+    if (lag > LOOP_LAG_FLOOR_MS) {
+      _cumLoopBlockedMs += lag;
+      if (lag > _maxLoopLagMs) _maxLoopLagMs = lag;
+    }
+    _lastLoopTick = now;
+  }, LOOP_TICK_MS).unref();
+}
+
+/**
+ * Loop-tick staleness at this instant. Complements the cumulative counter: when the blocking call
+ * runs inside a poll-phase callback, a query on another ready socket can resolve in that same poll
+ * phase BEFORE the ticker's timer gets to record the stall — the cumulative delta misses it, but the
+ * tick's staleness still exposes it.
+ */
+function loopTickStalenessMs(): number {
+  return _lastLoopTick ? Math.max(0, Date.now() - _lastLoopTick - 500) : 0;
+}
+
+/**
+ * Pool occupancy at the instant a query asked for a connection — that is the moment a wait needs
+ * explaining, so all three counters are sampled before the wait, never after. Note `waiting` counts
+ * the queue as it stood on arrival and so excludes this query's own turn in line: a lone waiter
+ * legitimately reports 队0, and `总`/`闲` are what show the pool was saturated.
+ */
+export interface PoolSnapshot { total: number; idle: number; waiting: number }
+
+/** Log prefix per cause. A stall is a real problem whatever caused it, so only 'none' stays quiet. */
+const SLOW_QUERY_LABEL: Record<SlowQueryCause, string> = {
+  db: 'PG 慢查询',
+  pool: 'PG 池饥饿',
+  loop: 'PG 查询被事件循环拖慢',
+  none: 'PG 查询端到端',
+};
+
+function reportSlowQuery(i: SlowQueryTiming & { ms: number; sql: string; pool: PoolSnapshot | null }): void {
+  const execHint = i.execBlockedMs >= 1000 ? `[阻塞 ${i.execBlockedMs}ms]` : '';
+  const waitHint = i.waitBlockedMs >= 1000 ? `[阻塞 ${i.waitBlockedMs}ms]` : '';
+  const poolHint = i.pool ? `，取连接前池 总${i.pool.total}/闲${i.pool.idle}/队${i.pool.waiting}` : '';
+  const stallHint = _maxLoopLagMs >= 1000 ? `，进程最长停顿 ${_maxLoopLagMs}ms` : '';
+  const detail = `（执行 ${i.execMs}ms${execHint}，池等待 ${i.poolWaitMs}ms${waitHint}${poolHint}${stallHint}）`;
+  const cause = classifySlowQuery(i);
+  const line = `${SLOW_QUERY_LABEL[cause]} ${i.ms}ms${detail}：${sqlPreview(i.sql)}`;
+  if (cause === 'none') log.debug(line);
+  else log.warn(line);
+}
+
+/**
+ * Connection settings shared by both pools. Everything here exists because the server is reached
+ * across a WAN link rather than a local socket:
+ *   - application_name names the pool AND the OS process, so a backend seen in pg_stat_activity can
+ *     be traced back to which of the several agent processes opened it;
+ *   - keepAlive: the server's own tcp_keepalives_idle is 2h, long enough for a NAT or firewall on
+ *     the path to drop an idle flow unnoticed — the next query on that connection then hangs on TCP
+ *     retransmits instead of failing;
+ *   - min/idleTimeoutMillis: pg reaps idle connections after 10s by default, so each polling sweep
+ *     pays a fresh TCP+auth handshake (~2s across this link, and one lost SYN doubles it). min:1
+ *     keeps the last connection from being reaped at all (pg-pool only reaps above min);
+ *   - allowExitOnIdle: min:1 means an idle connection is never removed, which would keep one-shot CLI
+ *     runs alive forever waiting on its socket. This unrefs idle clients so the process still exits
+ *     naturally, without closing the connection the long-running serve process wants kept warm.
+ */
+function pgPoolConfig(schema: string, max: number, label: string): PoolConfig {
+  return {
+    connectionString: resolvePgConnectionString(process.env.AGENT_PG_URL as string),
+    max,
+    min: 1,
+    allowExitOnIdle: true,
+    options: `-c search_path=${schema}`,
+    application_name: `${dbName()}-${label}-${process.pid}`,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
+    connectionTimeoutMillis: PG_CONNECT_TIMEOUT_MS,
+    idleTimeoutMillis: PG_IDLE_TIMEOUT_MS,
+    statement_timeout: PG_STATEMENT_TIMEOUT_MS,
+    query_timeout: PG_STATEMENT_TIMEOUT_MS > 0 ? PG_STATEMENT_TIMEOUT_MS + 2000 : undefined,
+  };
+}
+
+/** Announce which backend a pool serves, once per process, at pool construction. */
+function logBackendChoice(which: string, schema: string, max: number): void {
+  const line = `${which}后端：PostgreSQL（schema=${schema}，pool max=${max}）`;
+  if (IS_MCP_PROCESS) log.debug(line);
+  else log.info(line);
+}
+
+/** A single query result row set, shape-compatible whether the backend is PostgreSQL or SQLite. */
+export interface SqlResult<T = Record<string, unknown>> {
+  rows: T[];
+  rowCount: number;
+}
+
+/** Minimal common query interface the store layer programs against, independent of the backend. */
+export interface SqlExecutor {
+  query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<SqlResult<T>>;
+}
+
+/**
+ * The target server does not speak SSL at all: pg-connection-string >=2.14 treats
+ * sslmode=prefer/require/verify-ca as aliases for verify-full and unconditionally attempts a TLS
+ * handshake, which this server rejects outright ("The server does not support SSL connections")
+ * instead of falling back to plaintext the way libpq's real `prefer` semantics would. AGENT_PG_URL
+ * keeps the user-supplied sslmode=prefer for documentation purposes; every Pool construction strips
+ * it so the driver connects in plaintext.
+ */
+function resolvePgConnectionString(raw: string): string {
+  const u = new URL(raw);
+  u.searchParams.delete('sslmode');
+  return u.toString();
+}
+
+/**
+ * Wrap a node:sqlite handle as a SqlExecutor so store code written once against `$N` placeholders
+ * (the PostgreSQL convention) runs unchanged when AGENT_PG_URL is unset. `$1,$2,...` placeholders are
+ * translated to node:sqlite's positional `?` by expanding EVERY occurrence (not just the first) into
+ * its own `?` bound to `params[N-1]` — a handful of statements (e.g. spendPt's guarded UPDATE) reuse
+ * the same `$N` twice, which PostgreSQL binds to one value both times but node:sqlite's `?` cannot, so
+ * a naive one-shot regex substitution would silently under-supply parameters for those statements.
+ * A statement is treated as row-returning (`.all()`) when it starts with SELECT/WITH or carries a
+ * RETURNING clause (both node:sqlite and PostgreSQL support RETURNING on INSERT/UPDATE/DELETE);
+ * everything else runs via `.run()`, reporting `changes` as rowCount with no rows.
+ *
+ * ILIKE (the FTS5→ILIKE downgrade's replacement operator) is SQLite-illegal syntax, so it is textually
+ * downgraded to LIKE here — SQLite's LIKE is already ASCII case-insensitive by default (case-sensitive
+ * only via an opt-in pragma this codebase never sets), so the substitution is behavior-preserving for
+ * this fallback path; the ESCAPE clause syntax itself is identical in both engines.
+ */
+function sqliteExecutor(db: Db): SqlExecutor {
+  return {
+    async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<SqlResult<T>> {
+      const expanded: unknown[] = [];
+      const translated = sql
+        .replace(/\bILIKE\b/gi, 'LIKE')
+        .replace(/\$(\d+)/g, (_match, n: string) => {
+          expanded.push(params[Number(n) - 1]);
+          return '?';
+        });
+      const rowReturning = /^\s*(select|with)\b/i.test(translated) || /\breturning\b/i.test(translated);
+      const stmt = db.prepare(translated);
+      if (rowReturning) {
+        const rows = stmt.all(...(expanded as never[])) as T[];
+        return { rows, rowCount: rows.length };
+      }
+      const info = stmt.run(...(expanded as never[]));
+      return { rows: [], rowCount: Number(info.changes ?? 0) };
+    },
+  };
+}
+
+/**
+ * Wrap a pg Pool or checked-out PoolClient as a SqlExecutor. The Pool case checks a connection out
+ * explicitly (instead of pool.query()) so time spent waiting for a free connection is measured
+ * separately from statement execution — the two have entirely different remedies (pool starvation vs
+ * a slow database), and a merged number cannot tell them apart.
+ *
+ * Every query outcome is also reported to `breaker`: a success closes it (from any state); a failure
+ * is fed through shouldCountAsCircuitFailure first, so a query that merely failed because THIS
+ * process starved its own event loop (see circuit-breaker.ts's doc comment) never counts against it.
+ */
+function pgExecutor(client: PgPool | PoolClient, breaker: PgCircuitBreaker): SqlExecutor {
+  return {
+    async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<SqlResult<T>> {
+      const started = Date.now();
+      const blockedBeforeWait = _cumLoopBlockedMs;
+      const pool = (client as PgPool).totalCount !== undefined ? (client as PgPool) : null;
+      // Occupancy has to be sampled BEFORE the wait, because that is the instant being explained:
+      // "was the pool saturated when this query asked for a connection?". Sampling it at report time
+      // instead answers a different question — what the pool looked like once this query had already
+      // been served — and for a long query the two can disagree completely (siblings finish and free
+      // their connections in between, so a wait caused by a full pool gets reported next to an idle one).
+      const poolStats: PoolSnapshot | null = pool
+        ? { total: pool.totalCount, idle: pool.idleCount, waiting: pool.waitingCount }
+        : null;
+      let checked: PoolClient | null = null;
+      try {
+        let poolWaitMs = 0;
+        let waitBlockedMs = 0;
+        let conn: PgPool | PoolClient = client;
+        if (pool) {
+          checked = await pool.connect();
+          poolWaitMs = Date.now() - started;
+          waitBlockedMs = _cumLoopBlockedMs - blockedBeforeWait;
+          conn = checked;
+        }
+        const execStart = Date.now();
+        const blockedBeforeExec = _cumLoopBlockedMs;
+        const res = await conn.query(sql, params as never[]);
+        breaker.recordSuccess();
+        const ms = Date.now() - started;
+        if (ms >= PG_SLOW_QUERY_MS) {
+          const execBlockedMs = Math.max(_cumLoopBlockedMs - blockedBeforeExec, loopTickStalenessMs());
+          reportSlowQuery({
+            ms, execMs: Date.now() - execStart, execBlockedMs, poolWaitMs, waitBlockedMs, sql,
+            pool: poolStats,
+          });
+        }
+        return { rows: res.rows as T[], rowCount: res.rowCount ?? 0 };
+      } catch (e) {
+        // Callers usually log their own business-level failure without the SQL context; attach it here
+        // once (statement + elapsed time) and rethrow unchanged.
+        const elapsedMs = Date.now() - started;
+        const blockedMs = Math.max(_cumLoopBlockedMs - blockedBeforeWait, loopTickStalenessMs());
+        if (shouldCountAsCircuitFailure(e, elapsedMs, blockedMs, PG_SLOW_QUERY_MS)) breaker.recordFailure();
+        log.error(`PG 查询失败（${elapsedMs}ms）：${sqlPreview(sql)} — ${(e as Error).message}`);
+        throw e;
+      } finally {
+        checked?.release();
+      }
+    },
+  };
+}
 
 // SQLite engine for the agent: a single embedded database file under the runtime
 // directory, opened in WAL mode with foreign keys enforced. All access is synchronous.
@@ -44,8 +344,19 @@ function dbPath(): string {
   return process.env.AGENT_DB_PATH || path.join(RUNTIME_DIR, `${dbName()}.db`);
 }
 
-/** Open (once) and return the shared database handle, running pending migrations. */
-export function getDb(): Db {
+/**
+ * Whether the current soul's own database (chats/messages/TC/predict/meetups/…) is backed by
+ * PostgreSQL. Unlike the shared LP economy (which moves for every soul at once, see lpUsesPg()),
+ * only tudigong has been migrated — every other soul (analyst-mira, trader-yifan, …) stays on
+ * SQLite indefinitely, so this checks AGENT_SOUL specifically rather than just AGENT_PG_URL.
+ */
+function soulUsesPg(): boolean {
+  const soul = process.env.AGENT_SOUL || 'tudigong';
+  return soul === 'tudigong' && !!process.env.AGENT_PG_URL;
+}
+
+/** Open (once) and return the raw node:sqlite soul handle. Internal — only tx()'s SQLite fallback needs BEGIN/COMMIT on it directly. */
+async function getDbSqliteRaw(): Promise<Db> {
   if (_db) return _db;
   const { DatabaseSync } = loadSqlite();
   const file = dbPath();
@@ -59,14 +370,106 @@ export function getDb(): Db {
   return db;
 }
 
-/** Close the open handles and drop the singletons so the next getDb()/getLpDb() reopens. Mainly for tests. */
-export function closeDb(): void {
+// One circuit breaker per independent pool (see circuit-breaker.ts). soulCircuit guards tudigong's
+// own database; lpCircuit guards the shared LP economy every soul writes to. A failure on one never
+// implies the other is unhealthy, so they are tracked and reasoned about completely separately —
+// soulCircuit open diverts the Phase 2 telemetry tables to the outbox; lpCircuit open makes every
+// LP-mutating call throw PgUnavailableError outright (Phase 1). Both are exported so supervisor.ts
+// can subscribe to transitions (Phase 4 alerting) and `agent doctor` can report current state.
+export const soulCircuit = new PgCircuitBreaker({ label: 'soul' });
+export const lpCircuit = new PgCircuitBreaker({ label: 'shared' });
+
+/** Read-only peek at the soul pool's breaker state — for optional read-path degradation (e.g.
+ *  message_search) and for `agent doctor`. Never mutates state; use shouldDivertSoulWrites() to gate
+ *  an actual write attempt. */
+export function isSoulPgCircuitOpen(): boolean {
+  return soulUsesPg() && soulCircuit.state === 'open';
+}
+
+/** Read-only peek at the shared LP pool's breaker state — for supervisor schedulers deciding whether
+ *  to skip a run instead of failing it, and for `agent doctor`. Never mutates state. */
+export function isLpPgCircuitOpen(): boolean {
+  return lpUsesPg() && lpCircuit.state === 'open';
+}
+
+/**
+ * Whether a soul-db write for one of pg-outbox.ts's OUTBOX_TABLES should be diverted there instead of
+ * attempted against PostgreSQL. Mutating (calls soulCircuit.allowRequest()): call this exactly once
+ * per write attempt, immediately before choosing between the real getDb()/tx() path and
+ * enqueueOutboxWrite() — never as a side-channel status check (use isSoulPgCircuitOpen() for that).
+ * When the breaker is closed this is a single cheap comparison, so the happy path pays nothing extra.
+ */
+export function shouldDivertSoulWrites(): boolean {
+  return soulUsesPg() && !soulCircuit.allowRequest();
+}
+
+// PostgreSQL connection pool backing tudigong's own soul database. AGENT_PG_SOUL_SCHEMA overrides
+// the schema search_path (default 'soul_tudigong'); only test setup uses this, mirroring
+// AGENT_PG_SHARED_SCHEMA's role for the LP pool.
+const dbAls = new AsyncLocalStorage<PoolClient>();
+let _dbPgPool: PgPool | null = null;
+function dbPgPool(): PgPool {
+  if (_dbPgPool) return _dbPgPool;
+  const schema = process.env.AGENT_PG_SOUL_SCHEMA || 'soul_tudigong';
+  const max = Number(process.env.AGENT_PG_POOL_MAX) || 5;
+  _dbPgPool = new pg.Pool(pgPoolConfig(schema, max, 'soul'));
+  // An idle pooled connection dropped by the server (network blip, server restart) emits 'error' on
+  // the pool; without a listener Node treats it as an unhandled 'error' event and kills the process.
+  // Also feeds the circuit breaker: an idle connection getting reset IS a connection-layer signal,
+  // but only when it is not itself an artifact of this process having just starved its own loop (the
+  // loop-lag sampler's current staleness is the only signal available here — there is no in-flight
+  // query to attribute elapsed/blocked time to, unlike pgExecutor's catch).
+  _dbPgPool.on('error', (e) => {
+    log.error(`PG 连接池错误（soul 库，空闲连接被断开）：${e.message}`);
+    const staleness = loopTickStalenessMs();
+    if (shouldCountAsCircuitFailure(e, staleness, staleness, PG_SLOW_QUERY_MS)) soulCircuit.recordFailure();
+  });
+  ensureLoopLagSampler();
+  logBackendChoice('soul 库', schema, max);
+  return _dbPgPool;
+}
+
+/**
+ * Open (once) and return the current soul's database executor. PostgreSQL-backed only when
+ * soulUsesPg() (tudigong + AGENT_PG_URL); every other soul keeps using the SQLite fallback, wrapped
+ * so the same `$N`-placeholder SQL every store/*.ts call site now uses works unchanged there too.
+ *
+ * Deliberately NOT gated by soulCircuit here: Phase 2 only diverts a named set of append-only tables
+ * (see pg-outbox.ts) to the outbox, at the store-function call sites that write them — every other
+ * soul read/write keeps attempting PostgreSQL exactly as before, bounded by the connect/statement
+ * timeouts, and reports its own outcome to soulCircuit via pgExecutor.
+ */
+export async function getDb(): Promise<SqlExecutor> {
+  if (soulUsesPg()) {
+    const client = dbAls.getStore();
+    return pgExecutor(client ?? dbPgPool(), soulCircuit);
+  }
+  return sqliteExecutor(await getDbSqliteRaw());
+}
+
+/**
+ * Close the open handles/pools and drop the singletons so the next getDb()/getLpDb() reopens.
+ * Mainly for tests. Async because ending a pg.Pool is itself async (its idle connections would
+ * otherwise keep a test process's event loop alive); the SQLite-only path underneath is unaffected
+ * (no timing change) since it awaits nothing of its own.
+ */
+export async function closeDb(): Promise<void> {
   for (const h of [_db, _lpDb]) {
     if (!h) continue;
     try { h.close(); } catch { /* ignore close errors */ }
   }
   _db = null;
   _lpDb = null;
+  if (_lpPgPool) {
+    const pool = _lpPgPool;
+    _lpPgPool = null;
+    try { await pool.end(); } catch { /* ignore close errors */ }
+  }
+  if (_dbPgPool) {
+    const pool = _dbPgPool;
+    _dbPgPool = null;
+    try { await pool.end(); } catch { /* ignore close errors */ }
+  }
 }
 
 // All agents share ONE gamification/LP economy (points, ledger, check-ins, badges) kept in a single
@@ -77,9 +480,14 @@ function lpDbPath(): string {
   return process.env.AGENT_LP_DB_PATH || path.join(RUNTIME_DIR, 'shared.db');
 }
 
-/** Open (once) and return the shared LP database handle. Reuses the per-agent handle when they are the same file. */
-export function getLpDb(): Db {
-  if (lpDbPath() === dbPath()) return getDb(); // same file → one handle (tests / AGENT_SOUL pinned to the LP file)
+/** Whether the shared LP economy is backed by PostgreSQL (true whenever AGENT_PG_URL is configured, for every soul). */
+function lpUsesPg(): boolean {
+  return !!process.env.AGENT_PG_URL;
+}
+
+/** Open (once) and return the raw node:sqlite LP handle. Internal — only lpTx()'s SQLite fallback needs BEGIN/COMMIT on it directly. */
+async function getLpDbSqliteRaw(): Promise<Db> {
+  if (lpDbPath() === dbPath()) return getDbSqliteRaw(); // same file → one handle (tests / AGENT_SOUL pinned to the LP file)
   if (_lpDb) return _lpDb;
   const { DatabaseSync } = loadSqlite();
   const file = lpDbPath();
@@ -94,13 +502,106 @@ export function getLpDb(): Db {
   return db;
 }
 
-/** Run a function inside a single atomic transaction on the shared LP database. */
-export function lpTx<T>(fn: () => T): T {
+// PostgreSQL connection pool backing the shared LP economy. AGENT_PG_SHARED_SCHEMA overrides the
+// schema search_path (default 'shared'); only test setup uses this, so each test file's LP state can
+// live in its own throwaway schema, mirroring how AGENT_DB_PATH isolates the SQLite fallback per file.
+const lpAls = new AsyncLocalStorage<PoolClient>();
+let _lpPgPool: PgPool | null = null;
+function lpPgPool(): PgPool {
+  if (_lpPgPool) return _lpPgPool;
+  const schema = process.env.AGENT_PG_SHARED_SCHEMA || 'shared';
+  const max = Number(process.env.AGENT_PG_POOL_MAX) || 5;
+  _lpPgPool = new pg.Pool(pgPoolConfig(schema, max, 'lp'));
+  // Same rationale as dbPgPool(): an unhandled pool 'error' event would kill the process. Also feeds
+  // lpCircuit — see dbPgPool()'s matching handler for why the loop-lag staleness discount applies here too.
+  _lpPgPool.on('error', (e) => {
+    log.error(`PG 连接池错误（LP 库，空闲连接被断开）：${e.message}`);
+    const staleness = loopTickStalenessMs();
+    if (shouldCountAsCircuitFailure(e, staleness, staleness, PG_SLOW_QUERY_MS)) lpCircuit.recordFailure();
+  });
+  ensureLoopLagSampler();
+  logBackendChoice('LP 库', schema, max);
+  return _lpPgPool;
+}
+
+/**
+ * Open (once) and return the shared LP database executor. PostgreSQL-backed whenever AGENT_PG_URL is
+ * set (for every soul, not just tudigong — see the migration decision record); otherwise the SQLite
+ * fallback, wrapped so `$N`-placeholder SQL (the convention every store/*.ts call site now uses)
+ * still works unchanged.
+ *
+ * Gated by lpCircuit.allowRequest() whenever this is not already inside a bound transaction: when the
+ * breaker is open this throws PgUnavailableError immediately, without ever touching the pool — LP
+ * economy calls (checkIn/spendPt/grantPt/profile reads/leaderboard, …) get a fast, explicit refusal
+ * instead of waiting out a connection attempt already known to fail (Phase 1; full LP failover onto
+ * SQLite was evaluated and explicitly rejected — see the research report's split-brain analysis).
+ * Already-bound calls (inside lpTx()) are not re-gated: lpTx() itself already gated at entry, and the
+ * transaction's connection is already live.
+ */
+export async function getLpDb(): Promise<SqlExecutor> {
+  if (lpUsesPg()) {
+    const existing = lpAls.getStore();
+    if (existing) return pgExecutor(existing, lpCircuit);
+    if (!lpCircuit.allowRequest()) throw new PgUnavailableError(lpCircuit.label);
+    return pgExecutor(lpPgPool(), lpCircuit);
+  }
+  return sqliteExecutor(await getLpDbSqliteRaw());
+}
+
+/**
+ * Run a function inside a single atomic transaction on the shared LP database.
+ *
+ * PostgreSQL branch: checks out one pooled connection, BEGINs on it, and binds it to an
+ * AsyncLocalStorage context so every nested getLpDb() call within `fn` (including calls made by
+ * other store functions `fn` invokes, however deeply nested) resolves to that SAME connection —
+ * mirroring the single-process-wide-handle behavior node:sqlite gave for free. Re-entrant: a nested
+ * lpTx() while already inside one just runs inline (no second BEGIN), matching the "Raw"-suffixed
+ * inner-function convention throughout store/gamification.ts that never double-wraps.
+ *
+ * SQLite branch (AGENT_PG_URL unset): unchanged from Phase 1 — reuses the per-agent transaction when
+ * the LP file and the soul file are the same, otherwise BEGIN/COMMIT directly on the raw handle.
+ *
+ * PG branch is gated by lpCircuit.allowRequest() exactly like getLpDb(): when the breaker is open this
+ * throws PgUnavailableError before even attempting lpPgPool().connect() (Phase 1's fast refusal). The
+ * connect() attempt itself (when allowed) is also fed to lpCircuit — this is the one failure surface
+ * getDb()/getLpDb()'s own pgExecutor cannot see, since it happens before any SqlExecutor exists.
+ */
+export async function lpTx<T>(fn: () => Promise<T>): Promise<T> {
+  if (lpUsesPg()) {
+    const existing = lpAls.getStore();
+    if (existing) return fn();
+    if (!lpCircuit.allowRequest()) throw new PgUnavailableError(lpCircuit.label);
+    const started = Date.now();
+    const blockedBeforeConnect = _cumLoopBlockedMs;
+    let client: PoolClient;
+    try {
+      client = await lpPgPool().connect();
+    } catch (e) {
+      const elapsedMs = Date.now() - started;
+      const blockedMs = Math.max(_cumLoopBlockedMs - blockedBeforeConnect, loopTickStalenessMs());
+      if (shouldCountAsCircuitFailure(e, elapsedMs, blockedMs, PG_SLOW_QUERY_MS)) lpCircuit.recordFailure();
+      throw e;
+    }
+    try {
+      await client.query('BEGIN');
+      const result = await lpAls.run(client, fn);
+      await client.query('COMMIT');
+      lpCircuit.recordSuccess();
+      return result;
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => { /* ignore secondary rollback failure */ });
+      throw e;
+    } finally {
+      client.release();
+      const ms = Date.now() - started;
+      if (ms >= PG_SLOW_TX_MS) log.warn(`PG 长交易 ${ms}ms（LP 库）——期间独占一条池连接，留意池饥饿`);
+    }
+  }
   if (lpDbPath() === dbPath()) return tx(fn); // same file → reuse the per-agent transaction
-  const db = getLpDb();
+  const db = await getLpDbSqliteRaw();
   db.exec('BEGIN');
   try {
-    const r = fn();
+    const r = await fn();
     db.exec('COMMIT');
     return r;
   } catch (e) {
@@ -109,12 +610,58 @@ export function lpTx<T>(fn: () => T): T {
   }
 }
 
-/** Run a function inside a single atomic transaction; rolls back on any error. */
-export function tx<T>(fn: () => T): T {
-  const db = getDb();
+/**
+ * Run a function inside a single atomic transaction on the current soul's own database.
+ *
+ * PostgreSQL branch (tudigong only, once AGENT_PG_URL is set): mirrors lpTx()'s AsyncLocalStorage
+ * design exactly — checks out one pooled connection, BEGINs on it, and binds it so every nested
+ * getDb() call within `fn` resolves to that SAME connection. Re-entrant: a nested tx() while already
+ * inside one just runs inline (no second BEGIN).
+ *
+ * SQLite branch (every other soul, indefinitely — see the migration decision record): unchanged
+ * from Phase 1 — BEGIN/COMMIT directly on the raw handle.
+ *
+ * Deliberately NOT gated by soulCircuit.allowRequest() (contrast with lpTx()): Phase 2 only diverts a
+ * named set of append-only tables at their own store-function call sites (see pg-outbox.ts), which
+ * skip calling tx() entirely when diverting. Every other soul transaction attempts
+ * dbPgPool().connect() exactly as before, bounded by the connect timeout, and reports its own outcome
+ * to soulCircuit so the breaker's state — and therefore the outbox-diversion decision elsewhere —
+ * stays accurate even though this code path itself does not act on it.
+ */
+export async function tx<T>(fn: () => Promise<T>): Promise<T> {
+  if (soulUsesPg()) {
+    const existing = dbAls.getStore();
+    if (existing) return fn();
+    const started = Date.now();
+    const blockedBeforeConnect = _cumLoopBlockedMs;
+    let client: PoolClient;
+    try {
+      client = await dbPgPool().connect();
+    } catch (e) {
+      const elapsedMs = Date.now() - started;
+      const blockedMs = Math.max(_cumLoopBlockedMs - blockedBeforeConnect, loopTickStalenessMs());
+      if (shouldCountAsCircuitFailure(e, elapsedMs, blockedMs, PG_SLOW_QUERY_MS)) soulCircuit.recordFailure();
+      throw e;
+    }
+    try {
+      await client.query('BEGIN');
+      const result = await dbAls.run(client, fn);
+      await client.query('COMMIT');
+      soulCircuit.recordSuccess();
+      return result;
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => { /* ignore secondary rollback failure */ });
+      throw e;
+    } finally {
+      client.release();
+      const ms = Date.now() - started;
+      if (ms >= PG_SLOW_TX_MS) log.warn(`PG 长交易 ${ms}ms（soul 库）——期间独占一条池连接，留意池饥饿`);
+    }
+  }
+  const db = await getDbSqliteRaw();
   db.exec('BEGIN');
   try {
-    const r = fn();
+    const r = await fn();
     db.exec('COMMIT');
     return r;
   } catch (e) {
