@@ -9,6 +9,7 @@ import path from 'node:path';
 import { REPO_ROOT } from '../core/paths.js';
 import { listPeersInChat } from '../core/configs.js';
 import { isMeaninglessMessage, isFanoutFlood, newFanoutState } from '../core/outbound-guard.js';
+import { isPgUnavailableError, PG_UNAVAILABLE_REPLY_ZH, isSoulPgCircuitOpen } from '../core/db.js';
 
 // Tracks identical content fanned across chats, to block broadcast-spam.
 const _fanoutState = newFanoutState();
@@ -93,7 +94,7 @@ server.registerTool(
     // which is not a member of external groups (e.g. the public 围观群) and gets
     // rejected with access-denied even though the bot itself is in the chat.
     try {
-      const res = sendText({ chatId: target }, text, { as: 'bot', profile: LARK_PROFILE });
+      const res = await sendText({ chatId: target }, text, { as: 'bot', profile: LARK_PROFILE });
       return textResult(`已发送（message_id=${res.messageId}）`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -113,15 +114,20 @@ server.registerTool(
     inputSchema: { openId: z.string().describe('用户 open_id') },
   },
   async ({ openId }) => {
-    const p = store.getProfile(openId);
-    if (!p) return textResult(`用户 ${openId} 尚无档案。`);
-    const badges = store.listBadges(openId);
-    const badgeStr = badges.length
-      ? badges.map((b) => `${b.emoji || ''}${b.name}`).join('、')
-      : '（暂无）';
-    return textResult(
-      `用户：${p.name || openId}\nLP 余额：${p.ptBalance.toFixed(1)}\n徽章：${badgeStr}`
-    );
+    try {
+      const p = await store.getProfile(openId);
+      if (!p) return textResult(`用户 ${openId} 尚无档案。`);
+      const badges = await store.listBadges(openId);
+      const badgeStr = badges.length
+        ? badges.map((b) => `${b.emoji || ''}${b.name}`).join('、')
+        : '（暂无）';
+      return textResult(
+        `用户：${p.name || openId}\nLP 余额：${p.ptBalance.toFixed(1)}\n徽章：${badgeStr}`
+      );
+    } catch (e) {
+      if (isPgUnavailableError(e)) return textResult(PG_UNAVAILABLE_REPLY_ZH);
+      throw e;
+    }
   }
 );
 
@@ -137,8 +143,13 @@ server.registerTool(
     },
   },
   async ({ openId, amount, reason }) => {
-    const newBalance = store.grantPt(openId, amount, reason, TURN_REF);
-    return textResult(`已为 ${openId} ${amount >= 0 ? '增加' : '扣除'} ${Math.abs(amount)} LP，新余额：${newBalance.toFixed(1)}`);
+    try {
+      const newBalance = await store.grantPt(openId, amount, reason, TURN_REF);
+      return textResult(`已为 ${openId} ${amount >= 0 ? '增加' : '扣除'} ${Math.abs(amount)} LP，新余额：${newBalance.toFixed(1)}`);
+    } catch (e) {
+      if (isPgUnavailableError(e)) return textResult(PG_UNAVAILABLE_REPLY_ZH);
+      throw e;
+    }
   }
 );
 
@@ -154,7 +165,7 @@ server.registerTool(
     },
   },
   async ({ openId, badgeId, ref }) => {
-    const isNew = store.awardBadge(openId, badgeId, ref);
+    const isNew = await store.awardBadge(openId, badgeId, ref);
     return textResult(isNew ? `已向 ${openId} 新授予徽章 ${badgeId}` : `${openId} 已拥有徽章 ${badgeId}，未重复授予`);
   }
 );
@@ -169,10 +180,15 @@ server.registerTool(
     },
   },
   async ({ limit }) => {
-    const rows = store.leaderboard(limit ?? 10);
-    if (rows.length === 0) return textResult('（排行榜暂无数据）');
-    const lines = rows.map((r, i) => `${i + 1}. ${r.name || r.openId}  ${r.ptBalance.toFixed(1)} LP`);
-    return textResult(['LP 排行榜', ...lines].join('\n'));
+    try {
+      const rows = await store.leaderboard(limit ?? 10);
+      if (rows.length === 0) return textResult('（排行榜暂无数据）');
+      const lines = rows.map((r, i) => `${i + 1}. ${r.name || r.openId}  ${r.ptBalance.toFixed(1)} LP`);
+      return textResult(['LP 排行榜', ...lines].join('\n'));
+    } catch (e) {
+      if (isPgUnavailableError(e)) return textResult(PG_UNAVAILABLE_REPLY_ZH);
+      throw e;
+    }
   }
 );
 
@@ -187,7 +203,11 @@ server.registerTool(
     },
   },
   async ({ query, limit }) => {
-    const rows = store.searchMessages(query, limit ?? 20);
+    // Read-path degradation while the soul PG pool's circuit breaker is open: fail gracefully instead
+    // of attempting a full-table ILIKE scan against a known-unhealthy connection. Searching the local
+    // outbox queue too is a secondary priority, deliberately not implemented in this pass.
+    if (isSoulPgCircuitOpen()) return textResult('该功能暂时无法使用（数据库维护中），请稍后再试。');
+    const rows = await store.searchMessages(query, limit ?? 20);
     if (rows.length === 0) return textResult('没有找到匹配的消息。');
     const lines = rows.map((r) => {
       const snippet = r.text.slice(0, 80) + (r.text.length > 80 ? '…' : '');

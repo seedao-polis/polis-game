@@ -12,6 +12,7 @@ import {
   loadConfigs,
   listAgents,
   resolveAgent,
+  resolveAgentProfile,
   userOpenIdForProfile,
   type ResolvedAgent,
   type WorkerTarget,
@@ -34,7 +35,8 @@ import { runSupervisor, readServePid, isAlive } from '../core/supervisor.js';
 import { REPO_ROOT, RUNTIME_DIR } from '../core/paths.js';
 import { log } from '../core/log.js';
 import * as store from '../core/store.js';
-import { getLpDb } from '../core/db.js';
+import { getLpDb, lpTx, soulCircuit, lpCircuit } from '../core/db.js';
+import { outboxBacklogCount, lastReplayLog } from '../core/pg-outbox.js';
 import { scanCorruptSessions, quarantineSession } from '../core/kimi-session.js';
 import { reloadSoulIfChanged } from '../core/skills.js';
 import { fireEvent, listEventConfigs, getEventByRef, getEventConfig, describeSchedule } from '../core/events.js';
@@ -88,7 +90,7 @@ function usage(): void {
   agent reset-all-pt [--to <n>]                 把所有人的 LP 重置为同一数值（预设 120）
   agent lp-migrate [--from <soul>]              把某个 soul 库的 LP/徽章一次性迁入共享库 .agent/shared.db（预设 from tudigong）
   agent link <from_open_id> <to_open_id>        把 from 这个 open_id 归并到 to 这个人（跨 app 同一人 LP 统一；from 自己的 LP 作废）
-  agent doctor [--fix]                           扫描损坏的 kimi 会话并查看最近错误（--fix 隔离损坏会话）
+  agent doctor [--fix]                           扫描损坏的 kimi 会话、查看最近错误、PG 断路器状态与降级队列积压（--fix 隔离损坏会话）
   agent events                                   列出已定义的事件（含编号、范围、排程）
   agent event <编号|id> [--test] [--to <oc/ou>] [--dry-run]  手动触发一个事件（仅 server 端；--test 只发给操作者本人 P2P；--dry-run 只预览不发送）
   agent unsend <message_id> [--as bot|user]     撤回一条已发送的消息（默认 as bot；事件消息就是 bot 发的）
@@ -163,8 +165,10 @@ async function runWorker(target: WorkerTarget): Promise<void> {
     log.warn('启动清理失败：', (e as Error).message);
   }
 
-  // Resolve each agent to be started (including listen → oc_ list discovery).
-  const resolved: ResolvedAgent[] = ids.map((id) => resolveAgent(id, cfg));
+  // Resolve each agent to be started (including listen → oc_ list discovery). Sequential on
+  // purpose: each resolve may shell out to lark-cli for chat discovery.
+  const resolved: ResolvedAgent[] = [];
+  for (const id of ids) resolved.push(await resolveAgent(id, cfg));
 
   // Under --sup the supervisor passes the served soul here (AGENT_COLLECTOR_SOUL): bring up that soul's
   // user-identity channel as a collect-only collector. Roster sync / doc-view / RSVP / message capture all
@@ -180,7 +184,7 @@ async function runWorker(target: WorkerTarget): Promise<void> {
       (id) => cfg.agents.agents[id]?.identity === 'user' && cfg.agents.agents[id]?.soul === collectorSoul
     );
     if (userId && !ids.includes(userId)) {
-      resolved.push({ ...resolveAgent(userId, cfg), collectOnly: true });
+      resolved.push({ ...(await resolveAgent(userId, cfg)), collectOnly: true });
     } else if (!userId) {
       log.warn(`soul【${collectorSoul}】没有 user 身份的 agent，跳过 user-token 数据采集（群成员/文档访问需要 user token）。`);
     }
@@ -219,7 +223,7 @@ async function runWorker(target: WorkerTarget): Promise<void> {
   for (const r of resolved) {
     if (checkedProfiles.has(r.larkProfile)) continue;
     checkedProfiles.add(r.larkProfile);
-    const result = checkAndRecord(r.larkProfile, r.notifyChatId);
+    const result = await checkAndRecord(r.larkProfile, r.notifyChatId);
     log.info(
       `auth 检查 profile=${r.larkProfile}：${result.loggedIn ? '已登录' : '未登录'}` +
         (result.refreshExpiresAt ? `，refresh 到期 ${result.refreshExpiresAt}` : '')
@@ -297,7 +301,7 @@ async function update(argv: string[]): Promise<void> {
  * Each file is named <chatId>.jsonl; each line is a JSON object with at minimum
  * message_id and create_time. Skips lines that are already present (INSERT OR IGNORE).
  */
-function backfill(): void {
+async function backfill(): Promise<void> {
   const transcriptsDir = path.join(RUNTIME_DIR, 'transcripts');
   if (!fs.existsSync(transcriptsDir)) {
     console.log('没有找到 .agent/transcripts/ 目录，无需迁移。');
@@ -312,7 +316,7 @@ function backfill(): void {
   let totalSkipped = 0;
   for (const file of files) {
     const chatId = path.basename(file, '.jsonl');
-    store.upsertChat({ chatId, external: false });
+    await store.upsertChat({ chatId, external: false });
     const filePath = path.join(transcriptsDir, file);
     const lines = fs.readFileSync(filePath, 'utf8').split('\n');
     let written = 0;
@@ -329,7 +333,7 @@ function backfill(): void {
       }
       const messageId = (obj['message_id'] as string | undefined) ?? '';
       if (!messageId) { skipped += 1; continue; }
-      const inserted = store.insertMessage({
+      const inserted = await store.insertMessage({
         messageId,
         chatId,
         senderOpenId: (obj['sender_open_id'] as string | undefined) ?? '',
@@ -365,7 +369,7 @@ function backfill(): void {
  * Re-runnable: existing backfill rows are deleted and rebuilt each run (live rows untouched). synced_at
  * is UNIQUE and rounds at/after the earliest live round are skipped, so it never collides with live data.
  */
-function backfillMemberRounds(): void {
+async function backfillMemberRounds(): Promise<void> {
   const logsDir = path.join(REPO_ROOT, 'logs');
   if (!fs.existsSync(logsDir)) {
     console.log('没有找到 logs/ 目录，无可补录的日志。');
@@ -378,12 +382,12 @@ function backfillMemberRounds(): void {
   }
   // Baseline for the internal-group estimate: today's distinct internal head-count, held constant
   // across all historical rounds (external = roster − internal absorbs the growth).
-  const internalBaseline = store.directoryStats().presentInternal;
+  const internalBaseline = (await store.directoryStats()).presentInternal;
   // Rebuild backfill rows from scratch so re-runs pick up the current model/baseline (live rows kept).
-  const wiped = store.deleteBackfillRounds();
+  const wiped = await store.deleteBackfillRounds();
   // Only backfill rounds strictly before the first live-recorded round (when one exists), so we fill
   // history without colliding with or duplicating the rounds the running service already records.
-  const liveFrom = store.earliestMemberRoundAt('live');
+  const liveFrom = await store.earliestMemberRoundAt('live');
   const TS = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.\d{3}\b/;
   // Completion line; the 在群去重 and 离开 groups are both optional (only present in newer log formats),
   // matched non-capturing so the numbered capture indices below stay stable across all three formats.
@@ -428,7 +432,7 @@ function backfillMemberRounds(): void {
       const presentDistinct = rosterTotal;
       const presentInternal = Math.min(internalBaseline, rosterTotal);
       const presentExternal = presentDistinct - presentInternal;
-      const ok = store.recordMemberSyncRound({
+      const ok = await store.recordMemberSyncRound({
         syncedAt: at,
         chatCount,
         presentTotal,
@@ -457,7 +461,7 @@ function backfillMemberRounds(): void {
  * Diagnose self-heal health: scan our kimi sessions for corruption (orphan tool calls), optionally
  * quarantine them (--fix), and show the most recent failures from the error ledger.
  */
-function doctor(argv: string[]): void {
+async function doctor(argv: string[]): Promise<void> {
   const fix = hasFlag(argv, 'fix');
   console.log('扫描损坏的 kimi 会话（仅 .agent/ 下、本框架自己的会话）…');
   const corrupt = scanCorruptSessions();
@@ -476,7 +480,7 @@ function doctor(argv: string[]): void {
     if (!fix) console.log('\n  加上 --fix 可隔离这些会话（可逆，仅改名 + 移除索引行）。');
   }
 
-  const errors = store.recentErrors(15);
+  const errors = await store.recentErrors(15);
   console.log(`\n最近 ${errors.length} 条错误记录：`);
   if (errors.length === 0) {
     console.log('  （暂无）');
@@ -489,7 +493,7 @@ function doctor(argv: string[]): void {
     }
   }
 
-  const inactive = store.listInactiveChats();
+  const inactive = await store.listInactiveChats();
   if (inactive.length > 0) {
     console.log(`\n已停服的群 ${inactive.length} 个（已自动停止轮询与同步）：`);
     for (const d of inactive) {
@@ -497,6 +501,24 @@ function doctor(argv: string[]): void {
       const reasonZh = d.reason === 'inaccessible' ? '不可访问/被移出' : '已解散(232009)';
       console.log(`  ${when}  [${reasonZh}]  ${d.name || '(无名)'}  ${d.chatId}`);
     }
+  }
+
+  console.log('\nPG 断路器状态：');
+  console.log(`  soul 库（tudigong 自身数据）：${soulCircuit.state}`);
+  console.log(`  shared 库（LP 经济）：${lpCircuit.state}`);
+  const backlog = outboxBacklogCount();
+  console.log(`\nPG 降级队列（soul 库遥测，仅在 soul 断路器曾经 open 期间累积）：待回补 ${backlog} 条`);
+  const lastReplay = lastReplayLog();
+  if (lastReplay) {
+    const startedAt = new Date(lastReplay.startedAt * 1000).toISOString().replace('T', ' ').slice(0, 19);
+    const finishedAt = lastReplay.finishedAt
+      ? new Date(lastReplay.finishedAt * 1000).toISOString().replace('T', ' ').slice(0, 19)
+      : '(未完成)';
+    console.log(
+      `  最近一次回补：${startedAt} → ${finishedAt}  尝试 ${lastReplay.attempted} 条，成功 ${lastReplay.replayed} 条，失败 ${lastReplay.failed} 条`
+    );
+  } else {
+    console.log('  （尚未发生过回补）');
   }
 }
 
@@ -527,16 +549,16 @@ async function cmd_agents(_argv: string[]): Promise<void> {
 }
 
 async function cmd_backfill(_argv: string[]): Promise<void> {
-  backfill();
+  await backfill();
 }
 
 async function cmd_backfill_members(_argv: string[]): Promise<void> {
-  backfillMemberRounds();
+  await backfillMemberRounds();
 }
 
 async function cmd_calendar_events(_argv: string[]): Promise<void> {
   // Deduplicate: keep only the latest round per event_id, then filter to upcoming (not yet started).
-  const allRows = store.recentCalendarEventRsvpRounds(500);
+  const allRows = await store.recentCalendarEventRsvpRounds(500);
   const latestPerEvent = new Map<string, typeof allRows[0]>();
   for (const row of allRows) {
     if (!latestPerEvent.has(row.eventId)) latestPerEvent.set(row.eventId, row);
@@ -558,7 +580,7 @@ async function cmd_calendar_events(_argv: string[]): Promise<void> {
 
 async function cmd_doc_views(_argv: string[]): Promise<void> {
   // Show the most recent document view events (one line per observed viewer-view), newest first.
-  const rows = store.recentDocViewEvents(100);
+  const rows = await store.recentDocViewEvents(100);
   if (rows.length === 0) {
     console.log('(暂无文档访问记录)');
   } else {
@@ -576,7 +598,7 @@ async function cmd_token_check(argv: string[]): Promise<void> {
     const cfg = loadConfigs();
     for (const id of listAgents(cfg)) {
       if (cfg.agents.agents[id]?.enabled) {
-        profile = resolveAgent(id, cfg).larkProfile;
+        profile = resolveAgentProfile(id, cfg).larkProfile;
         break;
       }
     }
@@ -594,12 +616,12 @@ async function cmd_token_check(argv: string[]): Promise<void> {
     console.log(ok ? '已发送测试提醒到 Telegram alert 频道。' : '发送失败：未配置 TELEGRAM_BOT_TOKEN 或 alert chat。');
     return;
   }
-  console.log(describeTokenExpiry(profile));
+  console.log(await describeTokenExpiry(profile));
   await checkUserTokenExpiry(profile);
 }
 
 async function cmd_doctor(argv: string[]): Promise<void> {
-  doctor(argv);
+  await doctor(argv);
 }
 
 async function cmd_events(_argv: string[]): Promise<void> {
@@ -637,7 +659,7 @@ async function cmd_event(argv: string[]): Promise<void> {
     const cfg = loadConfigs();
     for (const id of listAgents(cfg)) {
       if (cfg.agents.agents[id]?.enabled) {
-        const r = resolveAgent(id, cfg);
+        const r = resolveAgentProfile(id, cfg);
         if (!profile) profile = r.larkProfile;
         operatorOpenId = r.larkProfileMeta.userOpenId;
         break;
@@ -688,13 +710,13 @@ async function cmd_unsend(argv: string[]): Promise<void> {
     try {
       const cfg = loadConfigs();
       for (const id of listAgents(cfg)) {
-        if (cfg.agents.agents[id]?.enabled) { profile = resolveAgent(id, cfg).larkProfile; break; }
+        if (cfg.agents.agents[id]?.enabled) { profile = resolveAgentProfile(id, cfg).larkProfile; break; }
       }
     } catch { /* ignore */ }
   }
   const as = (getFlag(argv, 'as') as 'bot' | 'user' | undefined) ?? 'bot';
   log.info(`撤回消息【${messageId}】（as ${as}）…`);
-  const res = recallMessage(messageId, { as, profile });
+  const res = await recallMessage(messageId, { as, profile });
   if (res.ok) {
     console.log(`已撤回：${messageId}`);
   } else {
@@ -724,7 +746,7 @@ async function cmd_badge(argv: string[]): Promise<void> {
     const cfg = loadConfigs();
     for (const id of listAgents(cfg)) {
       if (cfg.agents.agents[id]?.enabled) {
-        const r = resolveAgent(id, cfg);
+        const r = resolveAgentProfile(id, cfg);
         if (!profile) profile = r.larkProfile;
         operatorOpenId = r.larkProfileMeta.userOpenId;
         break;
@@ -765,7 +787,7 @@ async function cmd_badge(argv: string[]): Promise<void> {
       const badgeId = (b['badge_id'] as string | undefined) ||
         'badge-' + createHash('sha1').update(`${headline}|${category}|${duration}`).digest('hex').slice(0, 8);
       const badgeName = (b['badge_name'] as string | undefined) || headline;
-      store.upsertBadge({
+      await store.upsertBadge({
         badgeId,
         name: badgeName,
         description: (b['description'] as string | undefined) ?? '',
@@ -785,7 +807,7 @@ async function cmd_badge(argv: string[]): Promise<void> {
     }
     console.log(`共导入 ${imported} 条徽章定义。`);
     // Mirror the updated catalogue to the "徽章列表" wiki page (non-fatal on failure / when unconfigured).
-    if (imported > 0) syncBadgeWikiAfterChange(profile);
+    if (imported > 0) await syncBadgeWikiAfterChange(profile);
     return;
   }
 
@@ -820,7 +842,7 @@ async function cmd_badge(argv: string[]): Promise<void> {
     }
 
     // Resolve badge.
-    const badge = store.getBadge(badgeRef);
+    const badge = await store.getBadge(badgeRef);
     if (!badge) {
       log.error(`找不到徽章【${badgeRef}】。用 agent badge list 查看可用徽章。`);
       process.exit(1);
@@ -837,9 +859,9 @@ async function cmd_badge(argv: string[]): Promise<void> {
       let name = '';
       if (t.startsWith('ou_')) {
         openId = t;
-        name = store.memberName(openId) || openId;
+        name = (await store.memberName(openId)) || openId;
       } else {
-        const matches = store.findOpenIdsByName(t);
+        const matches = await store.findOpenIdsByName(t);
         if (matches.length === 0) {
           log.error(`在成员目录中找不到名称为【${t}】的成员（仅搜索已同步的 chat_members）。`);
           log.error('建议：改用 ou_xxxxxx 直接指定，或等待下一轮成员目录同步后重试。');
@@ -875,8 +897,8 @@ async function cmd_badge(argv: string[]): Promise<void> {
     // Award each recipient; collect those newly granted (awardBadge=false means already held → skip).
     const granted: Array<{ openId: string; name: string }> = [];
     for (const r of recipients) {
-      store.ensureProfile(r.openId, r.name || undefined);
-      if (store.awardBadge(r.openId, badge.badgeId, note ?? undefined)) {
+      await store.ensureProfile(r.openId, r.name || undefined);
+      if (await store.awardBadge(r.openId, badge.badgeId, note ?? undefined)) {
         granted.push(r);
         log.info(`徽章发放：【${badgeDisplay}】（${badge.badgeId}）→ ${r.name}（${r.openId}）`);
       } else {
@@ -932,7 +954,7 @@ async function cmd_badge(argv: string[]): Promise<void> {
     const targetArg = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
     if (!targetArg) {
       // List all badge definitions.
-      const all = store.listBadges();
+      const all = await store.listBadges();
       if (all.length === 0) {
         console.log('（暂无已定义徽章）');
       } else {
@@ -949,9 +971,9 @@ async function cmd_badge(argv: string[]): Promise<void> {
     let targetName = '';
     if (targetArg.startsWith('ou_')) {
       targetOpenId = targetArg;
-      targetName = store.memberName(targetOpenId) || targetOpenId;
+      targetName = (await store.memberName(targetOpenId)) || targetOpenId;
     } else {
-      const matches = store.findOpenIdsByName(targetArg);
+      const matches = await store.findOpenIdsByName(targetArg);
       if (matches.length === 0) {
         log.error(`找不到名称为【${targetArg}】的成员。`);
         process.exit(1);
@@ -965,7 +987,7 @@ async function cmd_badge(argv: string[]): Promise<void> {
       targetName = matches[0]!.name;
     }
     const displayName = targetName || targetOpenId;
-    const badges = store.listBadges(targetOpenId);
+    const badges = await store.listBadges(targetOpenId);
     if (badges.length === 0) {
       console.log(`${displayName} 暂无徽章。`);
     } else {
@@ -985,24 +1007,24 @@ async function cmd_badge(argv: string[]): Promise<void> {
       log.error('用法: agent badge delete <badge-ref> [--profile <p>]');
       process.exit(1);
     }
-    const badge = store.getBadge(badgeRef);
+    const badge = await store.getBadge(badgeRef);
     if (!badge) {
       log.error(`找不到徽章【${badgeRef}】。用 agent badge list 查看可用徽章。`);
       process.exit(1);
     }
-    const removed = store.deleteBadge(badge.badgeId);
+    const removed = await store.deleteBadge(badge.badgeId);
     if (!removed) {
       log.error(`删除失败：徽章【${badge.badgeId}】未被删除（可能已不存在）。`);
       process.exit(1);
     }
     console.log(`已删除徽章定义：${badge.badgeId}（${badge.headline || badge.name}），并清除其持有记录。`);
-    syncBadgeWikiAfterChange(profile);
+    await syncBadgeWikiAfterChange(profile);
     return;
   }
 
   // badge wiki-sync — manually rebuild the "徽章列表" wiki page from the current catalogue.
   if (sub === 'wiki-sync') {
-    const ok = refreshBadgeWiki({ profile });
+    const ok = await refreshBadgeWiki({ profile });
     if (ok) console.log('徽章列表 wiki 页面已刷新。');
     else {
       log.error('徽章列表 wiki 刷新失败或未配置 badgeWikiDocId。');
@@ -1020,9 +1042,9 @@ async function cmd_badge(argv: string[]): Promise<void> {
  * delete. Best-effort: logs the outcome but never throws or exits, so a wiki hiccup can't fail the
  * underlying badge operation (which has already committed to the DB).
  */
-function syncBadgeWikiAfterChange(profile?: string): void {
+async function syncBadgeWikiAfterChange(profile?: string): Promise<void> {
   try {
-    if (refreshBadgeWiki({ profile })) log.info('徽章列表 wiki 页面已自动刷新。');
+    if (await refreshBadgeWiki({ profile })) log.info('徽章列表 wiki 页面已自动刷新。');
     else log.warn('徽章列表 wiki 未刷新（未配置 badgeWikiDocId 或写入失败）。');
   } catch (e) {
     log.warn(`徽章列表 wiki 刷新异常：${(e as Error).message}`);
@@ -1036,7 +1058,7 @@ async function cmd_daily_reset(argv: string[]): Promise<void> {
     log.error('--floor 必须是非负整数');
     process.exit(1);
   }
-  const result = store.resetDailyPtFloor(floor);
+  const result = await store.resetDailyPtFloor(floor);
   console.log(`每日 LP 补底完成：补足 ${result.affected} 名用户（下限 ${floor}）`);
 }
 
@@ -1050,20 +1072,38 @@ async function cmd_reset_all_pt(argv: string[]): Promise<void> {
       process.exit(1);
     }
   }
-  const result = store.resetAllPtTo(target);
+  const result = await store.resetAllPtTo(target);
   console.log(`LP 重置完成：${result.affected} 名用户已重置为 ${result.target} LP`);
 }
 
 // Seed the shared LP database from a source per-agent db (default tudigong) so the existing community LP
 // and badges become the shared baseline. Copies only the LP cluster, idempotently (INSERT OR IGNORE).
+//
+// DEPRECATED as of the shared.db → PostgreSQL migration: this was a one-time historical tool (run once
+// on 2026-06-25, see pt-gamification-playbook.md §9) that relies on SQLite's ATTACH DATABASE, which
+// PostgreSQL has no equivalent of. Kept (not deleted) in case another soul still on SQLite ever needs
+// the same one-off import, but refuses to run once the shared LP economy is on PostgreSQL — running it
+// against the wrong backend would silently do nothing useful rather than produce a loud, actionable error.
 async function cmd_lp_migrate(argv: string[]): Promise<void> {
+  if (process.env.AGENT_PG_URL) {
+    log.error(
+      'lp-migrate 是拆库前的一次性历史迁移工具，依赖 SQLite 的 ATTACH DATABASE 语法，已随 shared.db 迁移到 ' +
+      'PostgreSQL 而失效。如需为尚未迁移的 soul 补历史数据，请改用 scripts/etl-shared-to-pg.mjs 的等价逻辑手写脚本。'
+    );
+    process.exit(1);
+  }
   const srcName = (getFlag(argv, 'from') || 'tudigong').replace(/[^A-Za-z0-9._-]/g, '_');
   const srcPath = path.join(RUNTIME_DIR, `${srcName}.db`);
   if (!fs.existsSync(srcPath)) {
     log.error(`源 db 不存在：${srcPath}`);
     process.exit(1);
   }
-  const db = getLpDb(); // creates + migrates the shared LP db
+  // Bypass the SqlExecutor abstraction here deliberately: ATTACH DATABASE is SQLite-only syntax with
+  // no PostgreSQL equivalent, so this legacy tool opens its own raw node:sqlite handle on the shared
+  // LP file rather than going through getLpDb() (which now returns a backend-agnostic SqlExecutor).
+  const { DatabaseSync } = await import('node:sqlite');
+  const sharedPath = process.env.AGENT_LP_DB_PATH || path.join(RUNTIME_DIR, 'shared.db');
+  const db = new DatabaseSync(sharedPath);
   db.exec(`ATTACH DATABASE '${srcPath.replace(/'/g, "''")}' AS src`);
   const tables = ['badges', 'profiles', 'pt_ledger', 'checkins', 'user_badges']; // parents before children (FK order)
   try {
@@ -1079,10 +1119,13 @@ async function cmd_lp_migrate(argv: string[]): Promise<void> {
   db.exec('DETACH DATABASE src');
   const counts = tables.map((t) => `${t}=${(db.prepare(`SELECT count(*) AS n FROM ${t}`).get() as { n: number }).n}`);
   console.log(`LP 已迁入共享库（来源 ${srcName}.db）：${counts.join(', ')}`);
+  db.close();
 }
 
 // Alias one open_id to another person's identity so their LP / badges unify across agents (each Feishu app
 // gives a person a different open_id). The `from` identity's own LP is discarded (作废以共享库为准).
+// Still a live operational command (unlike cmd_lp_migrate above) — rewritten against the SqlExecutor
+// `.query()` interface so it works against whichever backend getLpDb()/lpTx() resolve to.
 async function cmd_link(argv: string[]): Promise<void> {
   const from = argv[1];
   const to = argv[2];
@@ -1090,24 +1133,26 @@ async function cmd_link(argv: string[]): Promise<void> {
     log.error('用法: agent link <from_open_id> <to_open_id>（把 from 这个 open_id 归并到 to 这个人，from 自己的 LP 作废）');
     process.exit(1);
   }
-  const canon = store.canonicalId(to);
+  const canon = await store.canonicalId(to);
   if (from === canon) {
     console.log(`无需归并：${from} 已经是 ${canon}`);
     return;
   }
-  const db = getLpDb();
   try {
-    db.exec('BEGIN');
-    // discard the source identity's own LP history, then point it at the canonical identity
-    db.prepare('DELETE FROM pt_ledger WHERE user_open_id = ?').run(from);
-    db.prepare('DELETE FROM checkins WHERE user_open_id = ?').run(from);
-    db.prepare('DELETE FROM user_badges WHERE user_open_id = ?').run(from);
-    db.prepare('DELETE FROM profiles WHERE open_id = ?').run(from);
-    db.prepare('UPDATE identity_links SET canonical_id = ? WHERE canonical_id = ?').run(canon, from);
-    db.prepare('INSERT OR REPLACE INTO identity_links(open_id, canonical_id) VALUES (?, ?)').run(from, canon);
-    db.exec('COMMIT');
+    await lpTx(async () => {
+      const db = await getLpDb();
+      // discard the source identity's own LP history, then point it at the canonical identity
+      await db.query('DELETE FROM pt_ledger WHERE user_open_id = $1', [from]);
+      await db.query('DELETE FROM checkins WHERE user_open_id = $1', [from]);
+      await db.query('DELETE FROM user_badges WHERE user_open_id = $1', [from]);
+      await db.query('DELETE FROM profiles WHERE open_id = $1', [from]);
+      await db.query('UPDATE identity_links SET canonical_id = $1 WHERE canonical_id = $2', [canon, from]);
+      await db.query(
+        'INSERT INTO identity_links(open_id, canonical_id) VALUES ($1, $2) ON CONFLICT (open_id) DO UPDATE SET canonical_id = excluded.canonical_id',
+        [from, canon],
+      );
+    });
   } catch (e) {
-    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
     log.error('link 失败：', (e as Error).message);
     process.exit(1);
   }
@@ -1190,7 +1235,7 @@ async function cmd_ask(argv: string[]): Promise<void> {
   assertRunnableSoul(soul);
   process.env.AGENT_SOUL = soul; // names the DB file (.agent/<soul>.db)
   const agent = new Agent(soul, { journal: false });
-  const reply = agent.respond({ message });
+  const reply = await agent.respondAsync({ message });
   process.stdout.write(reply + '\n');
 }
 
@@ -1309,7 +1354,7 @@ async function cmd_heartbeat(argv: string[]): Promise<void> {
     const cfg = loadConfigs();
     for (const id of listAgents(cfg)) {
       if (cfg.agents.agents[id]?.enabled) {
-        larkProfile = resolveAgent(id, cfg).larkProfile;
+        larkProfile = resolveAgentProfile(id, cfg).larkProfile;
         break;
       }
     }
@@ -1390,7 +1435,7 @@ async function cmd_meetup(argv: string[]): Promise<void> {
     activityWikiDocId = cfg.lark.activityWikiDocId;
     for (const id of listAgents(cfg)) {
       if (cfg.agents.agents[id]?.enabled) {
-        larkProfile = resolveAgent(id, cfg).larkProfile;
+        larkProfile = resolveAgentProfile(id, cfg).larkProfile;
         break;
       }
     }
@@ -1434,7 +1479,7 @@ async function cmd_meetup(argv: string[]): Promise<void> {
     }
 
     log.info(`创建会议【${title}】${fmtSec(startSec)} → ${fmtSec(endSec)}${recurrence ? `（循环：${recurrence}）` : '（单次）'}…`);
-    const result = createCalendarEvent({
+    const result = await createCalendarEvent({
       calendarId: activityCalendarId,
       title,
       startTimeSec: startSec,
@@ -1451,7 +1496,7 @@ async function cmd_meetup(argv: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const meetupId = insertMeetup({
+    const meetupId = await insertMeetup({
       larkEventId: result.eventId,
       title,
       description: desc,
@@ -1464,8 +1509,8 @@ async function cmd_meetup(argv: string[]): Promise<void> {
       calendarId: activityCalendarId,
       createdBy: larkProfile ?? '',
     });
-    if (tags.length > 0) setMeetupTags(meetupId, tags);
-    refreshMeetupWiki({ profile: larkProfile }); // mirror to the "SeeDAO 活动日历" wiki page
+    if (tags.length > 0) await setMeetupTags(meetupId, tags);
+    await refreshMeetupWiki({ profile: larkProfile }); // mirror to the "SeeDAO 活动日历" wiki page
 
     console.log(`✅ 会议已创建：id=${meetupId}  event_id=${result.eventId}`);
     if (result.shareLink) console.log(`   日历链接：${result.shareLink}`);
@@ -1480,7 +1525,7 @@ async function cmd_meetup(argv: string[]): Promise<void> {
     const idStr = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
     if (!idStr) { log.error('用法: agent meetup edit <id> [--title ...] [--start ...] [--end ...] [--rrule ...] [--tags ...]'); process.exit(1); }
     const id = Number(idStr);
-    const mtg = getMeetupById(id);
+    const mtg = await getMeetupById(id);
     if (!mtg) { log.error(`找不到会议：id=${id}`); process.exit(1); }
     if (mtg.status === 'cancelled') { log.error(`会议【${mtg.title}】已取消，无法编辑。`); process.exit(1); }
 
@@ -1493,7 +1538,7 @@ async function cmd_meetup(argv: string[]): Promise<void> {
     // Update Feishu calendar event.
     const startIso = newStart ? new Date((parseDateTimeArg(newStart)) * 1000).toISOString() : undefined;
     const endIso = newEnd ? new Date((parseDateTimeArg(newEnd ?? '')) * 1000).toISOString() : undefined;
-    const larkOk = updateCalendarEvent({
+    const larkOk = await updateCalendarEvent({
       eventId: mtg.larkEventId,
       summary: newTitle,
       startIso,
@@ -1508,11 +1553,11 @@ async function cmd_meetup(argv: string[]): Promise<void> {
     if (newStart) dbUpdates.startTime = parseDateTimeArg(newStart);
     if (newEnd) dbUpdates.endTime = parseDateTimeArg(newEnd);
     if (newRrule !== undefined) dbUpdates.recurrence = newRrule;
-    updateMeetup(id, dbUpdates);
+    await updateMeetup(id, dbUpdates);
     if (newTagsArg !== undefined) {
-      setMeetupTags(id, newTagsArg.split(',').map((t) => t.trim()).filter(Boolean));
+      await setMeetupTags(id, newTagsArg.split(',').map((t) => t.trim()).filter(Boolean));
     }
-    refreshMeetupWiki({ profile: larkProfile }); // mirror the edit to the "SeeDAO 活动日历" wiki page
+    await refreshMeetupWiki({ profile: larkProfile }); // mirror the edit to the "SeeDAO 活动日历" wiki page
 
     console.log(larkOk ? `✅ 会议【${newTitle ?? mtg.title}】已更新。` : `⚠️  本地已更新，但飞书日历更新失败，请手动检查。`);
     return;
@@ -1523,14 +1568,14 @@ async function cmd_meetup(argv: string[]): Promise<void> {
     const idStr = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
     if (!idStr) { log.error('用法: agent meetup cancel <id>'); process.exit(1); }
     const id = Number(idStr);
-    const mtg = getMeetupById(id);
+    const mtg = await getMeetupById(id);
     if (!mtg) { log.error(`找不到会议：id=${id}`); process.exit(1); }
     if (mtg.status === 'cancelled') { console.log(`会议【${mtg.title}】已经是取消状态。`); return; }
 
     let calId = mtg.calendarId || activityCalendarId || '';
-    const larkOk = calId ? cancelCalendarEvent(calId, mtg.larkEventId, { profile: larkProfile }) : false;
-    storeCancelMeetup(id);
-    refreshMeetupWiki({ profile: larkProfile }); // mirror the cancellation to the "SeeDAO 活动日历" wiki page
+    const larkOk = calId ? await cancelCalendarEvent(calId, mtg.larkEventId, { profile: larkProfile }) : false;
+    await storeCancelMeetup(id);
+    await refreshMeetupWiki({ profile: larkProfile }); // mirror the cancellation to the "SeeDAO 活动日历" wiki page
     console.log(larkOk ? `✅ 已取消会议【${mtg.title}】（飞书日历已删除）。` : `⚠️  本地已标记取消，飞书日历删除${calId ? '失败' : '跳过（无 calendarId）'}，请手动检查。`);
     return;
   }
@@ -1545,7 +1590,7 @@ async function cmd_meetup(argv: string[]): Promise<void> {
     const dayStart = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate(), 0, 0, 0, 0);
     const dayEnd = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate() + 1, 0, 0, 0, 0);
     const { meetupsOnDate } = await import('../core/store/meetups.js');
-    const meetups = meetupsOnDate(Math.floor(dayStart.getTime() / 1000), Math.floor(dayEnd.getTime() / 1000));
+    const meetups = await meetupsOnDate(Math.floor(dayStart.getTime() / 1000), Math.floor(dayEnd.getTime() / 1000));
 
     if (meetups.length === 0) {
       console.log(`${fmtSec(Math.floor(dayStart.getTime() / 1000)).slice(0, 10)} 没有安排会议，不发送播报。`);
@@ -1585,7 +1630,7 @@ async function cmd_meetup(argv: string[]): Promise<void> {
 
     if (chatId) {
       try {
-        const res = sendPost({ chatId }, { content: lines }, { as: 'bot', profile: larkProfile });
+        const res = await sendPost({ chatId }, { content: lines }, { as: 'bot', profile: larkProfile });
         console.log(`✅ 已发送到群 ${chatId}（message_id=${res.messageId ?? '?'}）`);
       } catch (e) {
         log.error('发送失败：', (e as Error).message);
@@ -1597,7 +1642,7 @@ async function cmd_meetup(argv: string[]): Promise<void> {
 
   // ── meetup list ─────────────────────────────────────────────
   if (sub === 'list') {
-    const meetups = listUpcomingMeetups();
+    const meetups = await listUpcomingMeetups();
     if (meetups.length === 0) {
       console.log('（暂无即将举行的会议）');
       return;
@@ -1654,7 +1699,7 @@ async function cmd_memory(argv: string[]): Promise<void> {
     const chat = getFlag(argv, 'chat');
     const limitStr = getFlag(argv, 'limit');
     const limit = limitStr ? Number(limitStr) : 50;
-    const items = listMemories({ namespace: ns, userOpenId: user, chatId: chat, limit });
+    const items = await listMemories({ namespace: ns, userOpenId: user, chatId: chat, limit });
     if (items.length === 0) { console.log('（无记录）'); return; }
     for (const m of items) {
       const expiry = m.expiresAt ? ` expires=${m.expiresAt}` : '';
@@ -1668,7 +1713,7 @@ async function cmd_memory(argv: string[]): Promise<void> {
   if (sub === 'inspect') {
     const idStr = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
     if (!idStr) { log.error('用法: agent memory inspect <id>'); process.exit(1); }
-    const m = getMemoryById(Number(idStr));
+    const m = await getMemoryById(Number(idStr));
     if (!m) { log.error(`找不到记录：id=${idStr}`); process.exit(1); }
     console.log(JSON.stringify(m, null, 2));
     return;
@@ -1682,7 +1727,7 @@ async function cmd_memory(argv: string[]): Promise<void> {
     const visibility = getFlag(argv, 'visibility') as import('../core/store/memory.js').MemoryVisibility | undefined;
     const sensitivity = getFlag(argv, 'sensitivity') as import('../core/store/memory.js').MemorySensitivity | undefined;
     const expiresStr = getFlag(argv, 'expires');
-    const id = insertMemory({
+    const id = await insertMemory({
       namespace: ns, content, key, visibility, sensitivity,
       expiresAt: expiresStr ? Number(expiresStr) : undefined,
       source: 'manual',
@@ -1699,7 +1744,7 @@ async function cmd_memory(argv: string[]): Promise<void> {
     const visibility = getFlag(argv, 'visibility') as import('../core/store/memory.js').MemoryVisibility | undefined;
     const sensitivity = getFlag(argv, 'sensitivity') as import('../core/store/memory.js').MemorySensitivity | undefined;
     const expiresStr = getFlag(argv, 'expires');
-    const id = upsertMemory({
+    const id = await upsertMemory({
       namespace: ns, key, content, visibility, sensitivity,
       expiresAt: expiresStr ? Number(expiresStr) : undefined,
       source: 'manual',
@@ -1711,7 +1756,7 @@ async function cmd_memory(argv: string[]): Promise<void> {
   if (sub === 'rm') {
     const idStr = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
     if (!idStr) { log.error('用法: agent memory rm <id>'); process.exit(1); }
-    const ok = deleteMemory(Number(idStr));
+    const ok = await deleteMemory(Number(idStr));
     console.log(ok ? `已删除：id=${idStr}` : `找不到记录：id=${idStr}`);
     return;
   }
@@ -1719,7 +1764,7 @@ async function cmd_memory(argv: string[]): Promise<void> {
   if (sub === 'clear') {
     const ns = getFlag(argv, 'namespace');
     if (!ns) { log.error('--namespace 为必填项'); process.exit(1); }
-    const n = deleteNamespace(ns);
+    const n = await deleteNamespace(ns);
     console.log(`已清除命名空间 ${ns}：共删除 ${n} 条记录。`);
     return;
   }
@@ -1739,7 +1784,7 @@ async function cmd_memory(argv: string[]): Promise<void> {
     const admin = hasFlag(argv, 'admin') || isAdmin(user);
     const ctx = { chatId: chat, userOpenId: user, isAdmin: admin };
     const namespaces = allowedNamespaces(ctx);
-    const memories = getFilteredMemories(ctx, { namespaces, groupCharLimit: 500, userCharLimit: 300 });
+    const memories = await getFilteredMemories(ctx, { namespaces, groupCharLimit: 500, userCharLimit: 300 });
     const tier = getChatTier(chat);
     console.log(`视角：chat=${chat} user=${user} admin=${admin}`);
     console.log(`群层级：${tier}`);
@@ -1774,10 +1819,10 @@ async function cmd_memory(argv: string[]): Promise<void> {
   if (sub === 'aggregate') {
     const { aggregateGroupTopics } = await import('../core/group-intel.js');
     const chat = getFlag(argv, 'chat');
-    const chats = chat ? [chat] : listKnownChatIds();
+    const chats = chat ? [chat] : await listKnownChatIds();
     if (chats.length === 0) { console.log('（无已知群组）'); return; }
     for (const c of chats) {
-      const summary = aggregateGroupTopics(c);
+      const summary = await aggregateGroupTopics(c);
       console.log(summary ? `[${c}] ${summary}` : `[${c}]（消息不足，未生成）`);
     }
     return;
@@ -1785,7 +1830,7 @@ async function cmd_memory(argv: string[]): Promise<void> {
 
   // Manually run the TTL sweep that removes expired memory rows.
   if (sub === 'purge') {
-    const n = purgeExpiredMemories();
+    const n = await purgeExpiredMemories();
     console.log(`已清理过期记忆：共删除 ${n} 条。`);
     return;
   }
@@ -1815,26 +1860,26 @@ async function cmd_visitors(argv: string[]): Promise<void> {
   try {
     const cfg = loadConfigs();
     for (const id of listAgents(cfg)) {
-      if (cfg.agents.agents[id]?.enabled) { larkProfile = resolveAgent(id, cfg).larkProfile; break; }
+      if (cfg.agents.agents[id]?.enabled) { larkProfile = resolveAgentProfile(id, cfg).larkProfile; break; }
     }
   } catch { /* use default profile */ }
 
   if (sub !== 'backfill') { log.error('用法: agent visitors backfill [--chat <oc_id>]'); process.exit(1); }
 
-  const present = store.presentMemberCount(chatId);
+  const present = await store.presentMemberCount(chatId);
   const top = Math.floor(present / 100) * 100;
   console.log(`围观群在群人数 ${present}，回填里程碑至 ${top}…`);
   let recorded = 0;
   for (let m = 100; m <= top; m += 100) {
-    if (isMilestoneRecorded(DEFAULT_SOUL, chatId, m)) { console.log(`  第 ${m} 人：已记录，跳过`); continue; }
-    const person = store.nthPresentMemberByArrival(chatId, m);
+    if (await isMilestoneRecorded(DEFAULT_SOUL, chatId, m)) { console.log(`  第 ${m} 人：已记录，跳过`); continue; }
+    const person = await store.nthPresentMemberByArrival(chatId, m);
     if (!person) { console.log(`  第 ${m} 人：在群人数不足，跳过`); continue; }
     // Use the visitor's first_seen as the reached-at time (≈ when the milestone was hit).
-    recordMilestone(DEFAULT_SOUL, chatId, m, person, person.firstSeen);
+    await recordMilestone(DEFAULT_SOUL, chatId, m, person, person.firstSeen);
     recorded += 1;
     console.log(`  第 ${m} 人：${person.name || '(无名)'}（${person.openId}）已记录`);
   }
-  const wikiOk = refreshVisitorMilestonesWiki(chatId, { profile: larkProfile });
+  const wikiOk = await refreshVisitorMilestonesWiki(chatId, { profile: larkProfile });
   console.log(`完成：新记录 ${recorded} 个里程碑；wiki【访客里程碑】${wikiOk ? '已更新' : '未更新（检查 visitorMilestoneWikiDocId / scope）'}`);
 }
 
@@ -1872,7 +1917,7 @@ async function cmd_tc(argv: string[]): Promise<void> {
     const cfg = loadConfigs();
     for (const id of listAgents(cfg)) {
       if (cfg.agents.agents[id]?.enabled) {
-        larkProfile = resolveAgent(id, cfg).larkProfile;
+        larkProfile = resolveAgentProfile(id, cfg).larkProfile;
         break;
       }
     }
@@ -1881,7 +1926,7 @@ async function cmd_tc(argv: string[]): Promise<void> {
   // ── tc list ───────────────────────────────────────────────
   if (sub === 'list') {
     const all = hasFlag(argv, 'all');
-    const proposals = all ? listAllTcs(20) : listActiveTcs();
+    const proposals = all ? await listAllTcs(20) : await listActiveTcs();
     if (proposals.length === 0) {
       console.log(all ? '暂无提案记录。' : '暂无 active 提案。');
       return;
@@ -1898,9 +1943,9 @@ async function cmd_tc(argv: string[]): Promise<void> {
     const numStr = argv[2];
     const num = numStr ? parseInt(numStr, 10) : NaN;
     if (isNaN(num)) { log.error('用法: agent tc show <编号>'); process.exit(1); }
-    const p = getTcByNum(num);
+    const p = await getTcByNum(num);
     if (!p) { log.error(`找不到 TC-${num}`); process.exit(1); }
-    const bets = getTcBets(p.id);
+    const bets = await getTcBets(p.id);
     const activeBets = bets.filter(b => !b.isRefunded);
     const totalLp = activeBets.reduce((s, b) => s + b.lpAmount, 0);
     console.log(`TC-${p.num}: ${p.title}`);
@@ -1927,10 +1972,10 @@ async function cmd_tc(argv: string[]): Promise<void> {
     const numStr = argv[2];
     const num = numStr ? parseInt(numStr, 10) : NaN;
     if (isNaN(num)) { log.error('用法: agent tc cancel <编号>'); process.exit(1); }
-    const p = getTcByNum(num);
+    const p = await getTcByNum(num);
     if (!p) { log.error(`找不到 TC-${num}`); process.exit(1); }
     if (p.status !== 'active') { log.error(`TC-${num} 状态为 ${p.status}，不可撤销`); process.exit(1); }
-    const { refunded } = cancelTcWithRefund(p);
+    const { refunded } = await cancelTcWithRefund(p);
     console.log(`TC-${p.num}【${p.title}】已撤销，退款 ${refunded} 笔。`);
     return;
   }
@@ -1940,7 +1985,7 @@ async function cmd_tc(argv: string[]): Promise<void> {
     const numStr = argv[2];
     const num = numStr ? parseInt(numStr, 10) : NaN;
     if (isNaN(num)) { log.error('用法: agent tc settle <编号>'); process.exit(1); }
-    const p = getTcByNum(num);
+    const p = await getTcByNum(num);
     if (!p) { log.error(`找不到 TC-${num}`); process.exit(1); }
     if (p.status !== 'active') { log.error(`TC-${num} 状态为 ${p.status}，无法结算`); process.exit(1); }
     log.info(`强制结算 TC-${p.num}【${p.title}】…`);
@@ -1974,7 +2019,7 @@ async function cmd_tc(argv: string[]): Promise<void> {
       : Math.floor(Date.now() / 1000) + 86400;
     if (!Number.isFinite(endSec)) { log.error('--end 日期格式无效'); process.exit(1); }
     const maxBet = maxBetArg ? parseFloat(maxBetArg) : 10;
-    const { id, num } = insertTcProposal({ title, optionType: typeArg, options, endTime: endSec, maxBetLp: maxBet });
+    const { id, num } = await insertTcProposal({ title, optionType: typeArg, options, endTime: endSec, maxBetLp: maxBet });
     console.log(`TC-${num} 已创建（id=${id}），topMessageId 待手动发送后回填。`);
     return;
   }
@@ -2016,7 +2061,7 @@ async function cmd_fragment(argv: string[]): Promise<void> {
   if (sub === 'add') {
     const content = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
     if (!content) { log.error('用法: agent fragment add "<碎片文字>" [--source <url>] [--category <标签>]'); process.exit(1); }
-    const { inserted, id } = insertFragment({
+    const { inserted, id } = await insertFragment({
       content,
       sourceUrl: getFlag(argv, 'source'),
       sourceNote: getFlag(argv, 'note'),
@@ -2040,7 +2085,7 @@ async function cmd_fragment(argv: string[]): Promise<void> {
       let obj: { content?: string; sourceUrl?: string; sourceNote?: string; category?: string; addedBy?: string };
       try { obj = JSON.parse(line); } catch { bad++; continue; }
       if (!obj.content || typeof obj.content !== 'string' || !obj.content.trim()) { bad++; continue; }
-      const { inserted } = insertFragment({
+      const { inserted } = await insertFragment({
         content: obj.content,
         sourceUrl: obj.sourceUrl,
         sourceNote: obj.sourceNote,
@@ -2057,7 +2102,7 @@ async function cmd_fragment(argv: string[]): Promise<void> {
   if (sub === 'list') {
     const limitArg = getFlag(argv, 'limit');
     const offsetArg = getFlag(argv, 'offset');
-    const rows = listFragments({
+    const rows = await listFragments({
       limit: limitArg ? parseInt(limitArg, 10) : 50,
       offset: offsetArg ? parseInt(offsetArg, 10) : 0,
       status: getFlag(argv, 'status') as 'active' | 'archived' | undefined,
@@ -2069,7 +2114,7 @@ async function cmd_fragment(argv: string[]): Promise<void> {
       const st = f.status === 'active' ? '' : ` (${f.status})`;
       console.log(`#${f.id}${st}${tag} ${f.content}`);
     }
-    console.log(`— 本页 ${rows.length} 条；active 总数 ${countFragments({ status: 'active' })}`);
+    console.log(`— 本页 ${rows.length} 条；active 总数 ${await countFragments({ status: 'active' })}`);
     return;
   }
 
@@ -2078,7 +2123,7 @@ async function cmd_fragment(argv: string[]): Promise<void> {
     const q = argv[2] && !argv[2].startsWith('--') ? argv[2] : undefined;
     if (!q) { log.error('用法: agent fragment search "<关键字>" [--limit N]'); process.exit(1); }
     const limitArg = getFlag(argv, 'limit');
-    const rows = searchFragments(q, limitArg ? parseInt(limitArg, 10) : 20);
+    const rows = await searchFragments(q, limitArg ? parseInt(limitArg, 10) : 20);
     if (rows.length === 0) { console.log('（无匹配，可安全写入新碎片）'); return; }
     for (const f of rows) console.log(`#${f.id} ${f.content}`);
     return;
@@ -2086,14 +2131,14 @@ async function cmd_fragment(argv: string[]): Promise<void> {
 
   // ── fragment random ───────────────────────────────────────
   if (sub === 'random') {
-    const f = getRandomFragment({ category: getFlag(argv, 'category') });
+    const f = await getRandomFragment({ category: getFlag(argv, 'category') });
     console.log(f ? f.content : '（碎片库为空）');
     return;
   }
 
   // ── fragment count ────────────────────────────────────────
   if (sub === 'count') {
-    console.log(String(countFragments({ status: getFlag(argv, 'status') as 'active' | 'archived' | undefined })));
+    console.log(String(await countFragments({ status: getFlag(argv, 'status') as 'active' | 'archived' | undefined })));
     return;
   }
 
@@ -2102,7 +2147,7 @@ async function cmd_fragment(argv: string[]): Promise<void> {
     const idStr = argv[2];
     const id = idStr ? parseInt(idStr, 10) : NaN;
     if (isNaN(id)) { log.error('用法: agent fragment archive <id>'); process.exit(1); }
-    console.log(archiveFragment(id) ? `碎片 #${id} 已软停用。` : `碎片 #${id} 不存在或已非 active。`);
+    console.log((await archiveFragment(id)) ? `碎片 #${id} 已软停用。` : `碎片 #${id} 不存在或已非 active。`);
     return;
   }
 
@@ -2146,7 +2191,7 @@ async function cmd_predict(argv: string[]): Promise<void> {
     const cfg = loadConfigs();
     for (const id of listAgents(cfg)) {
       if (cfg.agents.agents[id]?.enabled) {
-        larkProfile = resolveAgent(id, cfg).larkProfile;
+        larkProfile = resolveAgentProfile(id, cfg).larkProfile;
         break;
       }
     }
@@ -2155,7 +2200,7 @@ async function cmd_predict(argv: string[]): Promise<void> {
   // ── predict list ──────────────────────────────────────────
   if (sub === 'list') {
     const all = hasFlag(argv, 'all');
-    const proposals = all ? listAllPredicts(20) : listActivePredicts();
+    const proposals = all ? await listAllPredicts(20) : await listActivePredicts();
     if (proposals.length === 0) {
       console.log(all ? '暂无提案记录。' : '暂无 active 提案。');
       return;
@@ -2172,9 +2217,9 @@ async function cmd_predict(argv: string[]): Promise<void> {
     const numStr = argv[2];
     const num = numStr ? parseInt(numStr, 10) : NaN;
     if (isNaN(num)) { log.error('用法: agent predict show <编号>'); process.exit(1); }
-    const p = getPredictByNum(num);
+    const p = await getPredictByNum(num);
     if (!p) { log.error(`找不到 BET-${num}`); process.exit(1); }
-    const bets = getPredictBets(p.id);
+    const bets = await getPredictBets(p.id);
     const activeBets = bets.filter(b => !b.isRefunded);
     const totalLp = activeBets.reduce((s, b) => s + b.lpAmount, 0);
     console.log(`BET-${p.num}: ${p.title}`);
@@ -2210,7 +2255,7 @@ async function cmd_predict(argv: string[]): Promise<void> {
     const numStr = argv[2];
     const num = numStr ? parseInt(numStr, 10) : NaN;
     if (isNaN(num)) { log.error('用法: agent predict refresh <编号>'); process.exit(1); }
-    const p = getPredictByNum(num);
+    const p = await getPredictByNum(num);
     if (!p) { log.error(`找不到 BET-${num}`); process.exit(1); }
     if (p.status !== 'active' && p.status !== 'settled') {
       log.error(`BET-${num} 状态为 ${p.status}，只有 active / settled 提案有可原地重绘的原帖`);
@@ -2219,28 +2264,28 @@ async function cmd_predict(argv: string[]): Promise<void> {
     if (!p.topMessageId) { log.error(`BET-${num} 尚未发送（topMessageId 为空），无法重绘`); process.exit(1); }
     const { buildPredictResultPost, buildPredictSettledPost } = await import('../core/predict-post.js');
     const { updateMessage } = await import('../core/lark.js');
-    const bets = getPredictBets(p.id);
+    const bets = await getPredictBets(p.id);
 
     let post;
     if (p.status === 'settled') {
-      const rewards = store.ptGrantsForRef('predict_reward', p.topMessageId);
-      const winnerNames = rewards.map((r) => ({
+      const rewards = await store.ptGrantsForRef('predict_reward', p.topMessageId);
+      const winnerNames = await Promise.all(rewards.map(async (r) => ({
         userOpenId: r.openId,
-        userName: store.memberName(r.openId) || store.getProfile(r.openId)?.name || r.openId,
+        userName: (await store.memberName(r.openId)) || (await store.getProfile(r.openId))?.name || r.openId,
         amount: r.delta,
-      }));
-      const chestContribution = store
-        .ptGrantsForRef('predict_chest_contribute', p.topMessageId)
+      })));
+      const chestContribution = (await store
+        .ptGrantsForRef('predict_chest_contribute', p.topMessageId))
         .reduce((s, r) => s + r.delta, 0);
       const announcerName = p.announcedBy
-        ? store.memberName(p.announcedBy) || store.getProfile(p.announcedBy)?.name || p.announcedBy
+        ? (await store.memberName(p.announcedBy)) || (await store.getProfile(p.announcedBy))?.name || p.announcedBy
         : '';
       post = buildPredictSettledPost(p, bets, winnerNames, announcerName, chestContribution);
     } else {
       post = buildPredictResultPost(p, bets);
     }
 
-    const ok = updateMessage(p.topMessageId, post, { as: 'bot', profile: larkProfile });
+    const ok = await updateMessage(p.topMessageId, post, { as: 'bot', profile: larkProfile });
     if (!ok) { log.error(`重绘失败：更新原帖返回失败（topMsgId=${p.topMessageId}）`); process.exit(1); }
     console.log(`BET-${p.num}【${p.title}】原帖已用当前模板重绘（status=${p.status}, topMsgId=${p.topMessageId}）。`);
     return;
@@ -2251,10 +2296,10 @@ async function cmd_predict(argv: string[]): Promise<void> {
     const numStr = argv[2];
     const num = numStr ? parseInt(numStr, 10) : NaN;
     if (isNaN(num)) { log.error('用法: agent predict cancel <编号>'); process.exit(1); }
-    const p = getPredictByNum(num);
+    const p = await getPredictByNum(num);
     if (!p) { log.error(`找不到 BET-${num}`); process.exit(1); }
     if (p.status !== 'active') { log.error(`BET-${num} 状态为 ${p.status}，不可撤销`); process.exit(1); }
-    const { refunded } = cancelPredictWithRefund(p);
+    const { refunded } = await cancelPredictWithRefund(p);
     console.log(`BET-${p.num}【${p.title}】已撤销，退款 ${refunded} 笔。`);
     return;
   }
@@ -2270,7 +2315,7 @@ async function cmd_predict(argv: string[]): Promise<void> {
     const winnerOption = (flagStart === -1 ? rest : rest.slice(0, flagStart)).join(' ').trim();
     const announcer = getFlag(argv, 'by') || 'cli';
     if (isNaN(num) || !winnerOption) { log.error('用法: agent predict announce <编号> <获胜选项> [--by <open_id>]'); process.exit(1); }
-    const p = getPredictByNum(num);
+    const p = await getPredictByNum(num);
     if (!p) { log.error(`找不到 BET-${num}`); process.exit(1); }
     if (p.status !== 'active') { log.error(`BET-${num} 状态为 ${p.status}，无法宣布结果`); process.exit(1); }
     if (!p.options.includes(winnerOption)) {
@@ -2301,7 +2346,7 @@ async function cmd_predict(argv: string[]): Promise<void> {
       : Math.floor(Date.now() / 1000) + 86400;
     if (!Number.isFinite(endSec)) { log.error('--end 日期格式无效'); process.exit(1); }
     const maxBet = maxBetArg ? parseFloat(maxBetArg) : 10;
-    const { id, num } = insertPredictProposal({ title, options, endTime: endSec, maxBetLp: maxBet });
+    const { id, num } = await insertPredictProposal({ title, options, endTime: endSec, maxBetLp: maxBet });
     console.log(`BET-${num} 已创建（id=${id}），topMessageId 待手动发送后回填。`);
     return;
   }
@@ -2341,7 +2386,7 @@ async function cmd_chest(argv: string[]): Promise<void> {
     const owner = getFlag(argv, 'owner');
     if (!name || !owner) { log.error('用法: agent chest create --name <名称> --owner <open_id>'); process.exit(1); }
     const chestId = `chest:${name.trim()}`;
-    const { chest, created } = createChest({ chestId, name, ownerOpenId: owner });
+    const { chest, created } = await createChest({ chestId, name, ownerOpenId: owner });
     console.log(created
       ? `宝箱【${chest.name}】已创建（chest_id=${chest.chestId}，owner=${chest.ownerOpenId}）。`
       : `宝箱【${chest.name}】已存在（owner=${chest.ownerOpenId}），未重复创建。`);
@@ -2352,9 +2397,9 @@ async function cmd_chest(argv: string[]): Promise<void> {
   if (sub === 'balance') {
     const name = argv[2];
     if (!name) { log.error('用法: agent chest balance <名称>'); process.exit(1); }
-    const chest = getChestByName(name);
+    const chest = await getChestByName(name);
     if (!chest) { log.error(`找不到宝箱【${name}】`); process.exit(1); }
-    console.log(`宝箱【${chest.name}】余额：${chestBalance(chest.chestId).toFixed(1)} LP（owner=${chest.ownerOpenId}）`);
+    console.log(`宝箱【${chest.name}】余额：${(await chestBalance(chest.chestId)).toFixed(1)} LP（owner=${chest.ownerOpenId}）`);
     return;
   }
 
@@ -2368,9 +2413,9 @@ async function cmd_chest(argv: string[]): Promise<void> {
       log.error('用法: agent chest deposit <名称> --from <open_id> --amount <N>');
       process.exit(1);
     }
-    const chest = getChestByName(name);
+    const chest = await getChestByName(name);
     if (!chest) { log.error(`找不到宝箱【${name}】`); process.exit(1); }
-    const result = chestDeposit(chest.chestId, from, amount);
+    const result = await chestDeposit(chest.chestId, from, amount);
     if (!result.ok) { log.error(`存入失败：${result.error}`); process.exit(1); }
     console.log(`已存入 ${amount.toFixed(1)} LP，宝箱【${chest.name}】当前余额：${result.balance.toFixed(1)} LP。`);
     return;
@@ -2386,9 +2431,9 @@ async function cmd_chest(argv: string[]): Promise<void> {
       log.error('用法: agent chest withdraw <名称> --to <open_id> --amount <N>');
       process.exit(1);
     }
-    const chest = getChestByName(name);
+    const chest = await getChestByName(name);
     if (!chest) { log.error(`找不到宝箱【${name}】`); process.exit(1); }
-    const result = chestWithdraw(chest.chestId, chest.ownerOpenId, to, amount);
+    const result = await chestWithdraw(chest.chestId, chest.ownerOpenId, to, amount);
     if (!result.ok) { log.error(`转出失败：${result.error}`); process.exit(1); }
     console.log(`已转出 ${amount.toFixed(1)} LP 给 ${to}，宝箱【${chest.name}】当前余额：${result.balance.toFixed(1)} LP。`);
     return;
