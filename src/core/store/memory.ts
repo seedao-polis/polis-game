@@ -83,47 +83,60 @@ function rowToMemoryItem(row: Record<string, unknown>): MemoryItem {
 /**
  * Insert a new memory item. namespace is required and has no default; callers must be explicit
  * about the access scope to prevent accidental global leakage.
+ *
+ * The INSERT carries a RETURNING clause (supported by both node:sqlite and PostgreSQL) so the new
+ * row's id can be read back without relying on `lastInsertRowid`, which the PostgreSQL query
+ * interface introduced later has no equivalent for.
  */
-export function insertMemory(input: InsertMemoryInput): number {
-  const db = getDb();
-  const result = db.prepare(`
+export async function insertMemory(input: InsertMemoryInput): Promise<number> {
+  const db = await getDb();
+  const { rows } = await db.query<{ id: number }>(
+    `
     INSERT INTO memory_items(namespace, key, content, visibility, sensitivity, source, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    input.namespace,
-    input.key ?? null,
-    input.content,
-    input.visibility ?? 'private',
-    input.sensitivity ?? 'normal',
-    input.source ?? 'manual',
-    input.expiresAt ?? null,
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    RETURNING id
+  `,
+    [
+      input.namespace,
+      input.key ?? null,
+      input.content,
+      input.visibility ?? 'private',
+      input.sensitivity ?? 'normal',
+      input.source ?? 'manual',
+      input.expiresAt ?? null,
+    ],
   );
-  return result.lastInsertRowid as number;
+  return rows[0]?.id ?? 0;
 }
 
 /**
  * Upsert a memory item by (namespace, key). When a row with the same namespace+key already
  * exists, its content and updated_at are refreshed. When key is null, always inserts a new row.
  */
-export function upsertMemory(input: InsertMemoryInput & { key: string }): number {
-  return tx(() => {
-    const db = getDb();
-    const existing = db.prepare(
-      'SELECT id FROM memory_items WHERE namespace = ? AND key = ? LIMIT 1'
-    ).get(input.namespace, input.key) as { id: number } | undefined;
+export async function upsertMemory(input: InsertMemoryInput & { key: string }): Promise<number> {
+  return tx(async () => {
+    const db = await getDb();
+    const { rows: existingRows } = await db.query<{ id: number }>(
+      'SELECT id FROM memory_items WHERE namespace = $1 AND key = $2 LIMIT 1',
+      [input.namespace, input.key],
+    );
+    const existing = existingRows[0];
     if (existing) {
-      db.prepare(`
+      await db.query(
+        `
         UPDATE memory_items
-        SET content = ?, visibility = ?, sensitivity = ?, source = ?,
-            expires_at = ?, updated_at = unixepoch()
-        WHERE id = ?
-      `).run(
-        input.content,
-        input.visibility ?? 'private',
-        input.sensitivity ?? 'normal',
-        input.source ?? 'manual',
-        input.expiresAt ?? null,
-        existing.id,
+        SET content = $1, visibility = $2, sensitivity = $3, source = $4,
+            expires_at = $5, updated_at = unixepoch()
+        WHERE id = $6
+      `,
+        [
+          input.content,
+          input.visibility ?? 'private',
+          input.sensitivity ?? 'normal',
+          input.source ?? 'manual',
+          input.expiresAt ?? null,
+          existing.id,
+        ],
       );
       return existing.id;
     }
@@ -138,26 +151,29 @@ export function upsertMemory(input: InsertMemoryInput & { key: string }): number
  *
  * The namespaces argument must come from allowedNamespaces(ctx) — never pass an unfiltered list.
  */
-export function getFilteredMemories(
+export async function getFilteredMemories(
   ctx: CallerContext,
   opts: GetFilteredMemoriesOptions,
-): MemoryItem[] {
+): Promise<MemoryItem[]> {
   if (opts.namespaces.length === 0) return [];
-  const db = getDb();
+  const db = await getDb();
 
   // Exclude expired entries at the SQL level.
   const now = Math.floor(Date.now() / 1000);
-  const placeholders = opts.namespaces.map(() => '?').join(', ');
-  const rows = db.prepare(`
+  const placeholders = opts.namespaces.map((_, i) => `$${i + 1}`).join(', ');
+  const { rows } = await db.query<Record<string, unknown>>(
+    `
     SELECT * FROM memory_items
     WHERE namespace IN (${placeholders})
-      AND (expires_at IS NULL OR expires_at > ?)
+      AND (expires_at IS NULL OR expires_at > $${opts.namespaces.length + 1})
     ORDER BY updated_at DESC
-  `).all(...opts.namespaces, now) as Array<Record<string, unknown>>;
+  `,
+    [...opts.namespaces, now],
+  );
 
   const items = rows.map(rowToMemoryItem);
 
-  // Policy filter: enforces visibility rules on top of namespace matching.
+  // Policy filter: enforces visibility rules on top of namespace matching. Pure/synchronous.
   const allowed = filterByPolicy(items, ctx);
 
   // Apply per-scope character budgets to prevent prompt bloat.
@@ -191,35 +207,39 @@ export function getFilteredMemories(
  * No policy filtering is applied here — callers are responsible for using caller-controlled
  * namespace values (e.g. constructed from the caller's own open_id).
  */
-export function getMemoryByKey(namespace: string, key: string): MemoryItem | null {
-  const db = getDb();
+export async function getMemoryByKey(namespace: string, key: string): Promise<MemoryItem | null> {
+  const db = await getDb();
   const now = Math.floor(Date.now() / 1000);
-  const row = db.prepare(`
+  const { rows } = await db.query<Record<string, unknown>>(
+    `
     SELECT * FROM memory_items
-    WHERE namespace = ? AND key = ?
-      AND (expires_at IS NULL OR expires_at > ?)
+    WHERE namespace = $1 AND key = $2
+      AND (expires_at IS NULL OR expires_at > $3)
     LIMIT 1
-  `).get(namespace, key, now) as Record<string, unknown> | undefined;
+  `,
+    [namespace, key, now],
+  );
+  const row = rows[0];
   return row ? rowToMemoryItem(row) : null;
 }
 
 /**
  * Delete a memory item by id. Returns true when a row was deleted.
  */
-export function deleteMemory(id: number): boolean {
-  const db = getDb();
-  const result = db.prepare('DELETE FROM memory_items WHERE id = ?').run(id);
-  return (result.changes as number) > 0;
+export async function deleteMemory(id: number): Promise<boolean> {
+  const db = await getDb();
+  const { rowCount } = await db.query('DELETE FROM memory_items WHERE id = $1', [id]);
+  return rowCount > 0;
 }
 
 /**
  * Delete all memory items in a namespace. Intended for administrative cleanup.
  * Returns the count of deleted rows.
  */
-export function deleteNamespace(namespace: string): number {
-  const db = getDb();
-  const result = db.prepare('DELETE FROM memory_items WHERE namespace = ?').run(namespace);
-  return result.changes as number;
+export async function deleteNamespace(namespace: string): Promise<number> {
+  const db = await getDb();
+  const { rowCount } = await db.query('DELETE FROM memory_items WHERE namespace = $1', [namespace]);
+  return rowCount;
 }
 
 /**
@@ -227,12 +247,12 @@ export function deleteNamespace(namespace: string): number {
  * Uses the DB-side unixepoch() so the comparison is clock-safe.
  * Returns the count of deleted rows.
  */
-export function purgeExpiredMemories(): number {
-  const db = getDb();
-  const result = db.prepare(
-    'DELETE FROM memory_items WHERE expires_at IS NOT NULL AND expires_at <= unixepoch()'
-  ).run();
-  return result.changes as number;
+export async function purgeExpiredMemories(): Promise<number> {
+  const db = await getDb();
+  const { rowCount } = await db.query(
+    'DELETE FROM memory_items WHERE expires_at IS NOT NULL AND expires_at <= unixepoch()',
+  );
+  return rowCount;
 }
 
 // ── Operator / admin read functions (no policy filter) ────────────────────────
@@ -250,30 +270,38 @@ export interface ListMemoriesFilter {
  * List memory items without any policy filtering. Intended for operator tooling only;
  * never expose the result of this function to an LLM or an untrusted caller.
  */
-export function listMemories(filter: ListMemoriesFilter = {}): MemoryItem[] {
-  const db = getDb();
+export async function listMemories(filter: ListMemoriesFilter = {}): Promise<MemoryItem[]> {
+  const db = await getDb();
   const conditions: string[] = [];
-  const params: string[] = [];
+  const params: unknown[] = [];
 
   if (filter.namespace) {
-    conditions.push('namespace = ?');
     params.push(filter.namespace);
+    conditions.push(`namespace = $${params.length}`);
   }
   if (filter.userOpenId) {
     // Match namespaces that encode this open_id: user:{id} or group_user:*:{id}
-    conditions.push("(namespace = ? OR namespace LIKE ?)");
-    params.push(`user:${filter.userOpenId}`, `group_user:%:${filter.userOpenId}`);
+    params.push(`user:${filter.userOpenId}`);
+    const eqIdx = params.length;
+    params.push(`group_user:%:${filter.userOpenId}`);
+    const likeIdx = params.length;
+    conditions.push(`(namespace = $${eqIdx} OR namespace LIKE $${likeIdx})`);
   }
   if (filter.chatId) {
-    conditions.push("(namespace = ? OR namespace LIKE ?)");
-    params.push(`group:${filter.chatId}`, `group_user:${filter.chatId}:%`);
+    params.push(`group:${filter.chatId}`);
+    const eqIdx = params.length;
+    params.push(`group_user:${filter.chatId}:%`);
+    const likeIdx = params.length;
+    conditions.push(`(namespace = $${eqIdx} OR namespace LIKE $${likeIdx})`);
   }
 
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')} ` : '';
   const limit = filter.limit ?? 100;
-  const rows = db.prepare(
-    `SELECT * FROM memory_items ${where}ORDER BY updated_at DESC LIMIT ?`
-  ).all(...params, limit) as Array<Record<string, unknown>>;
+  params.push(limit);
+  const { rows } = await db.query<Record<string, unknown>>(
+    `SELECT * FROM memory_items ${where}ORDER BY updated_at DESC LIMIT $${params.length}`,
+    params,
+  );
   return rows.map(rowToMemoryItem);
 }
 
@@ -281,10 +309,10 @@ export function listMemories(filter: ListMemoriesFilter = {}): MemoryItem[] {
  * Fetch a single memory item by id. Returns null when not found.
  * No policy filtering is applied — for operator / admin use only.
  */
-export function getMemoryById(id: number): MemoryItem | null {
-  const db = getDb();
-  const row = db.prepare('SELECT * FROM memory_items WHERE id = ?').get(id) as
-    Record<string, unknown> | undefined;
+export async function getMemoryById(id: number): Promise<MemoryItem | null> {
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>('SELECT * FROM memory_items WHERE id = $1', [id]);
+  const row = rows[0];
   return row ? rowToMemoryItem(row) : null;
 }
 
@@ -292,11 +320,12 @@ export function getMemoryById(id: number): MemoryItem | null {
  * Retrieve the N most recent messages sent to a specific chat, ordered oldest→newest.
  * Used by the group topic aggregator to build a frequency corpus.
  */
-export function getRecentMessagesForChat(chatId: string, limit: number): Array<{ text: string }> {
-  const db = getDb();
-  const rows = db.prepare(
-    'SELECT text FROM messages WHERE chat_id = ? AND deleted = 0 ORDER BY create_time DESC LIMIT ?'
-  ).all(chatId, limit) as Array<Record<string, unknown>>;
+export async function getRecentMessagesForChat(chatId: string, limit: number): Promise<Array<{ text: string }>> {
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>(
+    'SELECT text FROM messages WHERE chat_id = $1 AND deleted = 0 ORDER BY create_time DESC LIMIT $2',
+    [chatId, limit],
+  );
   return rows.map((r) => ({ text: (r['text'] as string) ?? '' }));
 }
 
@@ -304,17 +333,18 @@ export function getRecentMessagesForChat(chatId: string, limit: number): Array<{
  * Retrieve the N most recent messages sent by a specific user in a specific chat, ordered
  * newest→oldest. Used to build the per-user summary corpus.
  */
-export function getRecentUserMessagesInChat(
+export async function getRecentUserMessagesInChat(
   chatId: string,
   userOpenId: string,
   limit: number,
-): Array<{ text: string }> {
-  const db = getDb();
-  const rows = db.prepare(
+): Promise<Array<{ text: string }>> {
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>(
     `SELECT text FROM messages
-     WHERE chat_id = ? AND sender_open_id = ? AND deleted = 0
-     ORDER BY create_time DESC LIMIT ?`
-  ).all(chatId, userOpenId, limit) as Array<Record<string, unknown>>;
+     WHERE chat_id = $1 AND sender_open_id = $2 AND deleted = 0
+     ORDER BY create_time DESC LIMIT $3`,
+    [chatId, userOpenId, limit],
+  );
   return rows.map((r) => ({ text: (r['text'] as string) ?? '' }));
 }
 
@@ -322,8 +352,8 @@ export function getRecentUserMessagesInChat(
  * Return the distinct chat_ids that appear in the messages table (i.e. chats with
  * recorded history). Used by the daily memory maintenance job.
  */
-export function listKnownChatIds(): string[] {
-  const db = getDb();
-  const rows = db.prepare('SELECT DISTINCT chat_id FROM messages').all() as Array<Record<string, unknown>>;
+export async function listKnownChatIds(): Promise<string[]> {
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>('SELECT DISTINCT chat_id FROM messages');
   return rows.map((r) => r['chat_id'] as string).filter(Boolean);
 }

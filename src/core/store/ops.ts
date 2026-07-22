@@ -1,4 +1,5 @@
-import { getDb } from '../db.js';
+import { getDb, shouldDivertSoulWrites } from '../db.js';
+import { enqueueOutboxWrite } from '../pg-outbox.js';
 
 // ── error ledger ──────────────────────────────────────────────
 // Records every agent/kimi failure for observability + the janitor's threshold alerts.
@@ -18,39 +19,45 @@ export interface ErrorRecord {
   postmortem?: string | null;
 }
 
-export function recordError(e: ErrorRecord): void {
+export async function recordError(e: ErrorRecord): Promise<void> {
+  const cols = ['corr_id', 'soul', 'chat_id', 'source', 'kind', 'summary', 'exit_code', 'signal', 'duration_ms', 'attempt', 'healed', 'postmortem'];
+  const values = [
+    e.corrId ?? null,
+    e.soul ?? null,
+    e.chatId ?? null,
+    e.source ?? null,
+    e.kind,
+    e.summary,
+    e.exitCode ?? null,
+    e.signal ?? null,
+    e.durationMs ?? null,
+    e.attempt ?? 1,
+    e.healed ? 1 : 0,
+    e.postmortem ?? null,
+  ];
   try {
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO errors(corr_id, soul, chat_id, source, kind, summary, exit_code, signal, duration_ms, attempt, healed, postmortem)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      e.corrId ?? null,
-      e.soul ?? null,
-      e.chatId ?? null,
-      e.source ?? null,
-      e.kind,
-      e.summary,
-      e.exitCode ?? null,
-      e.signal ?? null,
-      e.durationMs ?? null,
-      e.attempt ?? 1,
-      e.healed ? 1 : 0,
-      e.postmortem ?? null,
-    );
+    // Append-only error ledger: while the soul PG pool's circuit breaker is open, divert straight to
+    // the local outbox instead of attempting PostgreSQL.
+    if (shouldDivertSoulWrites()) {
+      await enqueueOutboxWrite('errors', cols, values);
+      return;
+    }
+    const db = await getDb();
+    await db.query(`INSERT INTO errors(${cols.join(',')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(',')})`, values);
   } catch {
     /* ledger write must never break a reply */
   }
 }
 
-export function recentErrorCount(chatId: string, sinceMs: number): number {
+export async function recentErrorCount(chatId: string, sinceMs: number): Promise<number> {
   try {
-    const db = getDb();
+    const db = await getDb();
     const cutoff = Math.floor((Date.now() - sinceMs) / 1000);
-    const row = db
-      .prepare('SELECT COUNT(*) AS n FROM errors WHERE chat_id = ? AND created_at >= ?')
-      .get(chatId, cutoff) as { n: number } | undefined;
-    return row?.n ?? 0;
+    const { rows } = await db.query<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM errors WHERE chat_id = $1 AND created_at >= $2',
+      [chatId, cutoff],
+    );
+    return rows[0]?.n ?? 0;
   } catch {
     return 0;
   }
@@ -75,59 +82,72 @@ export interface PendingReply {
   attempts: number;
 }
 
-export function addPendingReply(r: Omit<PendingReply, 'id'>): number {
+/**
+ * The INSERT carries a RETURNING clause (supported by both node:sqlite and PostgreSQL) so the new
+ * row's id can be read back without relying on `lastInsertRowid`, which the PostgreSQL query
+ * interface introduced later has no equivalent for.
+ */
+export async function addPendingReply(r: Omit<PendingReply, 'id'>): Promise<number> {
   try {
-    const db = getDb();
-    const info = db.prepare(`
+    const db = await getDb();
+    const { rows } = await db.query<{ id: number }>(
+      `
       INSERT INTO pending_replies(agent_id, channel, chat_id, message_id, session_key, sender_open_id, text, reaction_id, pt_spent, attempts)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      r.agentId, r.channel, r.chatId, r.messageId ?? null, r.sessionKey,
-      r.senderOpenId ?? null, r.text, r.reactionId ?? null, r.ptSpent ? 1 : 0, r.attempts ?? 0,
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING id
+    `,
+      [
+        r.agentId, r.channel, r.chatId, r.messageId ?? null, r.sessionKey,
+        r.senderOpenId ?? null, r.text, r.reactionId ?? null, r.ptSpent ? 1 : 0, r.attempts ?? 0,
+      ],
     );
-    return Number(info.lastInsertRowid) || 0;
+    return rows[0]?.id ?? 0;
   } catch {
     return 0;
   }
 }
 
-export function updatePendingReply(
+export async function updatePendingReply(
   id: number,
   patch: { reactionId?: string | null; ptSpent?: boolean; attempts?: number },
-): void {
+): Promise<void> {
   if (!id) return;
   try {
-    const db = getDb();
+    const db = await getDb();
     if (patch.reactionId !== undefined) {
-      db.prepare('UPDATE pending_replies SET reaction_id = ? WHERE id = ?').run(patch.reactionId ?? null, id);
+      await db.query('UPDATE pending_replies SET reaction_id = $1 WHERE id = $2', [patch.reactionId ?? null, id]);
     }
     if (patch.ptSpent !== undefined) {
-      db.prepare('UPDATE pending_replies SET pt_spent = ? WHERE id = ?').run(patch.ptSpent ? 1 : 0, id);
+      await db.query('UPDATE pending_replies SET pt_spent = $1 WHERE id = $2', [patch.ptSpent ? 1 : 0, id]);
     }
     if (patch.attempts !== undefined) {
-      db.prepare('UPDATE pending_replies SET attempts = ? WHERE id = ?').run(patch.attempts, id);
+      await db.query('UPDATE pending_replies SET attempts = $1 WHERE id = $2', [patch.attempts, id]);
     }
   } catch {
     /* best-effort */
   }
 }
 
-export function removePendingReply(id: number): void {
+export async function removePendingReply(id: number): Promise<void> {
   if (!id) return;
   try {
-    getDb().prepare('DELETE FROM pending_replies WHERE id = ?').run(id);
+    const db = await getDb();
+    await db.query('DELETE FROM pending_replies WHERE id = $1', [id]);
   } catch {
     /* best-effort */
   }
 }
 
-export function listPendingReplies(agentId: string, channel: string): PendingReply[] {
+export async function listPendingReplies(agentId: string, channel: string): Promise<PendingReply[]> {
   try {
-    const db = getDb();
-    const rows = db.prepare(`
+    const db = await getDb();
+    const { rows } = await db.query<Record<string, unknown>>(
+      `
       SELECT id, agent_id, channel, chat_id, message_id, session_key, sender_open_id, text, reaction_id, pt_spent, attempts
-      FROM pending_replies WHERE agent_id = ? AND channel = ? ORDER BY id ASC
-    `).all(agentId, channel) as Array<Record<string, unknown>>;
+      FROM pending_replies WHERE agent_id = $1 AND channel = $2 ORDER BY id ASC
+    `,
+      [agentId, channel],
+    );
     return rows.map((r) => ({
       id: Number(r.id),
       agentId: String(r.agent_id),
@@ -146,7 +166,7 @@ export function listPendingReplies(agentId: string, channel: string): PendingRep
   }
 }
 
-export function recentErrors(limit = 20): Array<{
+export async function recentErrors(limit = 20): Promise<Array<{
   created_at: number;
   corr_id: string | null;
   soul: string | null;
@@ -154,12 +174,10 @@ export function recentErrors(limit = 20): Array<{
   kind: string;
   summary: string;
   healed: number;
-}> {
+}>> {
   try {
-    const db = getDb();
-    return db
-      .prepare('SELECT created_at, corr_id, soul, chat_id, kind, summary, healed FROM errors ORDER BY created_at DESC LIMIT ?')
-      .all(limit) as Array<{
+    const db = await getDb();
+    const { rows } = await db.query<{
       created_at: number;
       corr_id: string | null;
       soul: string | null;
@@ -167,29 +185,37 @@ export function recentErrors(limit = 20): Array<{
       kind: string;
       summary: string;
       healed: number;
-    }>;
+    }>(
+      'SELECT created_at, corr_id, soul, chat_id, kind, summary, healed FROM errors ORDER BY created_at DESC LIMIT $1',
+      [limit],
+    );
+    return rows;
   } catch {
     return [];
   }
 }
 
-export function wasTokenExpiryAlertSent(grantKey: string, threshold: number): boolean {
+export async function wasTokenExpiryAlertSent(grantKey: string, threshold: number): Promise<boolean> {
   try {
-    const row = getDb()
-      .prepare('SELECT 1 FROM token_expiry_alerts WHERE grant_key = ? AND threshold = ?')
-      .get(grantKey, threshold);
-    return !!row;
+    const db = await getDb();
+    const { rows } = await db.query(
+      'SELECT 1 FROM token_expiry_alerts WHERE grant_key = $1 AND threshold = $2',
+      [grantKey, threshold],
+    );
+    return rows.length > 0;
   } catch {
     return false;
   }
 }
 
-export function markTokenExpiryAlertSent(grantKey: string, threshold: number): boolean {
+export async function markTokenExpiryAlertSent(grantKey: string, threshold: number): Promise<boolean> {
   try {
-    const info = getDb()
-      .prepare('INSERT OR IGNORE INTO token_expiry_alerts(grant_key, threshold) VALUES (?, ?)')
-      .run(grantKey, threshold);
-    return (info.changes as number) > 0;
+    const db = await getDb();
+    const { rowCount } = await db.query(
+      'INSERT INTO token_expiry_alerts(grant_key, threshold) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [grantKey, threshold],
+    );
+    return rowCount > 0;
   } catch {
     return false;
   }

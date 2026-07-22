@@ -1,4 +1,5 @@
-import { getDb } from '../db.js';
+import { getDb, shouldDivertSoulWrites } from '../db.js';
+import { enqueueOutboxWrite } from '../pg-outbox.js';
 
 export interface MessageRow {
   messageId: string;
@@ -24,7 +25,12 @@ export interface MessageRow {
   raw?: string;
 }
 
-export function upsertChat(c: {
+/** Escape LIKE/ILIKE wildcard characters so user-supplied search text is matched literally. */
+function escapeLikePattern(s: string): string {
+  return s.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
+export async function upsertChat(c: {
   chatId: string;
   name?: string;
   chatType?: string;
@@ -32,18 +38,18 @@ export function upsertChat(c: {
   external?: boolean;
   tenantKey?: string;
   larkProfile?: string;
-}): void {
-  const db = getDb();
-  db.prepare(`
+}): Promise<void> {
+  const db = await getDb();
+  await db.query(`
     INSERT INTO chats(chat_id, name, chat_type, chat_mode, external, tenant_key, lark_profile)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
     ON CONFLICT(chat_id) DO UPDATE SET
       name         = CASE WHEN excluded.name <> '' THEN excluded.name ELSE chats.name END,
       external     = excluded.external,
       tenant_key   = CASE WHEN excluded.tenant_key IS NOT NULL THEN excluded.tenant_key ELSE chats.tenant_key END,
       lark_profile = CASE WHEN excluded.lark_profile IS NOT NULL THEN excluded.lark_profile ELSE chats.lark_profile END,
       updated_at   = unixepoch()
-  `).run(
+  `, [
     c.chatId,
     c.name ?? '',
     c.chatType ?? null,
@@ -51,25 +57,21 @@ export function upsertChat(c: {
     c.external ? 1 : 0,
     c.tenantKey ?? null,
     c.larkProfile ?? null,
-  );
+  ]);
 }
 
 /**
  * Insert a message row, ensuring the parent chat exists first.
  * Returns true when the row was newly inserted (false when already present).
  */
-export function insertMessage(m: MessageRow): boolean {
-  const db = getDb();
-  // Satisfy the foreign key: create a placeholder chat row if it does not exist yet.
-  db.prepare('INSERT OR IGNORE INTO chats(chat_id) VALUES(?)').run(m.chatId);
-  const result = db.prepare(`
-    INSERT OR IGNORE INTO messages(
-      message_id, chat_id, sender_open_id, sender_id_type, sender_type,
-      sender_tenant_key, sender_name, msg_type, text, mentions,
-      thread_id, reply_to_id, root_id, thread_message_position, message_position,
-      create_time, updated, deleted, raw
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
+export async function insertMessage(m: MessageRow): Promise<boolean> {
+  const cols = [
+    'message_id', 'chat_id', 'sender_open_id', 'sender_id_type', 'sender_type',
+    'sender_tenant_key', 'sender_name', 'msg_type', 'text', 'mentions',
+    'thread_id', 'reply_to_id', 'root_id', 'thread_message_position', 'message_position',
+    'create_time', 'updated', 'deleted', 'raw',
+  ];
+  const values = [
     m.messageId,
     m.chatId,
     m.senderOpenId,
@@ -89,8 +91,25 @@ export function insertMessage(m: MessageRow): boolean {
     m.updated ? 1 : 0,
     m.deleted ? 1 : 0,
     m.raw ?? null,
+  ];
+  // Append-only telemetry: while the soul PG pool's circuit breaker is open, divert straight to the
+  // local outbox instead of attempting PostgreSQL — this also skips the FK-satisfying chats
+  // placeholder insert below, which would otherwise itself attempt (and block on) a broken
+  // connection on every single captured message; replayOutbox() re-derives that placeholder from the
+  // queued row's chat_id at replay time (see pg-outbox.ts). Treated as newly-inserted for the caller:
+  // real duplicate detection is deferred to replay's ON CONFLICT DO NOTHING.
+  if (shouldDivertSoulWrites()) {
+    await enqueueOutboxWrite('messages', cols, values);
+    return true;
+  }
+  const db = await getDb();
+  // Satisfy the foreign key: create a placeholder chat row if it does not exist yet.
+  await db.query('INSERT INTO chats(chat_id) VALUES($1) ON CONFLICT DO NOTHING', [m.chatId]);
+  const { rowCount } = await db.query(
+    `INSERT INTO messages(${cols.join(',')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(',')}) ON CONFLICT DO NOTHING`,
+    values,
   );
-  return (result.changes as number) > 0;
+  return rowCount > 0;
 }
 
 function rowToMessage(row: Record<string, unknown>): MessageRow {
@@ -121,37 +140,36 @@ function rowToMessage(row: Record<string, unknown>): MessageRow {
 }
 
 /**
- * Full-text search over persisted messages using the trigram FTS5 index.
- * When the query is empty, returns the most recent rows by create_time instead.
+ * Substring search over persisted messages. When the query is empty, returns the most recent rows
+ * by create_time instead. Case-insensitive (ILIKE): PostgreSQL's LIKE is case-sensitive, unlike
+ * SQLite's ASCII-only case-insensitive default; user input is escaped so literal `%`/`_` in a search
+ * phrase aren't treated as wildcards. A full-table ILIKE scan (no trigram/FTS index backing it) is an
+ * accepted cost at this table's size — see the migration plan's FTS5→ILIKE downgrade rationale.
  */
-export function searchMessages(query: string, limit = 20): MessageRow[] {
-  const db = getDb();
+export async function searchMessages(query: string, limit = 20): Promise<MessageRow[]> {
+  const db = await getDb();
   if (!query.trim()) {
-    const rows = db.prepare(
-      'SELECT * FROM messages ORDER BY create_time DESC LIMIT ?'
-    ).all(limit) as Record<string, unknown>[];
+    const { rows } = await db.query<Record<string, unknown>>(
+      'SELECT * FROM messages ORDER BY create_time DESC LIMIT $1', [limit],
+    );
     return rows.map(rowToMessage);
   }
-  // Wrap the query as a quoted FTS5 string literal so arbitrary user input (which may
-  // contain MATCH operators or punctuation) is treated as a plain phrase, not query syntax.
-  const phrase = `"${query.replace(/"/g, '""')}"`;
-  const rows = db.prepare(`
-    SELECT m.* FROM messages_fts f
-    JOIN messages m ON m.rowid = f.rowid
-    WHERE messages_fts MATCH ?
-    ORDER BY rank
-    LIMIT ?
-  `).all(phrase, limit) as Record<string, unknown>[];
+  const like = `%${escapeLikePattern(query.trim())}%`;
+  const { rows } = await db.query<Record<string, unknown>>(
+    `SELECT * FROM messages WHERE text ILIKE $1 ESCAPE '\\' ORDER BY create_time DESC LIMIT $2`,
+    [like, limit],
+  );
   return rows.map(rowToMessage);
 }
 
 /** Look up one captured message by id. Returns null when it was never captured (or was deleted). */
-export function getMessageRow(messageId: string): MessageRow | null {
+export async function getMessageRow(messageId: string): Promise<MessageRow | null> {
   if (!messageId) return null;
-  const row = getDb().prepare(
-    'SELECT * FROM messages WHERE message_id = ? AND deleted = 0'
-  ).get(messageId) as Record<string, unknown> | undefined;
-  return row ? rowToMessage(row) : null;
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>(
+    'SELECT * FROM messages WHERE message_id = $1 AND deleted = 0', [messageId],
+  );
+  return rows[0] ? rowToMessage(rows[0]) : null;
 }
 
 /**
@@ -161,17 +179,23 @@ export function getMessageRow(messageId: string): MessageRow | null {
  * query is what surfaces that missing context. An optional excludeMessageId drops the current
  * message (it is appended separately as "用户最新消息").
  */
-export function getThreadContext(
+export async function getThreadContext(
   threadId: string,
   opts: { limit?: number; excludeMessageId?: string } = {}
-): MessageRow[] {
+): Promise<MessageRow[]> {
   if (!threadId) return [];
   const limit = opts.limit ?? 15;
-  const rows = getDb().prepare(
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>(
+    // $2 is reused (not cast): PostgreSQL resolves a placeholder's type left-to-right from the first
+    // typed context it meets, so the typed `message_id <> $2` comparison must come BEFORE the untyped
+    // `$2 IS NULL` check (the reverse order fails with "could not determine data type of parameter").
+    // An explicit `::text` cast would sidestep that but is rejected by SQLite's fallback executor.
     `SELECT * FROM messages
-       WHERE thread_id = ? AND deleted = 0 AND (? IS NULL OR message_id <> ?)
-       ORDER BY create_time DESC LIMIT ?`
-  ).all(threadId, opts.excludeMessageId ?? null, opts.excludeMessageId ?? null, limit) as Record<string, unknown>[];
+       WHERE thread_id = $1 AND deleted = 0 AND (message_id <> $2 OR $2 IS NULL)
+       ORDER BY create_time DESC LIMIT $3`,
+    [threadId, opts.excludeMessageId ?? null, limit],
+  );
   return rows.map(rowToMessage).reverse(); // oldest→newest
 }
 
@@ -185,23 +209,25 @@ export function getThreadContext(
  * "最近的对话上下文". An absolute cutoff rather than a max-age keeps this a pure query: the caller
  * anchors it on the triggering message's own timestamp, so it never depends on wall-clock now.
  */
-export function getRecentChatMessages(
+export async function getRecentChatMessages(
   chatId: string,
   opts: { limit?: number; excludeMessageId?: string; sinceMs?: number } = {}
-): MessageRow[] {
+): Promise<MessageRow[]> {
   if (!chatId) return [];
   const limit = opts.limit ?? 8;
-  const rows = getDb().prepare(
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>(
+    // Each optional filter reuses one placeholder (not cast): PostgreSQL resolves a placeholder's type
+    // left-to-right from the first typed context it meets, so each typed comparison must come BEFORE
+    // its own untyped `IS NULL` check (the reverse order fails with "could not determine data type of
+    // parameter"). An explicit `::text`/`::bigint` cast would sidestep that but is rejected by SQLite's
+    // fallback executor.
     `SELECT * FROM messages
-       WHERE chat_id = ? AND deleted = 0 AND (? IS NULL OR message_id <> ?)
-         AND (? IS NULL OR create_time >= ?)
-       ORDER BY create_time DESC LIMIT ?`
-  ).all(
-    chatId,
-    opts.excludeMessageId ?? null, opts.excludeMessageId ?? null,
-    opts.sinceMs ?? null, opts.sinceMs ?? null,
-    limit,
-  ) as Record<string, unknown>[];
+       WHERE chat_id = $1 AND deleted = 0 AND (message_id <> $2 OR $2 IS NULL)
+         AND (create_time >= $3 OR $3 IS NULL)
+       ORDER BY create_time DESC LIMIT $4`,
+    [chatId, opts.excludeMessageId ?? null, opts.sinceMs ?? null, limit],
+  );
   return rows.map(rowToMessage).reverse(); // oldest→newest
 }
 
@@ -212,23 +238,32 @@ export function getRecentChatMessages(
  * makes the first post-deploy run a no-op on history and correct from then on. Falls back to now (fully
  * conservative) if the row is somehow absent.
  */
-export function backfillEpochMs(): number {
-  const row = getDb().prepare(
-    'SELECT applied_at FROM schema_migrations WHERE version = 39'
-  ).get() as { applied_at?: number } | undefined;
-  return row?.applied_at ? row.applied_at * 1000 : Date.now();
+export async function backfillEpochMs(): Promise<number> {
+  const db = await getDb();
+  const { rows } = await db.query<{ applied_at?: number }>(
+    'SELECT applied_at FROM schema_migrations WHERE version = 39',
+  );
+  const appliedAt = rows[0]?.applied_at;
+  return appliedAt ? appliedAt * 1000 : Date.now();
 }
 
 /** True once the bot has acted on this inbound message (see handled_messages / SCHEMA_V39). */
-export function wasMessageHandled(messageId: string): boolean {
+export async function wasMessageHandled(messageId: string): Promise<boolean> {
   if (!messageId) return false;
-  return getDb().prepare('SELECT 1 FROM handled_messages WHERE message_id = ?').get(messageId) !== undefined;
+  const db = await getDb();
+  const { rows } = await db.query('SELECT 1 FROM handled_messages WHERE message_id = $1', [messageId]);
+  return rows.length > 0;
 }
 
-/** Mark an inbound message as acted-on. Idempotent (INSERT OR IGNORE). */
-export function markMessageHandled(messageId: string): void {
+/** Mark an inbound message as acted-on. Idempotent. */
+export async function markMessageHandled(messageId: string): Promise<void> {
   if (!messageId) return;
-  getDb().prepare('INSERT OR IGNORE INTO handled_messages(message_id) VALUES (?)').run(messageId);
+  if (shouldDivertSoulWrites()) {
+    await enqueueOutboxWrite('handled_messages', ['message_id'], [messageId]);
+    return;
+  }
+  const db = await getDb();
+  await db.query('INSERT INTO handled_messages(message_id) VALUES ($1) ON CONFLICT DO NOTHING', [messageId]);
 }
 
 /**
@@ -237,14 +272,16 @@ export function markMessageHandled(messageId: string): void {
  * poll collector still recorded them, but only the event path replies, so they went unanswered. The
  * mention filter is left to the caller (mentions are parsed from the JSON column). Newest first, capped.
  */
-export function unhandledPolledMessagesSince(sinceMs: number, limit = 50): MessageRow[] {
-  const rows = getDb().prepare(
+export async function unhandledPolledMessagesSince(sinceMs: number, limit = 50): Promise<MessageRow[]> {
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>(
     `SELECT m.* FROM messages m
-       WHERE m.create_time >= ? AND m.deleted = 0
+       WHERE m.create_time >= $1 AND m.deleted = 0
          AND (m.raw IS NULL OR m.raw = '')
          AND NOT EXISTS (SELECT 1 FROM handled_messages h WHERE h.message_id = m.message_id)
-       ORDER BY m.create_time DESC LIMIT ?`
-  ).all(Math.trunc(sinceMs), limit) as Record<string, unknown>[];
+       ORDER BY m.create_time DESC LIMIT $2`,
+    [Math.trunc(sinceMs), limit],
+  );
   return rows.map(rowToMessage);
 }
 
@@ -256,16 +293,19 @@ export function unhandledPolledMessagesSince(sinceMs: number, limit = 50): Messa
  * recent activity is an un-captured missed reply cannot appear here (nothing links it in the DB); that
  * residual gap is bounded by the event-stream recycle (see RECYCLE_MS), not recovered here.
  */
-export function recentThreadScanKeysSince(sinceMs: number, limit = 40): string[] {
-  const rows = getDb().prepare(
+export async function recentThreadScanKeysSince(sinceMs: number, limit = 40): Promise<string[]> {
+  const db = await getDb();
+  const truncated = Math.trunc(sinceMs);
+  const { rows } = await db.query<{ key: string }>(
     `SELECT key, MAX(t) AS mt FROM (
         SELECT thread_id AS key, create_time AS t FROM messages
-          WHERE thread_id IS NOT NULL AND thread_id <> '' AND create_time >= ? AND deleted = 0
+          WHERE thread_id IS NOT NULL AND thread_id <> '' AND create_time >= $1 AND deleted = 0
         UNION ALL
         SELECT root_id AS key, create_time AS t FROM messages
-          WHERE root_id IS NOT NULL AND root_id <> '' AND create_time >= ? AND deleted = 0
-     ) GROUP BY key ORDER BY mt DESC LIMIT ?`
-  ).all(Math.trunc(sinceMs), Math.trunc(sinceMs), limit) as Array<{ key: string }>;
+          WHERE root_id IS NOT NULL AND root_id <> '' AND create_time >= $2 AND deleted = 0
+     ) AS combined GROUP BY key ORDER BY mt DESC LIMIT $3`,
+    [truncated, truncated, limit],
+  );
   return rows.map((r) => r.key);
 }
 
@@ -277,14 +317,16 @@ export function recentThreadScanKeysSince(sinceMs: number, limit = 40): string[]
  * Args are Unix SECONDS (matching the other *Between queries), but messages.create_time is stored in
  * MILLISECONDS (Feishu's unit, via larkTimeToMs), so the window is converted to ms for the comparison.
  */
-export function messagesBetween(fromSec: number, toSec: number): MessageRow[] {
+export async function messagesBetween(fromSec: number, toSec: number): Promise<MessageRow[]> {
   const fromMs = Math.trunc(fromSec) * 1000;
   const toMs = Math.trunc(toSec) * 1000;
-  const rows = getDb().prepare(
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>(
     `SELECT * FROM messages
-       WHERE create_time >= ? AND create_time < ? AND deleted = 0
-       ORDER BY create_time ASC`
-  ).all(fromMs, toMs) as Record<string, unknown>[];
+       WHERE create_time >= $1 AND create_time < $2 AND deleted = 0
+       ORDER BY create_time ASC`,
+    [fromMs, toMs],
+  );
   return rows.map(rowToMessage);
 }
 
@@ -297,10 +339,12 @@ export interface ChatMeta {
 }
 
 /** Look up a chat's display name and external flag from the chats table; null when unknown. */
-export function getChatMeta(chatId: string): ChatMeta | null {
-  const row = getDb()
-    .prepare('SELECT chat_id, name, external, chat_mode FROM chats WHERE chat_id = ?')
-    .get(chatId) as Record<string, unknown> | undefined;
+export async function getChatMeta(chatId: string): Promise<ChatMeta | null> {
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>(
+    'SELECT chat_id, name, external, chat_mode FROM chats WHERE chat_id = $1', [chatId],
+  );
+  const row = rows[0];
   if (!row) return null;
   return {
     chatId: row['chat_id'] as string,
@@ -314,16 +358,18 @@ export function getChatMeta(chatId: string): ChatMeta | null {
  * Retrieve messages sent by a specific user, ordered by most recent first.
  * An optional sinceUnix timestamp (Unix seconds) filters to messages at or after that time.
  */
-export function getMessagesByUser(openId: string, limit = 50, sinceUnix?: number): MessageRow[] {
-  const db = getDb();
+export async function getMessagesByUser(openId: string, limit = 50, sinceUnix?: number): Promise<MessageRow[]> {
+  const db = await getDb();
   if (sinceUnix !== undefined) {
-    const rows = db.prepare(
-      'SELECT * FROM messages WHERE sender_open_id = ? AND create_time >= ? ORDER BY create_time DESC LIMIT ?'
-    ).all(openId, sinceUnix, limit) as Record<string, unknown>[];
+    const { rows } = await db.query<Record<string, unknown>>(
+      'SELECT * FROM messages WHERE sender_open_id = $1 AND create_time >= $2 ORDER BY create_time DESC LIMIT $3',
+      [openId, sinceUnix, limit],
+    );
     return rows.map(rowToMessage);
   }
-  const rows = db.prepare(
-    'SELECT * FROM messages WHERE sender_open_id = ? ORDER BY create_time DESC LIMIT ?'
-  ).all(openId, limit) as Record<string, unknown>[];
+  const { rows } = await db.query<Record<string, unknown>>(
+    'SELECT * FROM messages WHERE sender_open_id = $1 ORDER BY create_time DESC LIMIT $2',
+    [openId, limit],
+  );
   return rows.map(rowToMessage);
 }

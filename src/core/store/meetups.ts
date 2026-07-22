@@ -78,13 +78,15 @@ function rowToMeetup(row: Record<string, unknown>, tags: string[]): ActivityMeet
 }
 
 /** Fetch tags for one or more meetup ids. Returns a map of id → tag[]. */
-function fetchTagsForIds(ids: number[]): Map<number, string[]> {
+async function fetchTagsForIds(ids: number[]): Promise<Map<number, string[]>> {
   const map = new Map<number, string[]>();
   if (ids.length === 0) return map;
-  const placeholders = ids.map(() => '?').join(',');
-  const rows = getDb()
-    .prepare(`SELECT meetup_id, tag FROM activity_meetup_tags WHERE meetup_id IN (${placeholders})`)
-    .all(...ids) as Array<{ meetup_id: number; tag: string }>;
+  const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
+  const db = await getDb();
+  const { rows } = await db.query<{ meetup_id: number; tag: string }>(
+    `SELECT meetup_id, tag FROM activity_meetup_tags WHERE meetup_id IN (${placeholders})`,
+    ids,
+  );
   for (const r of rows) {
     const list = map.get(r.meetup_id) ?? [];
     list.push(r.tag);
@@ -96,14 +98,20 @@ function fetchTagsForIds(ids: number[]): Map<number, string[]> {
 /**
  * Insert a new activity meetup row and return its auto-incremented id.
  * Does not set tags — call setMeetupTags separately.
+ *
+ * The INSERT carries a RETURNING clause (supported by both node:sqlite and PostgreSQL) so the new
+ * row's id can be read back without relying on `lastInsertRowid`, which the query-based executor
+ * interface has no equivalent for.
  */
-export function insertMeetup(m: ActivityMeetupInput): number {
-  const res = getDb().prepare(`
+export async function insertMeetup(m: ActivityMeetupInput): Promise<number> {
+  const db = await getDb();
+  const { rows } = await db.query<{ id: number }>(`
     INSERT INTO activity_meetups
       (lark_event_id, title, description, recurrence, start_time, end_time,
        meetup_url, app_link, share_link, calendar_id, created_by)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    RETURNING id
+  `, [
     m.larkEventId,
     m.title,
     m.description ?? '',
@@ -115,20 +123,19 @@ export function insertMeetup(m: ActivityMeetupInput): number {
     m.shareLink ?? '',
     m.calendarId ?? '',
     m.createdBy ?? '',
-  );
-  return Number(res.lastInsertRowid);
+  ]);
+  return Number(rows[0].id);
 }
 
 /**
  * Replace the tag set for a meetup. Deletes all existing tags for the meetup,
  * then inserts the new ones. Idempotent when called with the same tags.
  */
-export function setMeetupTags(meetupId: number, tags: string[]): void {
-  const db = getDb();
-  db.prepare('DELETE FROM activity_meetup_tags WHERE meetup_id = ?').run(meetupId);
-  const insert = db.prepare('INSERT OR IGNORE INTO activity_meetup_tags(meetup_id, tag) VALUES (?, ?)');
+export async function setMeetupTags(meetupId: number, tags: string[]): Promise<void> {
+  const db = await getDb();
+  await db.query('DELETE FROM activity_meetup_tags WHERE meetup_id = $1', [meetupId]);
   for (const tag of tags) {
-    insert.run(meetupId, tag.trim());
+    await db.query('INSERT INTO activity_meetup_tags(meetup_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING', [meetupId, tag.trim()]);
   }
 }
 
@@ -136,10 +143,12 @@ export function setMeetupTags(meetupId: number, tags: string[]): void {
  * Fetch a single meetup by its local integer id, including its tags.
  * Returns null when no matching row exists.
  */
-export function getMeetupById(id: number): ActivityMeetup | null {
-  const row = getDb().prepare('SELECT * FROM activity_meetups WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+export async function getMeetupById(id: number): Promise<ActivityMeetup | null> {
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>('SELECT * FROM activity_meetups WHERE id = $1', [id]);
+  const row = rows[0];
   if (!row) return null;
-  const tagMap = fetchTagsForIds([Number(row['id'])]);
+  const tagMap = await fetchTagsForIds([Number(row['id'])]);
   return rowToMeetup(row, tagMap.get(Number(row['id'])) ?? []);
 }
 
@@ -147,10 +156,12 @@ export function getMeetupById(id: number): ActivityMeetup | null {
  * Fetch a single meetup by its Feishu lark_event_id (bare series UUID).
  * Returns null when not found.
  */
-export function getMeetupByEventId(larkEventId: string): ActivityMeetup | null {
-  const row = getDb().prepare('SELECT * FROM activity_meetups WHERE lark_event_id = ?').get(larkEventId) as Record<string, unknown> | undefined;
+export async function getMeetupByEventId(larkEventId: string): Promise<ActivityMeetup | null> {
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>('SELECT * FROM activity_meetups WHERE lark_event_id = $1', [larkEventId]);
+  const row = rows[0];
   if (!row) return null;
-  const tagMap = fetchTagsForIds([Number(row['id'])]);
+  const tagMap = await fetchTagsForIds([Number(row['id'])]);
   return rowToMeetup(row, tagMap.get(Number(row['id'])) ?? []);
 }
 
@@ -158,47 +169,50 @@ export function getMeetupByEventId(larkEventId: string): ActivityMeetup | null {
  * Soft-cancel a meetup by setting its status to 'cancelled' and bumping updated_at.
  * Returns true when a row was updated, false when the id was not found.
  */
-export function cancelMeetup(id: number): boolean {
-  const res = getDb().prepare(`
-    UPDATE activity_meetups SET status = 'cancelled', updated_at = unixepoch() WHERE id = ?
-  `).run(id);
-  return (res.changes ?? 0) > 0;
+export async function cancelMeetup(id: number): Promise<boolean> {
+  const db = await getDb();
+  const { rowCount } = await db.query(`
+    UPDATE activity_meetups SET status = 'cancelled', updated_at = unixepoch() WHERE id = $1
+  `, [id]);
+  return rowCount > 0;
 }
 
 /**
  * Update editable fields on an existing meetup. Only provided (non-undefined) fields
  * are written; updated_at is always bumped. Returns true when a row was changed.
  */
-export function updateMeetup(id: number, updates: ActivityMeetupUpdate): boolean {
+export async function updateMeetup(id: number, updates: ActivityMeetupUpdate): Promise<boolean> {
   const sets: string[] = [];
-  // SQLInputValue = null | number | bigint | string | NodeJS.ArrayBufferView
   const params: (string | number | null)[] = [];
-  if (updates.title !== undefined) { sets.push('title = ?'); params.push(updates.title); }
-  if (updates.description !== undefined) { sets.push('description = ?'); params.push(updates.description); }
-  if (updates.recurrence !== undefined) { sets.push('recurrence = ?'); params.push(updates.recurrence); }
-  if (updates.startTime !== undefined) { sets.push('start_time = ?'); params.push(updates.startTime); }
-  if (updates.endTime !== undefined) { sets.push('end_time = ?'); params.push(updates.endTime); }
-  if (updates.meetupUrl !== undefined) { sets.push('meetup_url = ?'); params.push(updates.meetupUrl); }
-  if (updates.appLink !== undefined) { sets.push('app_link = ?'); params.push(updates.appLink); }
+  if (updates.title !== undefined) { params.push(updates.title); sets.push(`title = $${params.length}`); }
+  if (updates.description !== undefined) { params.push(updates.description); sets.push(`description = $${params.length}`); }
+  if (updates.recurrence !== undefined) { params.push(updates.recurrence); sets.push(`recurrence = $${params.length}`); }
+  if (updates.startTime !== undefined) { params.push(updates.startTime); sets.push(`start_time = $${params.length}`); }
+  if (updates.endTime !== undefined) { params.push(updates.endTime); sets.push(`end_time = $${params.length}`); }
+  if (updates.meetupUrl !== undefined) { params.push(updates.meetupUrl); sets.push(`meetup_url = $${params.length}`); }
+  if (updates.appLink !== undefined) { params.push(updates.appLink); sets.push(`app_link = $${params.length}`); }
   if (sets.length === 0) return false;
   sets.push('updated_at = unixepoch()');
-  const res = getDb().prepare(`UPDATE activity_meetups SET ${sets.join(', ')} WHERE id = ?`).run(...params, id);
-  return (res.changes ?? 0) > 0;
+  params.push(id);
+  const db = await getDb();
+  const { rowCount } = await db.query(`UPDATE activity_meetups SET ${sets.join(', ')} WHERE id = $${params.length}`, params);
+  return rowCount > 0;
 }
 
 /**
  * Return all confirmed meetups whose start_time falls within [startSec, endSec).
  * Includes each meetup's tags. Ordered by start_time ascending.
  */
-export function meetupsOnDate(startSec: number, endSec: number): ActivityMeetup[] {
-  const rows = getDb().prepare(`
+export async function meetupsOnDate(startSec: number, endSec: number): Promise<ActivityMeetup[]> {
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>(`
     SELECT * FROM activity_meetups
-    WHERE status = 'confirmed' AND start_time >= ? AND start_time < ?
+    WHERE status = 'confirmed' AND start_time >= $1 AND start_time < $2
     ORDER BY start_time ASC
-  `).all(startSec, endSec) as Array<Record<string, unknown>>;
+  `, [startSec, endSec]);
   if (rows.length === 0) return [];
   const ids = rows.map((r) => Number(r['id']));
-  const tagMap = fetchTagsForIds(ids);
+  const tagMap = await fetchTagsForIds(ids);
   return rows.map((r) => rowToMeetup(r, tagMap.get(Number(r['id'])) ?? []));
 }
 
@@ -206,16 +220,17 @@ export function meetupsOnDate(startSec: number, endSec: number): ActivityMeetup[
  * Return all confirmed meetups whose end_time is in the future, ordered by start_time.
  * Used by the CLI digest preview.
  */
-export function listUpcomingMeetups(): ActivityMeetup[] {
+export async function listUpcomingMeetups(): Promise<ActivityMeetup[]> {
   const nowSec = Math.floor(Date.now() / 1000);
-  const rows = getDb().prepare(`
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>(`
     SELECT * FROM activity_meetups
-    WHERE status = 'confirmed' AND end_time > ?
+    WHERE status = 'confirmed' AND end_time > $1
     ORDER BY start_time ASC
-  `).all(nowSec) as Array<Record<string, unknown>>;
+  `, [nowSec]);
   if (rows.length === 0) return [];
   const ids = rows.map((r) => Number(r['id']));
-  const tagMap = fetchTagsForIds(ids);
+  const tagMap = await fetchTagsForIds(ids);
   return rows.map((r) => rowToMeetup(r, tagMap.get(Number(r['id'])) ?? []));
 }
 
@@ -225,16 +240,17 @@ export function listUpcomingMeetups(): ActivityMeetup[] {
  * stays relevant after that first occurrence passes; single events drop off once ended. Ordered by
  * start_time ascending. Feeds the background block injected into the serve prompt.
  */
-export function listActiveMeetupsForContext(): ActivityMeetup[] {
+export async function listActiveMeetupsForContext(): Promise<ActivityMeetup[]> {
   const nowSec = Math.floor(Date.now() / 1000);
-  const rows = getDb().prepare(`
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>(`
     SELECT * FROM activity_meetups
-    WHERE status = 'confirmed' AND (end_time > ? OR recurrence != '')
+    WHERE status = 'confirmed' AND (end_time > $1 OR recurrence != '')
     ORDER BY start_time ASC
-  `).all(nowSec) as Array<Record<string, unknown>>;
+  `, [nowSec]);
   if (rows.length === 0) return [];
   const ids = rows.map((r) => Number(r['id']));
-  const tagMap = fetchTagsForIds(ids);
+  const tagMap = await fetchTagsForIds(ids);
   return rows.map((r) => rowToMeetup(r, tagMap.get(Number(r['id'])) ?? []));
 }
 
@@ -242,13 +258,14 @@ export function listActiveMeetupsForContext(): ActivityMeetup[] {
  * Return all meetups (confirmed and cancelled) ordered by start_time.
  * Used by the wiki update job to render the full activity calendar page.
  */
-export function listAllMeetupsForWiki(): ActivityMeetup[] {
-  const rows = getDb().prepare(`
+export async function listAllMeetupsForWiki(): Promise<ActivityMeetup[]> {
+  const db = await getDb();
+  const { rows } = await db.query<Record<string, unknown>>(`
     SELECT * FROM activity_meetups ORDER BY start_time ASC
-  `).all() as Array<Record<string, unknown>>;
+  `);
   if (rows.length === 0) return [];
   const ids = rows.map((r) => Number(r['id']));
-  const tagMap = fetchTagsForIds(ids);
+  const tagMap = await fetchTagsForIds(ids);
   return rows.map((r) => rowToMeetup(r, tagMap.get(Number(r['id'])) ?? []));
 }
 
@@ -258,40 +275,44 @@ export function listAllMeetupsForWiki(): ActivityMeetup[] {
  * Subscribe an open_id to a meetup tag. Returns true when a new row was inserted,
  * false when the subscription already existed.
  */
-export function subscribeMeetupTag(openId: string, tag: string): boolean {
-  const res = getDb().prepare(`
-    INSERT OR IGNORE INTO meetup_subscriptions(user_open_id, tag) VALUES (?, ?)
-  `).run(openId, tag.trim());
-  return (res.changes ?? 0) > 0;
+export async function subscribeMeetupTag(openId: string, tag: string): Promise<boolean> {
+  const db = await getDb();
+  const { rowCount } = await db.query(`
+    INSERT INTO meetup_subscriptions(user_open_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING
+  `, [openId, tag.trim()]);
+  return rowCount > 0;
 }
 
 /**
  * Unsubscribe an open_id from a meetup tag. Returns true when a row was deleted,
  * false when the subscription did not exist.
  */
-export function unsubscribeMeetupTag(openId: string, tag: string): boolean {
-  const res = getDb().prepare(`
-    DELETE FROM meetup_subscriptions WHERE user_open_id = ? AND tag = ?
-  `).run(openId, tag.trim());
-  return (res.changes ?? 0) > 0;
+export async function unsubscribeMeetupTag(openId: string, tag: string): Promise<boolean> {
+  const db = await getDb();
+  const { rowCount } = await db.query(`
+    DELETE FROM meetup_subscriptions WHERE user_open_id = $1 AND tag = $2
+  `, [openId, tag.trim()]);
+  return rowCount > 0;
 }
 
 /**
  * List all tags that an open_id has subscribed to, in insertion order.
  */
-export function listMeetupSubscriptions(openId: string): string[] {
-  const rows = getDb().prepare(`
-    SELECT tag FROM meetup_subscriptions WHERE user_open_id = ? ORDER BY created_at ASC
-  `).all(openId) as Array<{ tag: string }>;
+export async function listMeetupSubscriptions(openId: string): Promise<string[]> {
+  const db = await getDb();
+  const { rows } = await db.query<{ tag: string }>(`
+    SELECT tag FROM meetup_subscriptions WHERE user_open_id = $1 ORDER BY created_at ASC
+  `, [openId]);
   return rows.map((r) => r.tag);
 }
 
 /**
  * Return the open_ids of all users who have subscribed to a given tag.
  */
-export function subscribersForTag(tag: string): string[] {
-  const rows = getDb().prepare(`
-    SELECT user_open_id FROM meetup_subscriptions WHERE tag = ?
-  `).all(tag.trim()) as Array<{ user_open_id: string }>;
+export async function subscribersForTag(tag: string): Promise<string[]> {
+  const db = await getDb();
+  const { rows } = await db.query<{ user_open_id: string }>(`
+    SELECT user_open_id FROM meetup_subscriptions WHERE tag = $1
+  `, [tag.trim()]);
   return rows.map((r) => r.user_open_id);
 }

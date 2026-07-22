@@ -1,6 +1,6 @@
 import { getDb } from '../db.js';
 
-export function upsertEventType(t: {
+export async function upsertEventType(t: {
   eventTypeId: string;
   title?: string;
   description?: string;
@@ -9,18 +9,21 @@ export function upsertEventType(t: {
   baseImage?: string | null;
   renderConfig?: string | null;
   enabled?: boolean;
-}): void {
-  const db = getDb();
-  db.prepare(`
+}): Promise<void> {
+  const db = await getDb();
+  await db.query(
+    `
     INSERT INTO event_types(event_type_id, title, description, scope, target_chat_id, base_image, render_config, enabled, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, unixepoch())
     ON CONFLICT(event_type_id) DO UPDATE SET
       title=excluded.title, description=excluded.description, scope=excluded.scope,
       target_chat_id=excluded.target_chat_id, base_image=excluded.base_image,
       render_config=excluded.render_config, enabled=excluded.enabled, updated_at=unixepoch()
-  `).run(
-    t.eventTypeId, t.title ?? '', t.description ?? '', t.scope ?? 'global',
-    t.targetChatId ?? null, t.baseImage ?? null, t.renderConfig ?? null, t.enabled === false ? 0 : 1,
+  `,
+    [
+      t.eventTypeId, t.title ?? '', t.description ?? '', t.scope ?? 'global',
+      t.targetChatId ?? null, t.baseImage ?? null, t.renderConfig ?? null, t.enabled === false ? 0 : 1,
+    ],
   );
 }
 
@@ -34,46 +37,60 @@ export interface EventDispatchInput {
   payload?: object | null;
 }
 
-export function insertEventDispatch(d: EventDispatchInput): number {
-  const db = getDb();
-  const info = db.prepare(`
+/**
+ * The INSERT carries a RETURNING clause (supported by both node:sqlite and PostgreSQL) so the new
+ * row's id can be read back without relying on `lastInsertRowid`, which the PostgreSQL query
+ * interface introduced later has no equivalent for.
+ */
+export async function insertEventDispatch(d: EventDispatchInput): Promise<number> {
+  const db = await getDb();
+  const { rows } = await db.query<{ id: number }>(
+    `
     INSERT INTO event_dispatches(event_type_id, trigger_reason, scope, actor_open_id, target, rendered_image, payload, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-  `).run(
-    d.eventTypeId, d.triggerReason ?? '', d.scope ?? 'global', d.actorOpenId ?? null,
-    d.target ?? null, d.renderedImage ?? null, d.payload != null ? JSON.stringify(d.payload) : null,
+    VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+    RETURNING id
+  `,
+    [
+      d.eventTypeId, d.triggerReason ?? '', d.scope ?? 'global', d.actorOpenId ?? null,
+      d.target ?? null, d.renderedImage ?? null, d.payload != null ? JSON.stringify(d.payload) : null,
+    ],
   );
-  return Number(info.lastInsertRowid) || 0;
+  return Number(rows[0]?.id) || 0;
 }
 
-export function updateEventDispatch(
+export async function updateEventDispatch(
   id: number,
   patch: { status?: 'pending' | 'sent' | 'failed'; messageId?: string | null; errorMsg?: string | null; sentAt?: number },
-): void {
+): Promise<void> {
   if (!id) return;
-  const db = getDb();
-  if (patch.status !== undefined) db.prepare('UPDATE event_dispatches SET status = ? WHERE id = ?').run(patch.status, id);
-  if (patch.messageId !== undefined) db.prepare('UPDATE event_dispatches SET message_id = ? WHERE id = ?').run(patch.messageId ?? null, id);
-  if (patch.errorMsg !== undefined) db.prepare('UPDATE event_dispatches SET error_msg = ? WHERE id = ?').run(patch.errorMsg ?? null, id);
-  if (patch.sentAt !== undefined) db.prepare('UPDATE event_dispatches SET sent_at = ? WHERE id = ?').run(patch.sentAt, id);
+  const db = await getDb();
+  if (patch.status !== undefined) await db.query('UPDATE event_dispatches SET status = $1 WHERE id = $2', [patch.status, id]);
+  if (patch.messageId !== undefined) await db.query('UPDATE event_dispatches SET message_id = $1 WHERE id = $2', [patch.messageId ?? null, id]);
+  if (patch.errorMsg !== undefined) await db.query('UPDATE event_dispatches SET error_msg = $1 WHERE id = $2', [patch.errorMsg ?? null, id]);
+  if (patch.sentAt !== undefined) await db.query('UPDATE event_dispatches SET sent_at = $1 WHERE id = $2', [patch.sentAt, id]);
 }
 
-export function hasSuccessfulDispatch(eventTypeId: string, actorOpenId: string): boolean {
+export async function hasSuccessfulDispatch(eventTypeId: string, actorOpenId: string): Promise<boolean> {
   try {
-    const row = getDb()
-      .prepare("SELECT 1 FROM event_dispatches WHERE event_type_id = ? AND actor_open_id = ? AND status = 'sent' LIMIT 1")
-      .get(eventTypeId, actorOpenId);
-    return !!row;
+    const db = await getDb();
+    const { rows } = await db.query(
+      "SELECT 1 FROM event_dispatches WHERE event_type_id = $1 AND actor_open_id = $2 AND status = 'sent' LIMIT 1",
+      [eventTypeId, actorOpenId],
+    );
+    return rows.length > 0;
   } catch {
     return false;
   }
 }
 
-export function getEventDispatchByMessageId(messageId: string): { id: number; eventTypeId: string } | null {
+export async function getEventDispatchByMessageId(messageId: string): Promise<{ id: number; eventTypeId: string } | null> {
   try {
-    const row = getDb()
-      .prepare('SELECT id, event_type_id FROM event_dispatches WHERE message_id = ?')
-      .get(messageId) as { id: number; event_type_id: string } | undefined;
+    const db = await getDb();
+    const { rows } = await db.query<{ id: number; event_type_id: string }>(
+      'SELECT id, event_type_id FROM event_dispatches WHERE message_id = $1',
+      [messageId],
+    );
+    const row = rows[0];
     return row ? { id: row.id, eventTypeId: row.event_type_id } : null;
   } catch {
     return null;
@@ -97,13 +114,16 @@ export interface ScheduleState {
   nextFireAt: number | null;
 }
 
-export function getScheduleState(eventTypeId: string): ScheduleState {
+export async function getScheduleState(eventTypeId: string): Promise<ScheduleState> {
   try {
-    const row = getDb()
-      .prepare('SELECT last_eval_at, last_fire_at, last_outcome, next_fire_at FROM event_schedule_state WHERE event_type_id = ?')
-      .get(eventTypeId) as
-      | { last_eval_at: number | null; last_fire_at: number | null; last_outcome: string | null; next_fire_at: number | null }
-      | undefined;
+    const db = await getDb();
+    const { rows } = await db.query<{
+      last_eval_at: number | null; last_fire_at: number | null; last_outcome: string | null; next_fire_at: number | null;
+    }>(
+      'SELECT last_eval_at, last_fire_at, last_outcome, next_fire_at FROM event_schedule_state WHERE event_type_id = $1',
+      [eventTypeId],
+    );
+    const row = rows[0];
     return {
       lastEvalAt: row?.last_eval_at ?? null,
       lastFireAt: row?.last_fire_at ?? null,
@@ -119,33 +139,41 @@ export function getScheduleState(eventTypeId: string): ScheduleState {
  * Plan a within-window fire for an event: record the chosen fire time (`fireAtUnix`) and stamp
  * `evalAtUnix` as the cadence anchor (so it won't be re-planned until everyDays later).
  */
-export function planScheduleFire(eventTypeId: string, fireAtUnix: number, evalAtUnix: number): void {
+export async function planScheduleFire(eventTypeId: string, fireAtUnix: number, evalAtUnix: number): Promise<void> {
   try {
-    getDb().prepare(`
+    const db = await getDb();
+    await db.query(
+      `
       INSERT INTO event_schedule_state(event_type_id, last_eval_at, next_fire_at)
-      VALUES (?, ?, ?)
+      VALUES ($1, $2, $3)
       ON CONFLICT(event_type_id) DO UPDATE SET
         last_eval_at = excluded.last_eval_at,
         next_fire_at = excluded.next_fire_at
-    `).run(eventTypeId, evalAtUnix, fireAtUnix);
+    `,
+      [eventTypeId, evalAtUnix, fireAtUnix],
+    );
   } catch {
     /* best-effort */
   }
 }
 
-export function resolveScheduleRoll(
+export async function resolveScheduleRoll(
   eventTypeId: string,
   outcome: 'fired' | 'missed' | 'skipped' | 'send-failed',
-): void {
+): Promise<void> {
   try {
     const now = Math.floor(Date.now() / 1000);
-    getDb().prepare(`
+    const db = await getDb();
+    await db.query(
+      `
       UPDATE event_schedule_state
-      SET last_outcome = ?,
-          last_fire_at = CASE WHEN ? = 'fired' THEN ? ELSE last_fire_at END,
+      SET last_outcome = $1,
+          last_fire_at = CASE WHEN $2 = 'fired' THEN $3 ELSE last_fire_at END,
           next_fire_at = NULL
-      WHERE event_type_id = ?
-    `).run(outcome, outcome, now, eventTypeId);
+      WHERE event_type_id = $4
+    `,
+      [outcome, outcome, now, eventTypeId],
+    );
   } catch {
     /* best-effort */
   }
