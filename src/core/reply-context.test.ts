@@ -19,9 +19,9 @@ after(() => {
 
 const CHAT = 'oc_reply_ctx';
 const names: Record<string, string> = { ou_ajian: '阿坚', ou_baiyu: '白鱼', ou_liqin: '李沁' };
-const resolveName = (openId: string): string => names[openId] ?? '';
+const resolveName = async (openId: string): Promise<string> => names[openId] ?? '';
 
-function msg(o: {
+async function msg(o: {
   id: string;
   sender: string;
   text: string;
@@ -30,7 +30,7 @@ function msg(o: {
   replyToId?: string;
   rootId?: string;
 }) {
-  store.insertMessage({
+  await store.insertMessage({
     messageId: o.id,
     chatId: CHAT,
     senderOpenId: o.sender,
@@ -57,44 +57,44 @@ const SELF_INTRO =
   '就翻看了SeeDAO的历史推文，看到了这个飞书二维码就加入进来了哈哈！我刚参加完南塘DAO的艺术共创营，' +
   '重新找回了对画画的热情，最近就是在大画特画丙烯画，同时也在了解艺术创作+乡村振兴+民众学院的项目。';
 
-test('setup: the incident timeline', () => {
-  msg({ id: 'om_ajian', sender: 'ou_ajian', text: AJIAN_POST, t: 1784264700000, msgType: 'post' });
+test('setup: the incident timeline', async () => {
+  await msg({ id: 'om_ajian', sender: 'ou_ajian', text: AJIAN_POST, t: 1784264700000, msgType: 'post' });
   for (let i = 0; i < 5; i++) {
-    msg({ id: `om_filler${i}`, sender: 'ou_liqin', text: `闲聊 ${i}`, t: 1784266000000 + i * 1000 });
+    await msg({ id: `om_filler${i}`, sender: 'ou_liqin', text: `闲聊 ${i}`, t: 1784266000000 + i * 1000 });
   }
-  msg({ id: 'om_join1', sender: '', text: '谢子骞 joined the group via a link shared by 白鱼.', t: 1784269000000, msgType: 'system' });
-  msg({ id: 'om_join2', sender: '', text: '李沁 joined the group via a QR Code shared by 白鱼.', t: 1784269100000, msgType: 'system' });
+  await msg({ id: 'om_join1', sender: '', text: '谢子骞 joined the group via a link shared by 白鱼.', t: 1784269000000, msgType: 'system' });
+  await msg({ id: 'om_join2', sender: '', text: '李沁 joined the group via a QR Code shared by 白鱼.', t: 1784269100000, msgType: 'system' });
   // NOT byte-identical: the real double-send was 632 vs 627 chars (edited between the two sends).
   // An exact-string dedupe passes a test built from identical strings and then does nothing in
   // production — which is exactly what happened before this test was written from the real data.
-  msg({ id: 'om_intro1', sender: 'ou_liqin', text: SELF_INTRO, t: 1784271060000, msgType: 'post' });
-  msg({ id: 'om_intro2', sender: 'ou_liqin', text: `${SELF_INTRO}（已编辑，多了一句尾巴）`, t: 1784271061000, msgType: 'post' });
-  msg({ id: 'om_cmd1', sender: 'ou_op', text: '@城邦土地神 收录自介', t: 1784271120000 });
-  msg({ id: 'om_cmd2', sender: 'ou_op', text: '@城邦土地神 收录自介', t: 1784271180000 });
-  msg({
+  await msg({ id: 'om_intro1', sender: 'ou_liqin', text: SELF_INTRO, t: 1784271060000, msgType: 'post' });
+  await msg({ id: 'om_intro2', sender: 'ou_liqin', text: `${SELF_INTRO}（已编辑，多了一句尾巴）`, t: 1784271061000, msgType: 'post' });
+  await msg({ id: 'om_cmd1', sender: 'ou_op', text: '@城邦土地神 收录自介', t: 1784271120000 });
+  await msg({ id: 'om_cmd2', sender: 'ou_op', text: '@城邦土地神 收录自介', t: 1784271180000 });
+  await msg({
     id: 'om_baiyu', sender: 'ou_baiyu', text: '@阿坚 @城邦土地神 你怎么看这个发言',
     t: 1784277594633, replyToId: 'om_ajian', rootId: 'om_ajian',
   });
 });
 
-test('reply linkage survives the round-trip through the DB', () => {
-  const row = store.getMessageRow('om_baiyu');
+test('reply linkage survives the round-trip through the DB', async () => {
+  const row = await store.getMessageRow('om_baiyu');
   assert.equal(row?.replyToId, 'om_ajian');
   assert.equal(row?.rootId, 'om_ajian');
 });
 
-test('the recent window alone does NOT reach the replied-to message (the bug)', () => {
-  const rows = store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu' });
-  const window = renderContext(rows, resolveName);
+test('the recent window alone does NOT reach the replied-to message (the bug)', async () => {
+  const rows = await store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu' });
+  const window = await renderContext(rows, resolveName);
   // This is the condition that made the model answer about the self-intro.
   assert.ok(!window.includes('个人观点'), '阿坚的发言本就不该在 8 条窗口内（若在，本测试失去意义）');
   assert.ok(window.includes('Gloria'), '自介确实占据了窗口');
 });
 
-test('the replied-to message is pinned into the context even though it is outside the window', () => {
-  const rows = store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu' });
-  const target = store.getMessageRow('om_ajian');
-  const context = buildReplyContext(rows, target, '白鱼', resolveName);
+test('the replied-to message is pinned into the context even though it is outside the window', async () => {
+  const rows = await store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu' });
+  const target = await store.getMessageRow('om_ajian');
+  const context = await buildReplyContext(rows, target, '白鱼', resolveName);
 
   assert.ok(context.includes('个人观点'), '被回复的原文必须进上下文——这正是本次事故的死因');
   assert.ok(context.includes('白鱼 正在回复 阿坚'), '必须明确标出回复关系，而不是让模型去猜');
@@ -102,30 +102,30 @@ test('the replied-to message is pinned into the context even though it is outsid
   assert.ok(context.indexOf('个人观点') < context.indexOf('Gloria'), '引用块必须排在窗口之前');
 });
 
-test('system join notices are dropped', () => {
-  const rows = store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu' });
-  const window = renderContext(rows, resolveName);
+test('system join notices are dropped', async () => {
+  const rows = await store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu' });
+  const window = await renderContext(rows, resolveName);
   assert.ok(!window.includes('joined the group'), '入群系统通知不是对话，不该占窗口');
 });
 
-test('a near-identical double-send from the same author collapses to one', () => {
-  const rows = store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu' });
-  const window = renderContext(rows, resolveName);
+test('a near-identical double-send from the same author collapses to one', async () => {
+  const rows = await store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu' });
+  const window = await renderContext(rows, resolveName);
   assert.equal(window.split('第二届数字游民生活周').length - 1, 1, '连发的重复自介（内容略有差异）只应保留一条');
 });
 
-test('two different messages from the same author are NOT collapsed', () => {
+test('two different messages from the same author are NOT collapsed', async () => {
   const solo = 'oc_dedupe_guard';
-  store.insertMessage({ messageId: 'om_s1', chatId: solo, senderOpenId: 'ou_ajian', senderName: '', msgType: 'text', text: '第一句话，讲的是这件事', mentions: [], createTime: 1000 });
-  store.insertMessage({ messageId: 'om_s2', chatId: solo, senderOpenId: 'ou_ajian', senderName: '', msgType: 'text', text: '第二句话，讲的是另一件事', mentions: [], createTime: 2000 });
-  const window = renderContext(store.getRecentChatMessages(solo, { limit: 8 }), resolveName);
+  await store.insertMessage({ messageId: 'om_s1', chatId: solo, senderOpenId: 'ou_ajian', senderName: '', msgType: 'text', text: '第一句话，讲的是这件事', mentions: [], createTime: 1000 });
+  await store.insertMessage({ messageId: 'om_s2', chatId: solo, senderOpenId: 'ou_ajian', senderName: '', msgType: 'text', text: '第二句话，讲的是另一件事', mentions: [], createTime: 2000 });
+  const window = await renderContext(await store.getRecentChatMessages(solo, { limit: 8 }), resolveName);
   assert.ok(window.includes('第一句话'), '同一人的不同发言不能被去重误杀');
   assert.ok(window.includes('第二句话'));
 });
 
-test('a long quote is truncated rather than allowed to eat the prompt', () => {
+test('a long quote is truncated rather than allowed to eat the prompt', async () => {
   const long = 'あ'.repeat(MAX_QUOTE_CHARS + 500);
-  const quote = renderReplyQuote(
+  const quote = await renderReplyQuote(
     { messageId: 'x', chatId: CHAT, senderOpenId: 'ou_ajian', senderName: '', msgType: 'text', text: long, mentions: [], createTime: 1 },
     '白鱼',
     resolveName
@@ -134,9 +134,9 @@ test('a long quote is truncated rather than allowed to eat the prompt', () => {
   assert.ok(quote.length < MAX_QUOTE_CHARS + 200);
 });
 
-test('an uncaptured reply target degrades to the window instead of throwing', () => {
-  const rows = store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu' });
-  const context = buildReplyContext(rows, store.getMessageRow('om_does_not_exist'), '白鱼', resolveName);
+test('an uncaptured reply target degrades to the window instead of throwing', async () => {
+  const rows = await store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu' });
+  const context = await buildReplyContext(rows, await store.getMessageRow('om_does_not_exist'), '白鱼', resolveName);
   assert.ok(context.length > 0);
   assert.ok(!context.includes('正在回复'));
 });
@@ -144,28 +144,28 @@ test('an uncaptured reply target degrades to the window instead of throwing', ()
 // Measured on live data: 4 of 11 chats had their last 8 messages spanning >72h, one 17 days — all of
 // which the prompt labels "最近的对话上下文". sinceMs is absolute (anchored on the trigger message's own
 // timestamp), so this test asserts a pure query and never depends on wall-clock now.
-test('the chat window drops messages older than the cutoff', () => {
+test('the chat window drops messages older than the cutoff', async () => {
   const trigger = 1784277594633;
   const dayBefore = trigger - 24 * 60 * 60 * 1000;
-  const fresh = store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu', sinceMs: dayBefore });
+  const fresh = await store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu', sinceMs: dayBefore });
   assert.ok(fresh.length > 0, '24h 内的消息应该留下');
 
-  const cutoffAfterEverything = store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu', sinceMs: trigger });
+  const cutoffAfterEverything = await store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu', sinceMs: trigger });
   assert.equal(cutoffAfterEverything.length, 0, '截止时间晚于所有消息时应为空，而不是照样端出陈年旧账');
 });
 
-test('a stale window yields empty context rather than passing off old messages as recent', () => {
-  const rows = store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu', sinceMs: 1784277594633 });
-  const target = store.getMessageRow('om_ajian');
+test('a stale window yields empty context rather than passing off old messages as recent', async () => {
+  const rows = await store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu', sinceMs: 1784277594633 });
+  const target = await store.getMessageRow('om_ajian');
   // The pinned quote still carries the referent even when the window is empty — the fix does not
   // depend on the window at all.
-  const context = buildReplyContext(rows, target, '白鱼', resolveName);
+  const context = await buildReplyContext(rows, target, '白鱼', resolveName);
   assert.ok(context.includes('个人观点'));
   assert.ok(!context.includes('Gloria'));
 });
 
-test('an original post (no reply linkage) is unaffected', () => {
-  const rows = store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu' });
-  const context = buildReplyContext(rows, null, '白鱼', resolveName);
-  assert.equal(context, renderContext(rows, resolveName));
+test('an original post (no reply linkage) is unaffected', async () => {
+  const rows = await store.getRecentChatMessages(CHAT, { limit: 8, excludeMessageId: 'om_baiyu' });
+  const context = await buildReplyContext(rows, null, '白鱼', resolveName);
+  assert.equal(context, await renderContext(rows, resolveName));
 });

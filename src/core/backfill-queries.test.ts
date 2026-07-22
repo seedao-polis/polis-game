@@ -22,11 +22,11 @@ const CHAT = 'oc_backfill';
 // A thread @-mention the poll path could never capture (raw NULL, no thread linkage in DB) is exactly
 // the miss the backfill exists to recover; a top-level @-mention the poll DID capture (raw NULL) is the
 // cheap DB-only case. These tests pin the queries that select and dedupe those candidates.
-function insert(o: {
+async function insert(o: {
   id: string; t: number; text: string; mentions?: string[]; raw?: string;
   threadId?: string; rootId?: string; senderType?: string;
 }) {
-  store.insertMessage({
+  await store.insertMessage({
     messageId: o.id,
     chatId: CHAT,
     senderOpenId: 'ou_someone',
@@ -44,20 +44,20 @@ function insert(o: {
 
 const T0 = 1_784_000_000_000;
 
-test('setup rows', () => {
+test('setup rows', async () => {
   // poll-captured top-level @-mention the event stream missed (raw NULL) — a backfill candidate.
-  insert({ id: 'om_missed_top', t: T0 + 1000, text: '@bot follow X', mentions: [BOT] });
+  await insert({ id: 'om_missed_top', t: T0 + 1000, text: '@bot follow X', mentions: [BOT] });
   // event-captured message (raw present) — already handled, NOT a poll candidate.
-  insert({ id: 'om_event', t: T0 + 2000, text: '@bot hi', mentions: [BOT], raw: '{"x":1}' });
+  await insert({ id: 'om_event', t: T0 + 2000, text: '@bot hi', mentions: [BOT], raw: '{"x":1}' });
   // poll-captured but does not mention the bot — not a candidate.
-  insert({ id: 'om_nomention', t: T0 + 3000, text: 'hello world', mentions: [] });
+  await insert({ id: 'om_nomention', t: T0 + 3000, text: 'hello world', mentions: [] });
   // poll-captured @-mention but already handled — excluded once marked.
-  insert({ id: 'om_done', t: T0 + 4000, text: '@bot done', mentions: [BOT] });
-  store.markMessageHandled('om_done');
+  await insert({ id: 'om_done', t: T0 + 4000, text: '@bot done', mentions: [BOT] });
+  await store.markMessageHandled('om_done');
 });
 
-test('unhandledPolledMessagesSince returns only raw-NULL, unhandled rows', () => {
-  const rows = store.unhandledPolledMessagesSince(T0);
+test('unhandledPolledMessagesSince returns only raw-NULL, unhandled rows', async () => {
+  const rows = await store.unhandledPolledMessagesSince(T0);
   const ids = rows.map((r) => r.messageId);
   assert.ok(ids.includes('om_missed_top'), 'the missed poll-captured @-mention must surface');
   assert.ok(!ids.includes('om_event'), 'event-captured (raw set) must be excluded — it was handled');
@@ -69,36 +69,36 @@ test('unhandledPolledMessagesSince returns only raw-NULL, unhandled rows', () =>
   assert.deepEqual(mentioning.sort(), ['om_missed_top']);
 });
 
-test('marking handled removes a row from the candidate set', () => {
-  assert.equal(store.wasMessageHandled('om_missed_top'), false);
-  store.markMessageHandled('om_missed_top');
-  assert.equal(store.wasMessageHandled('om_missed_top'), true);
-  const ids = store.unhandledPolledMessagesSince(T0).map((r) => r.messageId);
+test('marking handled removes a row from the candidate set', async () => {
+  assert.equal(await store.wasMessageHandled('om_missed_top'), false);
+  await store.markMessageHandled('om_missed_top');
+  assert.equal(await store.wasMessageHandled('om_missed_top'), true);
+  const ids = (await store.unhandledPolledMessagesSince(T0)).map((r) => r.messageId);
   assert.ok(!ids.includes('om_missed_top'), 'once handled it must not be re-offered (no double reply)');
 });
 
-test('markMessageHandled is idempotent', () => {
-  store.markMessageHandled('om_missed_top');
-  store.markMessageHandled('om_missed_top');
-  assert.equal(store.wasMessageHandled('om_missed_top'), true);
+test('markMessageHandled is idempotent', async () => {
+  await store.markMessageHandled('om_missed_top');
+  await store.markMessageHandled('om_missed_top');
+  assert.equal(await store.wasMessageHandled('om_missed_top'), true);
 });
 
-test('recentThreadScanKeysSince unions thread_id and root_id', () => {
-  insert({ id: 'om_thr', t: T0 + 5000, text: 'in thread', threadId: 'omt_aaa', raw: '{"x":1}' });
-  insert({ id: 'om_root', t: T0 + 6000, text: 'reply', rootId: 'om_root_msg', raw: '{"x":1}' });
-  const keys = store.recentThreadScanKeysSince(T0);
+test('recentThreadScanKeysSince unions thread_id and root_id', async () => {
+  await insert({ id: 'om_thr', t: T0 + 5000, text: 'in thread', threadId: 'omt_aaa', raw: '{"x":1}' });
+  await insert({ id: 'om_root', t: T0 + 6000, text: 'reply', rootId: 'om_root_msg', raw: '{"x":1}' });
+  const keys = await store.recentThreadScanKeysSince(T0);
   assert.ok(keys.includes('omt_aaa'), 'thread_id is a scan key');
   assert.ok(keys.includes('om_root_msg'), 'root_id is a scan key (events often carry only this)');
 });
 
-test('recentThreadScanKeysSince respects the since floor', () => {
-  insert({ id: 'om_old_thread', t: T0 - 10 * 86_400_000, text: 'ancient', threadId: 'omt_ancient', raw: '{"x":1}' });
-  const keys = store.recentThreadScanKeysSince(T0);
+test('recentThreadScanKeysSince respects the since floor', async () => {
+  await insert({ id: 'om_old_thread', t: T0 - 10 * 86_400_000, text: 'ancient', threadId: 'omt_ancient', raw: '{"x":1}' });
+  const keys = await store.recentThreadScanKeysSince(T0);
   assert.ok(!keys.includes('omt_ancient'), 'a thread older than the window is not rescanned');
 });
 
-test('backfillEpochMs reflects when the feature (v39) was applied', () => {
-  const epoch = store.backfillEpochMs();
+test('backfillEpochMs reflects when the feature (v39) was applied', async () => {
+  const epoch = await store.backfillEpochMs();
   assert.ok(epoch > 0);
   // Anchored on v39's applied_at (seconds→ms), so it is a plausible recent ms timestamp, not 0/NaN.
   assert.ok(Number.isFinite(epoch));

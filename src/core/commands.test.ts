@@ -35,22 +35,22 @@ test('isFuzzyCheckIn rejects non-matching or over-long messages', () => {
   assert.equal(isFuzzyCheckIn(''), false);
 });
 
-test('the exact 签 / 签到 aliases still check in', () => {
+test('the exact 签 / 签到 aliases still check in', async () => {
   const u = 'ou_sign_exact';
-  const r = dispatchCommand('签到', ctx(u));
+  const r = await dispatchCommand('签到', ctx(u));
   assert.equal(r.handled, true);
   assert.equal(r.command, 'sign');
   assert.match(r.reply ?? '', /签到/);
 });
 
-test('a fuzzy check-in routes to the sign command and awards LP once per day', () => {
+test('a fuzzy check-in routes to the sign command and awards LP once per day', async () => {
   const u = 'ou_sign_fuzzy';
-  const first = dispatchCommand('每日签到', ctx(u));
+  const first = await dispatchCommand('每日签到', ctx(u));
   assert.equal(first.handled, true);
   assert.equal(first.command, 'sign');
   assert.match(first.reply ?? '', /签到/);
   // Second fuzzy check-in the same day is a no-op award (already checked in).
-  const again = dispatchCommand('8/12 签', ctx(u));
+  const again = await dispatchCommand('8/12 签', ctx(u));
   assert.equal(again.command, 'sign');
   assert.match(again.reply ?? '', /已在 SeeDAO 数字城邦签到/);
 });
@@ -72,8 +72,8 @@ test('isFuzzyLpQuery rejects bet-status questions that merely mention LP', () =>
   assert.equal(isFuzzyLpQuery('LP是什么'), false); // mechanism question, no self/query signal
 });
 
-test('a bet-status question is not swallowed by the lp command (falls through to the LLM)', () => {
-  const r = dispatchCommand('@城邦土地神 我西班牙的 押注 LP呢', ctx('ou_bet_asker'));
+test('a bet-status question is not swallowed by the lp command (falls through to the LLM)', async () => {
+  const r = await dispatchCommand('@城邦土地神 我西班牙的 押注 LP呢', ctx('ou_bet_asker'));
   assert.equal(r.handled, false); // not handled as a command → handed to the agent to answer
 });
 
@@ -89,31 +89,31 @@ test('parseRename extracts the name (glued, spaced, full-width, with @mention)',
   assert.equal(parseRename('改名怎么操作？'), null); // a question is not a rename → falls to the LLM
 });
 
-test('dispatchCommand renames the sender and the new name resolves everywhere', () => {
+test('dispatchCommand renames the sender and the new name resolves everywhere', async () => {
   const u = 'ou_rename_me';
-  store.ensureProfile(u, '用户560770'); // seed a profile with the raw captured name
-  const r = dispatchCommand('@城邦土地神 改名 Vicky Huang', ctx(u));
+  await store.ensureProfile(u, '用户560770'); // seed a profile with the raw captured name
+  const r = await dispatchCommand('@城邦土地神 改名 Vicky Huang', ctx(u));
   assert.equal(r.handled, true);
   assert.equal(r.command, 'rename');
   assert.match(r.reply ?? '', /Vicky Huang/);
   // Display surfaces resolve the new name by open_id.
-  assert.equal(store.getProfile(u)?.name, 'Vicky Huang');
-  store.recordChatMember('oc_x', u, '用户560770'); // roster still holds the raw Feishu name
-  assert.equal(store.memberName(u), 'Vicky Huang'); // memberName applies the override
+  assert.equal((await store.getProfile(u))?.name, 'Vicky Huang');
+  await store.recordChatMember('oc_x', u, '用户560770'); // roster still holds the raw Feishu name
+  assert.equal(await store.memberName(u), 'Vicky Huang'); // memberName applies the override
 });
 
-test('a bare 改名 with no name replies with usage and does not change the name', () => {
+test('a bare 改名 with no name replies with usage and does not change the name', async () => {
   const u = 'ou_rename_bare';
-  store.ensureProfile(u, '张三');
-  const r = dispatchCommand('改名', ctx(u));
+  await store.ensureProfile(u, '张三');
+  const r = await dispatchCommand('改名', ctx(u));
   assert.equal(r.handled, true);
   assert.equal(r.command, 'rename');
   assert.match(r.reply ?? '', /改名用法/);
-  assert.equal(store.getProfile(u)?.name, '张三');
+  assert.equal((await store.getProfile(u))?.name, '张三');
 });
 
-test('rename without a sender open_id is refused (handled, not sent to the LLM)', () => {
-  const r = dispatchCommand('改名 Vicky', ctx(undefined));
+test('rename without a sender open_id is refused (handled, not sent to the LLM)', async () => {
+  const r = await dispatchCommand('改名 Vicky', ctx(undefined));
   assert.equal(r.handled, true);
   assert.match(r.reply ?? '', /无法确认你的身份/);
 });

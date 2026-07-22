@@ -41,8 +41,8 @@ describe('parseLpAmount', () => {
 
 // ── TC command / bet-parser regression: "tc cancel" must not be a bet ──
 
-function makeDiscreteProposal(createdBy = 'U1') {
-  const { num } = insertTcProposal({
+async function makeDiscreteProposal(createdBy = 'U1') {
+  const { num } = await insertTcProposal({
     title: '西班牙还是法国',
     optionType: 'discrete',
     options: ['法国', '西班牙'],
@@ -51,60 +51,60 @@ function makeDiscreteProposal(createdBy = 'U1') {
     createdBy,
     chatId: 'oc_test',
   });
-  return getTcByNum(num)!;
+  return (await getTcByNum(num))!;
 }
 
 describe('tryParseTcBet — non-bet messages fall through', () => {
-  it('"tc cancel 51" is NOT parsed as a bet', () => {
-    const p = makeDiscreteProposal();
-    assert.equal(tryParseTcBet('@城邦土地神 tc cancel 51', p, 'U9', 'm1'), false);
+  it('"tc cancel 51" is NOT parsed as a bet', async () => {
+    const p = await makeDiscreteProposal();
+    assert.equal(await tryParseTcBet('@城邦土地神 tc cancel 51', p, 'U9', 'm1'), false);
   });
-  it('chatter ending in a bare number is NOT a bet', () => {
-    const p = makeDiscreteProposal();
-    assert.equal(tryParseTcBet('@城邦土地神 我觉得 8', p, 'U9', 'm2'), false);
+  it('chatter ending in a bare number is NOT a bet', async () => {
+    const p = await makeDiscreteProposal();
+    assert.equal(await tryParseTcBet('@城邦土地神 我觉得 8', p, 'U9', 'm2'), false);
   });
-  it('an invalid option WITH an lp marker still reports an error', () => {
-    const p = makeDiscreteProposal();
-    const r = tryParseTcBet('@城邦土地神 法國 5lp', p, 'U9', 'm3');
+  it('an invalid option WITH an lp marker still reports an error', async () => {
+    const p = await makeDiscreteProposal();
+    const r = await tryParseTcBet('@城邦土地神 法國 5lp', p, 'U9', 'm3');
     assert.notEqual(r, false);
     assert.match((r as { reply: string }).reply, /不是有效选项/);
   });
 });
 
 describe('tryHandleTcCommand — cancel', () => {
-  it('a non-tc message returns false (not a command)', () => {
-    assert.equal(tryHandleTcCommand('@城邦土地神 法国 5lp', 'U1'), false);
+  it('a non-tc message returns false (not a command)', async () => {
+    assert.equal(await tryHandleTcCommand('@城邦土地神 法国 5lp', 'U1'), false);
   });
-  it('an unknown TC number replies not-found', () => {
-    const r = tryHandleTcCommand('@城邦土地神 tc cancel 999999', 'U1');
+  it('an unknown TC number replies not-found', async () => {
+    const r = await tryHandleTcCommand('@城邦土地神 tc cancel 999999', 'U1');
     assert.notEqual(r, false);
     assert.match((r as { reply: string }).reply, /找不到/);
   });
-  it('a non-creator, non-admin is rejected and the proposal stays active', () => {
-    const p = makeDiscreteProposal('creator1');
-    const r = tryHandleTcCommand(`@城邦土地神 tc cancel ${p.num}`, 'someone-else');
+  it('a non-creator, non-admin is rejected and the proposal stays active', async () => {
+    const p = await makeDiscreteProposal('creator1');
+    const r = await tryHandleTcCommand(`@城邦土地神 tc cancel ${p.num}`, 'someone-else');
     assert.notEqual(r, false);
     assert.match((r as { reply: string }).reply, /只有发起人或管理员/);
-    assert.equal(getTcByNum(p.num)!.status, 'active');
+    assert.equal((await getTcByNum(p.num))!.status, 'active');
   });
 });
 
 describe('cancelTcWithRefund', () => {
-  it('cancels a proposal with no bets', () => {
-    const p = makeDiscreteProposal();
-    const res = cancelTcWithRefund(p);
+  it('cancels a proposal with no bets', async () => {
+    const p = await makeDiscreteProposal();
+    const res = await cancelTcWithRefund(p);
     assert.equal(res.refunded, 0);
-    assert.equal(getTcByNum(p.num)!.status, 'cancelled');
+    assert.equal((await getTcByNum(p.num))!.status, 'cancelled');
   });
-  it('refunds outstanding bets and marks the proposal cancelled', () => {
-    const p = makeDiscreteProposal('creator2');
-    insertTcBet({ proposalId: p.id, userOpenId: 'bettor', optionValue: '法国', lpAmount: 4, messageId: 'b1' });
-    assert.equal(getUnrefundedBets(p.id).length, 1);
-    const res = cancelTcWithRefund(p);
+  it('refunds outstanding bets and marks the proposal cancelled', async () => {
+    const p = await makeDiscreteProposal('creator2');
+    await insertTcBet({ proposalId: p.id, userOpenId: 'bettor', optionValue: '法国', lpAmount: 4, messageId: 'b1' });
+    assert.equal((await getUnrefundedBets(p.id)).length, 1);
+    const res = await cancelTcWithRefund(p);
     assert.equal(res.refunded, 1);
     assert.equal(res.refundedLp, 4);
-    assert.equal(getTcByNum(p.num)!.status, 'cancelled');
-    assert.equal(getUnrefundedBets(p.id).length, 0);
+    assert.equal((await getTcByNum(p.num))!.status, 'cancelled');
+    assert.equal((await getUnrefundedBets(p.id)).length, 0);
   });
 });
 
@@ -274,21 +274,21 @@ describe('computeTcSettlement — discrete', () => {
 // ── Counter and insert tests ──────────────────────────────────
 
 describe('nextTcNumUnsafe and insertTcProposal', () => {
-  it('assigns monotonically increasing num values', () => {
+  it('assigns monotonically increasing num values', async () => {
     const endTime = Math.floor(Date.now() / 1000) + 3600;
-    const r1 = insertTcProposal({ title: '测试1', optionType: 'discrete', options: ['A', 'B'], endTime });
-    const r2 = insertTcProposal({ title: '测试2', optionType: 'discrete', options: ['A', 'B'], endTime });
-    const r3 = insertTcProposal({ title: '测试3', optionType: 'continuous', options: [0, 100], endTime });
+    const r1 = await insertTcProposal({ title: '测试1', optionType: 'discrete', options: ['A', 'B'], endTime });
+    const r2 = await insertTcProposal({ title: '测试2', optionType: 'discrete', options: ['A', 'B'], endTime });
+    const r3 = await insertTcProposal({ title: '测试3', optionType: 'continuous', options: [0, 100], endTime });
     assert.ok(r1.num < r2.num);
     assert.ok(r2.num < r3.num);
     assert.equal(r2.num, r1.num + 1);
     assert.equal(r3.num, r2.num + 1);
   });
 
-  it('getTcByNum returns correct proposal', () => {
+  it('getTcByNum returns correct proposal', async () => {
     const endTime = Math.floor(Date.now() / 1000) + 7200;
-    const { num } = insertTcProposal({ title: '查询测试', optionType: 'discrete', options: ['是', '否'], endTime, maxBetLp: 20, createdBy: 'ou_test' });
-    const p = getTcByNum(num);
+    const { num } = await insertTcProposal({ title: '查询测试', optionType: 'discrete', options: ['是', '否'], endTime, maxBetLp: 20, createdBy: 'ou_test' });
+    const p = await getTcByNum(num);
     assert.ok(p);
     assert.equal(p!.title, '查询测试');
     assert.equal(p!.maxBetLp, 20);
@@ -296,10 +296,10 @@ describe('nextTcNumUnsafe and insertTcProposal', () => {
     assert.deepEqual(p!.options, ['是', '否']);
   });
 
-  it('getTcBets returns empty array for new proposal', () => {
+  it('getTcBets returns empty array for new proposal', async () => {
     const endTime = Math.floor(Date.now() / 1000) + 7200;
-    const { id } = insertTcProposal({ title: '空投注测试', optionType: 'discrete', options: ['A'], endTime });
-    const bets = getTcBets(id);
+    const { id } = await insertTcProposal({ title: '空投注测试', optionType: 'discrete', options: ['A'], endTime });
+    const bets = await getTcBets(id);
     assert.equal(bets.length, 0);
   });
 });

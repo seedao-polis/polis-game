@@ -53,21 +53,21 @@ after(() => {
 
 // ── purgeExpiredMemories ──────────────────────────────────────────────────────
 
-test('purgeExpiredMemories only removes expired entries', () => {
+test('purgeExpiredMemories only removes expired entries', async () => {
   const pastTs = Math.floor(Date.now() / 1000) - 7200; // 2 hours ago
   const futureTs = Math.floor(Date.now() / 1000) + 7200; // 2 hours from now
 
-  insertMemory({ namespace: 'global', content: 'purge-expired-A', expiresAt: pastTs, visibility: 'public' });
-  insertMemory({ namespace: 'global', content: 'purge-expired-B', expiresAt: pastTs, visibility: 'public' });
-  insertMemory({ namespace: 'global', content: 'purge-future', expiresAt: futureTs, visibility: 'public' });
-  insertMemory({ namespace: 'global', content: 'purge-permanent', visibility: 'public' });
+  await insertMemory({ namespace: 'global', content: 'purge-expired-A', expiresAt: pastTs, visibility: 'public' });
+  await insertMemory({ namespace: 'global', content: 'purge-expired-B', expiresAt: pastTs, visibility: 'public' });
+  await insertMemory({ namespace: 'global', content: 'purge-future', expiresAt: futureTs, visibility: 'public' });
+  await insertMemory({ namespace: 'global', content: 'purge-permanent', visibility: 'public' });
 
-  const deleted = purgeExpiredMemories();
+  const deleted = await purgeExpiredMemories();
   assert.ok(deleted >= 2, `should delete at least 2 expired rows, deleted=${deleted}`);
 
   // Verify the non-expired entries survive.
   const ctx = { chatId: 'oc_unused', userOpenId: 'ou_unused' };
-  const remaining = getFilteredMemories(ctx, { namespaces: ['global'] });
+  const remaining = await getFilteredMemories(ctx, { namespaces: ['global'] });
   const contents = remaining.map((m) => m.content);
   assert.ok(contents.includes('purge-future'), 'future-expiry entry must survive');
   assert.ok(contents.includes('purge-permanent'), 'no-expiry entry must survive');
@@ -75,11 +75,11 @@ test('purgeExpiredMemories only removes expired entries', () => {
   assert.ok(!contents.includes('purge-expired-B'), 'expired B must be removed');
 });
 
-test('purgeExpiredMemories does not remove entries with NULL expires_at', () => {
-  insertMemory({ namespace: 'global', content: 'purge-null-expiry-test', visibility: 'public' });
-  purgeExpiredMemories();
+test('purgeExpiredMemories does not remove entries with NULL expires_at', async () => {
+  await insertMemory({ namespace: 'global', content: 'purge-null-expiry-test', visibility: 'public' });
+  await purgeExpiredMemories();
   const ctx = { chatId: 'oc_x', userOpenId: 'ou_x' };
-  const mems = getFilteredMemories(ctx, { namespaces: ['global'] });
+  const mems = await getFilteredMemories(ctx, { namespaces: ['global'] });
   const contents = mems.map((m) => m.content);
   assert.ok(contents.includes('purge-null-expiry-test'), 'permanent entries must survive purge');
 });
@@ -108,7 +108,7 @@ test('topTokens returns the most frequent non-stop tokens', () => {
   assert.equal(top.length, 3, 'should return exactly topN tokens');
 });
 
-test('aggregateGroupTopics produces a non-empty deterministic summary from seeded messages', () => {
+test('aggregateGroupTopics produces a non-empty deterministic summary from seeded messages', async () => {
   const chatId = 'oc_group_intel_test';
   const msgs = [
     '大家好，今天讨论 SeeDAO 治理提案',
@@ -118,7 +118,7 @@ test('aggregateGroupTopics produces a non-empty deterministic summary from seede
     '社区发展讨论中',
   ];
   for (let i = 0; i < msgs.length; i++) {
-    insertMessage({
+    await insertMessage({
       messageId: `msg_git_${i}`,
       chatId,
       senderOpenId: 'ou_tester',
@@ -130,7 +130,7 @@ test('aggregateGroupTopics produces a non-empty deterministic summary from seede
     });
   }
 
-  const summary = aggregateGroupTopics(chatId);
+  const summary = await aggregateGroupTopics(chatId);
   assert.ok(summary.length > 0, 'summary must not be empty');
   assert.ok(summary.includes('话题热词'), 'summary must contain expected header phrase');
   const hasSeeDao = summary.toLowerCase().includes('seedao');

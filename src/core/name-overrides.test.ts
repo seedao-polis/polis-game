@@ -31,33 +31,33 @@ after(() => {
   fs.rmSync(TMP, { recursive: true, force: true });
 });
 
-test('preferredName returns the configured override', () => {
-  assert.equal(preferredName('ou_fivea'), 'Fivea');
+test('preferredName returns the configured override', async () => {
+  assert.equal(await preferredName('ou_fivea'), 'Fivea');
 });
 
-test('preferredName returns undefined for unmapped or blank ids', () => {
-  assert.equal(preferredName('ou_unknown'), undefined);
-  assert.equal(preferredName('ou_blank'), undefined); // whitespace-only override is ignored
-  assert.equal(preferredName(''), undefined);
+test('preferredName returns undefined for unmapped or blank ids', async () => {
+  assert.equal(await preferredName('ou_unknown'), undefined);
+  assert.equal(await preferredName('ou_blank'), undefined); // whitespace-only override is ignored
+  assert.equal(await preferredName(''), undefined);
 });
 
-test('applyNameOverride prefers the override over the raw captured name', () => {
-  assert.equal(applyNameOverride('ou_fivea', '李'), 'Fivea');
-  assert.equal(applyNameOverride('ou_fivea', ''), 'Fivea'); // override wins even with an empty raw name
+test('applyNameOverride prefers the override over the raw captured name', async () => {
+  assert.equal(await applyNameOverride('ou_fivea', '李'), 'Fivea');
+  assert.equal(await applyNameOverride('ou_fivea', ''), 'Fivea'); // override wins even with an empty raw name
 });
 
-test('applyNameOverride falls back to the raw name when there is no override', () => {
-  assert.equal(applyNameOverride('ou_unknown', '张三'), '张三');
-  assert.equal(applyNameOverride('ou_unknown', ''), '');
+test('applyNameOverride falls back to the raw name when there is no override', async () => {
+  assert.equal(await applyNameOverride('ou_unknown', '张三'), '张三');
+  assert.equal(await applyNameOverride('ou_unknown', ''), '');
 });
 
-test('a self-service rename (name_overrides table) overrides the raw captured name', () => {
-  store.setPreferredName('ou_self', 'Vicky Huang');
-  assert.equal(preferredName('ou_self'), 'Vicky Huang');
-  assert.equal(applyNameOverride('ou_self', '用户560770'), 'Vicky Huang');
+test('a self-service rename (name_overrides table) overrides the raw captured name', async () => {
+  await store.setPreferredName('ou_self', 'Vicky Huang');
+  assert.equal(await preferredName('ou_self'), 'Vicky Huang');
+  assert.equal(await applyNameOverride('ou_self', '用户560770'), 'Vicky Huang');
 });
 
-test('operator config takes precedence over a self-service rename', () => {
-  store.setPreferredName('ou_fivea', 'NotFivea');
-  assert.equal(applyNameOverride('ou_fivea', '李'), 'Fivea'); // config still wins
+test('operator config takes precedence over a self-service rename', async () => {
+  await store.setPreferredName('ou_fivea', 'NotFivea');
+  assert.equal(await applyNameOverride('ou_fivea', '李'), 'Fivea'); // config still wins
 });

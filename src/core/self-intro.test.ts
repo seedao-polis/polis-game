@@ -80,26 +80,26 @@ describe('buildNewcomerWelcomePost', () => {
 describe('pending_welcome queue', () => {
   const CHAT = 'oc_test_welcome';
 
-  it('enqueues, lists (deduped, oldest-first), and clears', () => {
-    clearPendingWelcome(CHAT);
-    enqueuePendingWelcome(CHAT, [{ openId: 'ou_a', name: '阿尔法' }, { openId: 'ou_b', name: '贝塔' }]);
+  it('enqueues, lists (deduped, oldest-first), and clears', async () => {
+    await clearPendingWelcome(CHAT);
+    await enqueuePendingWelcome(CHAT, [{ openId: 'ou_a', name: '阿尔法' }, { openId: 'ou_b', name: '贝塔' }]);
     // Re-enqueueing ou_a is ignored (INSERT OR IGNORE keeps the first); '' open_id is skipped.
-    enqueuePendingWelcome(CHAT, [{ openId: 'ou_a', name: '阿尔法(改名)' }, { openId: '', name: 'skip' }, { openId: 'ou_c', name: '' }]);
+    await enqueuePendingWelcome(CHAT, [{ openId: 'ou_a', name: '阿尔法(改名)' }, { openId: '', name: 'skip' }, { openId: 'ou_c', name: '' }]);
 
-    const listed = listPendingWelcome(CHAT);
+    const listed = await listPendingWelcome(CHAT);
     assert.deepEqual(listed.map((m) => m.openId), ['ou_a', 'ou_b', 'ou_c']);
 
-    clearPendingWelcome(CHAT);
-    assert.deepEqual(listPendingWelcome(CHAT), []);
+    await clearPendingWelcome(CHAT);
+    assert.deepEqual(await listPendingWelcome(CHAT), []);
   });
 
-  it('scopes by chat and no-ops on empty input', () => {
-    clearPendingWelcome(CHAT);
-    clearPendingWelcome('oc_other');
-    enqueuePendingWelcome(CHAT, []); // no-op
-    enqueuePendingWelcome(CHAT, [{ openId: 'ou_x', name: 'X' }]);
-    assert.deepEqual(listPendingWelcome('oc_other'), []); // different chat unaffected
-    assert.equal(listPendingWelcome(CHAT).length, 1);
-    clearPendingWelcome(CHAT);
+  it('scopes by chat and no-ops on empty input', async () => {
+    await clearPendingWelcome(CHAT);
+    await clearPendingWelcome('oc_other');
+    await enqueuePendingWelcome(CHAT, []); // no-op
+    await enqueuePendingWelcome(CHAT, [{ openId: 'ou_x', name: 'X' }]);
+    assert.deepEqual(await listPendingWelcome('oc_other'), []); // different chat unaffected
+    assert.equal((await listPendingWelcome(CHAT)).length, 1);
+    await clearPendingWelcome(CHAT);
   });
 });

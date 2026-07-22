@@ -52,8 +52,8 @@ test('attachmentMarker returns a compact label per attachment type', () => {
   assert.equal(attachmentMarker('text', 'hello'), '');
 });
 
-test('renderMessageBody inlines a text file from the raw event JSON content form', () => {
-  const body = renderMessageBody(
+test('renderMessageBody inlines a text file from the raw event JSON content form', async () => {
+  const body = await renderMessageBody(
     { msgType: 'file', content: '{"file_key":"fk","file_name":"brief.md"}', messageId: 'om_9' },
     { fetchFile: () => '/tmp/brief.md', readFile: () => 'raw markdown body' }
   );
@@ -92,8 +92,8 @@ test('extractText passes plain-text formats through and truncates past the cap',
 });
 
 // ── message rendering ────────────────────────────────────────────────────────────
-test('renderMessageBody inlines a downloaded text file', () => {
-  const body = renderMessageBody(
+test('renderMessageBody inlines a downloaded text file', async () => {
+  const body = await renderMessageBody(
     { msgType: 'file', content: '<file key="file_k1" name="brief.md"/>', messageId: 'om_1' },
     {
       fetchFile: (mid, key, name) => {
@@ -110,9 +110,9 @@ test('renderMessageBody inlines a downloaded text file', () => {
   assert.match(body, /some content here/);
 });
 
-test('renderMessageBody marks a binary file without downloading', () => {
+test('renderMessageBody marks a binary file without downloading', async () => {
   let fetched = false;
-  const body = renderMessageBody(
+  const body = await renderMessageBody(
     { msgType: 'file', content: '<file key="k" name="slides.pdf"/>', messageId: 'om_2' },
     { fetchFile: () => { fetched = true; return '/tmp/x'; } }
   );
@@ -121,23 +121,23 @@ test('renderMessageBody marks a binary file without downloading', () => {
   assert.match(body, /二进制/);
 });
 
-test('renderMessageBody reports a failed download for a text file', () => {
-  const body = renderMessageBody(
+test('renderMessageBody reports a failed download for a text file', async () => {
+  const body = await renderMessageBody(
     { msgType: 'file', content: '<file key="k" name="a.html"/>', messageId: 'om_3' },
     { fetchFile: () => null }
   );
   assert.match(body, /未能读取内容/);
 });
 
-test('renderMessageBody renders image and video markers', () => {
-  assert.equal(renderMessageBody({ msgType: 'image', content: '[Image: img_v3_z]' }), '[图片]');
+test('renderMessageBody renders image and video markers', async () => {
+  assert.equal(await renderMessageBody({ msgType: 'image', content: '[Image: img_v3_z]' }), '[图片]');
   assert.equal(
-    renderMessageBody({ msgType: 'media', content: '<video key="k" name="v.mp4"/>' }),
+    await renderMessageBody({ msgType: 'media', content: '<video key="k" name="v.mp4"/>' }),
     '[视频：v.mp4]'
   );
 });
 
-test('renderMessageBody returns empty for types it does not surface', () => {
-  assert.equal(renderMessageBody({ msgType: 'text', content: 'hello' }), '');
-  assert.equal(renderMessageBody({ msgType: 'system', content: 'x' }), '');
+test('renderMessageBody returns empty for types it does not surface', async () => {
+  assert.equal(await renderMessageBody({ msgType: 'text', content: 'hello' }), '');
+  assert.equal(await renderMessageBody({ msgType: 'system', content: 'x' }), '');
 });

@@ -22,15 +22,15 @@ const { closeDb } = await import('./db.js');
 // Production registers this badge definition once via `agent badge import` (see the community
 // prediction research doc's "施工起点状态"); a fresh test DB starts empty, so the definition must be
 // registered here before awardBadge() can satisfy user_badges' FK on badges.badge_id.
-upsertBadge({ badgeId: 'predict_judge', name: '社区预测裁判', description: '拥有宣布社区预测结果的权限', emoji: '⚖️', role: '社区预测裁判', type: 'role' });
+await upsertBadge({ badgeId: 'predict_judge', name: '社区预测裁判', description: '拥有宣布社区预测结果的权限', emoji: '⚖️', role: '社区预测裁判', type: 'role' });
 
 after(() => {
   closeDb();
   fs.rmSync(TMP, { recursive: true, force: true });
 });
 
-function makeDiscreteProposal(options: string[], createdBy = 'creator') {
-  const { num } = insertPredictProposal({
+async function makeDiscreteProposal(options: string[], createdBy = 'creator') {
+  const { num } = await insertPredictProposal({
     title: '测试社区预测',
     options,
     endTime: Math.floor(Date.now() / 1000) + 3600,
@@ -38,7 +38,7 @@ function makeDiscreteProposal(options: string[], createdBy = 'creator') {
     createdBy,
     chatId: 'oc_test_predict_settlement',
   });
-  return getPredictByNum(num)!;
+  return (await getPredictByNum(num))!;
 }
 
 // ── distributePool — pure-function boundary cases ──────────────
@@ -131,10 +131,10 @@ describe('buildPredictSettledPost — pool and chest are stated as distinct amou
 
 describe('settlePredict — manual winner announcement', () => {
   it('winner-option bettors split the pool by LP stake; losers get nothing; chest gets totalPool*0.10', async () => {
-    const p = makeDiscreteProposal(['法国', '巴西']);
-    insertPredictBet({ proposalId: p.id, userOpenId: 'u1', optionValue: '法国', lpAmount: 3, messageId: 'b1' });
-    insertPredictBet({ proposalId: p.id, userOpenId: 'u2', optionValue: '法国', lpAmount: 7, messageId: 'b2' });
-    insertPredictBet({ proposalId: p.id, userOpenId: 'u3', optionValue: '巴西', lpAmount: 5, messageId: 'b3' });
+    const p = await makeDiscreteProposal(['法国', '巴西']);
+    await insertPredictBet({ proposalId: p.id, userOpenId: 'u1', optionValue: '法国', lpAmount: 3, messageId: 'b1' });
+    await insertPredictBet({ proposalId: p.id, userOpenId: 'u2', optionValue: '法国', lpAmount: 7, messageId: 'b2' });
+    await insertPredictBet({ proposalId: p.id, userOpenId: 'u3', optionValue: '巴西', lpAmount: 5, messageId: 'b3' });
 
     const result = await settlePredict(p, '法国', 'judge1');
     assert.equal(result.ok, true);
@@ -148,22 +148,22 @@ describe('settlePredict — manual winner announcement', () => {
     assert.equal(result.chestContribution, 1.58);
 
     // Ledger reflects the grants under the predict-specific reason codes.
-    const u1Ledger = recentPtLedger('u1', 5);
+    const u1Ledger = await recentPtLedger('u1', 5);
     assert.ok(u1Ledger.some(e => e.reason === 'predict_reward' && e.delta === 4.7));
-    const chestLedger = recentPtLedger('chest:public-welfare', 5);
+    const chestLedger = await recentPtLedger('chest:public-welfare', 5);
     assert.ok(chestLedger.some(e => e.reason === 'predict_chest_contribute' && e.delta === 1.58));
 
     // Proposal transitioned to settled with the announced option and announcer recorded.
-    const settled = getPredictByNum(p.num)!;
+    const settled = (await getPredictByNum(p.num))!;
     assert.equal(settled.status, 'settled');
     assert.equal(settled.settledOption, '法国');
     assert.equal(settled.announcedBy, 'judge1');
   });
 
   it('everyone bets the announced winning option (no losers) — chest still gets funded', async () => {
-    const p = makeDiscreteProposal(['A', 'B']);
-    insertPredictBet({ proposalId: p.id, userOpenId: 'u1', optionValue: 'A', lpAmount: 5, messageId: 'b1' });
-    insertPredictBet({ proposalId: p.id, userOpenId: 'u2', optionValue: 'A', lpAmount: 5, messageId: 'b2' });
+    const p = await makeDiscreteProposal(['A', 'B']);
+    await insertPredictBet({ proposalId: p.id, userOpenId: 'u1', optionValue: 'A', lpAmount: 5, messageId: 'b1' });
+    await insertPredictBet({ proposalId: p.id, userOpenId: 'u2', optionValue: 'A', lpAmount: 5, messageId: 'b2' });
 
     const result = await settlePredict(p, 'A', 'judge1');
     assert.equal(result.ok, true);
@@ -176,40 +176,40 @@ describe('settlePredict — manual winner announcement', () => {
   });
 
   it('zero bets — settles cleanly with no winners and no chest contribution', async () => {
-    const p = makeDiscreteProposal(['A', 'B']);
+    const p = await makeDiscreteProposal(['A', 'B']);
     const result = await settlePredict(p, 'A', 'judge1');
     assert.equal(result.ok, true);
     assert.deepEqual(result.winners, []);
     assert.equal(result.totalPool, 0);
     assert.equal(result.chestContribution, 0);
     assert.equal(result.dust, 0);
-    assert.equal(getPredictByNum(p.num)!.status, 'settled');
+    assert.equal((await getPredictByNum(p.num))!.status, 'settled');
   });
 
   it('rejects an option that is not one of the proposal\'s options', async () => {
-    const p = makeDiscreteProposal(['A', 'B']);
+    const p = await makeDiscreteProposal(['A', 'B']);
     const result = await settlePredict(p, 'C', 'judge1');
     assert.equal(result.ok, false);
     assert.equal(result.error, 'invalid_option');
-    assert.equal(getPredictByNum(p.num)!.status, 'active'); // untouched
+    assert.equal((await getPredictByNum(p.num))!.status, 'active'); // untouched
   });
 
   it('idempotent: a second announcement on an already-settled proposal grants nothing further', async () => {
-    const p = makeDiscreteProposal(['A', 'B']);
+    const p = await makeDiscreteProposal(['A', 'B']);
     // Unique user id (not reused from earlier tests in this file) so recentPtLedger below reflects
     // only this proposal's grant, not accumulated predict_reward entries from other proposals.
-    insertPredictBet({ proposalId: p.id, userOpenId: 'idem-user', optionValue: 'A', lpAmount: 4, messageId: 'b1' });
+    await insertPredictBet({ proposalId: p.id, userOpenId: 'idem-user', optionValue: 'A', lpAmount: 4, messageId: 'b1' });
 
     const first = await settlePredict(p, 'A', 'judge1');
     assert.equal(first.ok, true);
-    const ledgerAfterFirst = recentPtLedger('idem-user', 10).filter(e => e.reason === 'predict_reward').length;
+    const ledgerAfterFirst = (await recentPtLedger('idem-user', 10)).filter(e => e.reason === 'predict_reward').length;
     assert.equal(ledgerAfterFirst, 1);
 
     // Replay (duplicate Feishu event / judge double-tap) — must be a no-op.
-    const second = await settlePredict(getPredictByNum(p.num)!, 'A', 'judge1');
+    const second = await settlePredict((await getPredictByNum(p.num))!, 'A', 'judge1');
     assert.equal(second.ok, false);
     assert.equal(second.error, 'already_settled');
-    const ledgerAfterSecond = recentPtLedger('idem-user', 10).filter(e => e.reason === 'predict_reward').length;
+    const ledgerAfterSecond = (await recentPtLedger('idem-user', 10)).filter(e => e.reason === 'predict_reward').length;
     assert.equal(ledgerAfterSecond, 1); // unchanged — no double grant
   });
 });
@@ -217,40 +217,40 @@ describe('settlePredict — manual winner announcement', () => {
 // ── hasBadge permission gate on the announce command ────────────
 
 describe('tryHandlePredictCommand — announce is gated on the predict_judge badge', () => {
-  it('a sender without the badge is rejected, and the proposal stays active', () => {
-    const p = makeDiscreteProposal(['A', 'B'], 'creator3');
-    assert.equal(hasBadge('no-badge-user', 'predict_judge'), false);
-    const r = tryHandlePredictCommand(`@城邦土地神 预测 宣布 ${p.num} A`, 'no-badge-user');
+  it('a sender without the badge is rejected, and the proposal stays active', async () => {
+    const p = await makeDiscreteProposal(['A', 'B'], 'creator3');
+    assert.equal(await hasBadge('no-badge-user', 'predict_judge'), false);
+    const r = await tryHandlePredictCommand(`@城邦土地神 预测 宣布 ${p.num} A`, 'no-badge-user');
     assert.notEqual(r, false);
     assert.match((r as { reply: string }).reply, /只有社区预测裁判/);
-    assert.equal(getPredictByNum(p.num)!.status, 'active');
+    assert.equal((await getPredictByNum(p.num))!.status, 'active');
   });
 
-  it('a sender holding the predict_judge badge may announce a result', () => {
-    const p = makeDiscreteProposal(['A', 'B'], 'creator4');
-    awardBadge('judge-user', 'predict_judge', 'test-grant');
-    assert.equal(hasBadge('judge-user', 'predict_judge'), true);
-    const r = tryHandlePredictCommand(`@城邦土地神 预测 宣布 ${p.num} A`, 'judge-user');
+  it('a sender holding the predict_judge badge may announce a result', async () => {
+    const p = await makeDiscreteProposal(['A', 'B'], 'creator4');
+    await awardBadge('judge-user', 'predict_judge', 'test-grant');
+    assert.equal(await hasBadge('judge-user', 'predict_judge'), true);
+    const r = await tryHandlePredictCommand(`@城邦土地神 预测 宣布 ${p.num} A`, 'judge-user');
     assert.notEqual(r, false);
     assert.match((r as { reply: string }).reply, /已宣布/);
   });
 
-  it('accepts a "BET-N" token as the proposal number (the abbreviation members actually type)', () => {
-    const p = makeDiscreteProposal(['A', 'B'], 'creator-bet');
-    awardBadge('judge-bet', 'predict_judge', 'test-grant');
+  it('accepts a "BET-N" token as the proposal number (the abbreviation members actually type)', async () => {
+    const p = await makeDiscreteProposal(['A', 'B'], 'creator-bet');
+    await awardBadge('judge-bet', 'predict_judge', 'test-grant');
     // "BET-<num>" must resolve to the same proposal as the bare integer — guards parsePredictNum after
     // the PREDICT→BET abbreviation rename.
-    const r = tryHandlePredictCommand(`@城邦土地神 预测 宣布 BET-${p.num} A`, 'judge-bet');
+    const r = await tryHandlePredictCommand(`@城邦土地神 预测 宣布 BET-${p.num} A`, 'judge-bet');
     assert.notEqual(r, false);
     assert.match((r as { reply: string }).reply, /已宣布/);
   });
 
-  it('"预测 宣布 <num> <option>" is never misread as a bet by the regression it guards against', () => {
-    const p = makeDiscreteProposal(['A', 'B'], 'creator5');
+  it('"预测 宣布 <num> <option>" is never misread as a bet by the regression it guards against', async () => {
+    const p = await makeDiscreteProposal(['A', 'B'], 'creator5');
     // Not a predict command at all -> false, falls through (mirrors tc.test.ts's analogous regression).
-    assert.equal(tryHandlePredictCommand('@城邦土地神 A 5lp', 'someone'), false);
+    assert.equal(await tryHandlePredictCommand('@城邦土地神 A 5lp', 'someone'), false);
     // A predict command ending in a discrete option token IS handled here (never reaches the bet parser).
-    const r = tryHandlePredictCommand(`@城邦土地神 预测 宣布 ${p.num} A`, 'someone-without-badge');
+    const r = await tryHandlePredictCommand(`@城邦土地神 预测 宣布 ${p.num} A`, 'someone-without-badge');
     assert.notEqual(r, false);
   });
 });

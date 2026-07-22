@@ -18,8 +18,8 @@ after(() => {
   fs.rmSync(TMP, { recursive: true, force: true });
 });
 
-function msg(id: string, chatId: string, t: number, text: string, sender = 'ou_u1', name = 'Alice') {
-  store.insertMessage({
+async function msg(id: string, chatId: string, t: number, text: string, sender = 'ou_u1', name = 'Alice') {
+  await store.insertMessage({
     messageId: id,
     chatId,
     senderOpenId: sender,
@@ -54,20 +54,20 @@ test('parseMemberRefs round-trips formatMemberRefs', () => {
   assert.deepEqual(parseMemberRefs(''), []);
 });
 
-test('gatherDayData summarizes public/member content but only counts work-group metrics', () => {
-  store.upsertChat({ chatId: 'oc_pub', name: '围观群', external: true });
-  store.upsertChat({ chatId: 'oc_work', name: '工作群', external: false });
+test('gatherDayData summarizes public/member content but only counts work-group metrics', async () => {
+  await store.upsertChat({ chatId: 'oc_pub', name: '围观群', external: true });
+  await store.upsertChat({ chatId: 'oc_work', name: '工作群', external: false });
 
   // Public chat: 2 senders, 3 messages → content should be summarized.
-  msg('p1', 'oc_pub', 1100, '今天有什么活动', 'ou_a', 'Amy');
-  msg('p2', 'oc_pub', 1200, '欢迎新朋友', 'ou_b', 'Ben');
-  msg('p3', 'oc_pub', 1300, '请问怎么加入', 'ou_a', 'Amy');
+  await msg('p1', 'oc_pub', 1100, '今天有什么活动', 'ou_a', 'Amy');
+  await msg('p2', 'oc_pub', 1200, '欢迎新朋友', 'ou_b', 'Ben');
+  await msg('p3', 'oc_pub', 1300, '请问怎么加入', 'ou_a', 'Amy');
 
   // Work chat: real discussion that must NOT be summarized, only counted.
-  msg('w1', 'oc_work', 1150, '内部预算讨论', 'ou_c', 'Cara');
-  msg('w2', 'oc_work', 1250, '下周排期', 'ou_c', 'Cara');
+  await msg('w1', 'oc_work', 1150, '内部预算讨论', 'ou_c', 'Cara');
+  await msg('w2', 'oc_work', 1250, '下周排期', 'ou_c', 'Cara');
 
-  const data = gatherDayData(
+  const data = await gatherDayData(
     { from: 1000, to: 2000 },
     { tierOf: (id) => (id === 'oc_work' ? 'work' : 'public') },
   );
@@ -91,22 +91,22 @@ test('gatherDayData summarizes public/member content but only counts work-group 
   assert.equal(data.chats[0]!.chatId, 'oc_pub');
 });
 
-test('gatherDayData excludes the bot’s own messages from activity', () => {
+test('gatherDayData excludes the bot’s own messages from activity', async () => {
   // The default profile bot open_id (from configs/lark.json); fall back is harmless if absent.
   const botId = loadConfigs().lark.profiles.default?.botOpenId ?? 'ou_bot_fallback';
-  store.upsertChat({ chatId: 'oc_bot', name: '测试群', external: true });
-  msg('b1', 'oc_bot', 1400, '人类发言', 'ou_human', '路人');
-  msg('b2', 'oc_bot', 1450, '机器人自动回复', botId, '城邦土地神');
+  await store.upsertChat({ chatId: 'oc_bot', name: '测试群', external: true });
+  await msg('b1', 'oc_bot', 1400, '人类发言', 'ou_human', '路人');
+  await msg('b2', 'oc_bot', 1450, '机器人自动回复', botId, '城邦土地神');
 
-  const data = gatherDayData({ from: 1000, to: 2000 }, { tierOf: () => 'public' });
+  const data = await gatherDayData({ from: 1000, to: 2000 }, { tierOf: () => 'public' });
   const c = data.chats.find((x) => x.chatId === 'oc_bot')!;
   assert.equal(c.messageCount, 1, 'bot message excluded from count');
   assert.equal(c.activeMembers, 1);
   assert.ok(!c.lines.some((l) => l.text.includes('机器人')), 'bot content not summarized');
 });
 
-test('gatherDayData aggregates member joins/leaves from sync rounds', () => {
-  store.recordMemberSyncRound({
+test('gatherDayData aggregates member joins/leaves from sync rounds', async () => {
+  await store.recordMemberSyncRound({
     syncedAt: 1100,
     chatCount: 1,
     presentTotal: 100,
@@ -119,7 +119,7 @@ test('gatherDayData aggregates member joins/leaves from sync rounds', () => {
     leftDetail: '',
     renamedDetail: '(ou_x, 改名乙)',
   });
-  store.recordMemberSyncRound({
+  await store.recordMemberSyncRound({
     syncedAt: 1500,
     chatCount: 1,
     presentTotal: 102,
@@ -133,7 +133,7 @@ test('gatherDayData aggregates member joins/leaves from sync rounds', () => {
     renamedDetail: '',
   });
 
-  const data = gatherDayData({ from: 1000, to: 2000 }, { tierOf: () => 'public' });
+  const data = await gatherDayData({ from: 1000, to: 2000 }, { tierOf: () => 'public' });
   assert.deepEqual(
     data.members.joined.map((j) => j.name).sort(),
     ['新人丙', '新人甲'],

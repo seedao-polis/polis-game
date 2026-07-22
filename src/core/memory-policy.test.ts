@@ -123,18 +123,18 @@ test("B cannot read A's group_user memory even in the same chat", () => {
 
 // ── getFilteredMemories integration (DB-backed) ──────────────────────────────
 
-test('getFilteredMemories end-to-end: namespace isolation between two users', () => {
+test('getFilteredMemories end-to-end: namespace isolation between two users', async () => {
   const chatId  = 'oc_integration_test';
   const aliceId = 'ou_integration_alice';
   const bobId   = 'ou_integration_bob';
 
   // Insert memories for Alice and Bob in their respective namespaces.
-  insertMemory({ namespace: `user:${aliceId}`, content: 'alice secret', visibility: 'private' });
-  insertMemory({ namespace: `user:${bobId}`,   content: 'bob secret',   visibility: 'private' });
-  insertMemory({ namespace: `group:${chatId}`, content: 'group shared', visibility: 'group' });
+  await insertMemory({ namespace: `user:${aliceId}`, content: 'alice secret', visibility: 'private' });
+  await insertMemory({ namespace: `user:${bobId}`,   content: 'bob secret',   visibility: 'private' });
+  await insertMemory({ namespace: `group:${chatId}`, content: 'group shared', visibility: 'group' });
 
   const aliceCtx = { chatId, userOpenId: aliceId };
-  const aliceMems = getFilteredMemories(aliceCtx, {
+  const aliceMems = await getFilteredMemories(aliceCtx, {
     namespaces: allowedNamespaces(aliceCtx),
   });
 
@@ -145,25 +145,25 @@ test('getFilteredMemories end-to-end: namespace isolation between two users', ()
   assert.ok(!aliceContents.includes('bob secret'), "Alice must not see Bob's private memory");
 });
 
-test('getFilteredMemories end-to-end: expired entries are excluded', () => {
+test('getFilteredMemories end-to-end: expired entries are excluded', async () => {
   const chatId = 'oc_expiry_test';
   const userId = 'ou_expiry_user';
   const pastExpiry = Math.floor(Date.now() / 1000) - 3600; // 1 hour ago
 
-  insertMemory({
+  await insertMemory({
     namespace: `user:${userId}`,
     content: 'expired note',
     visibility: 'private',
     expiresAt: pastExpiry,
   });
-  insertMemory({
+  await insertMemory({
     namespace: `user:${userId}`,
     content: 'active note',
     visibility: 'private',
   });
 
   const ctx = { chatId, userOpenId: userId };
-  const mems = getFilteredMemories(ctx, { namespaces: allowedNamespaces(ctx) });
+  const mems = await getFilteredMemories(ctx, { namespaces: allowedNamespaces(ctx) });
   const contents = mems.map((m) => m.content);
   assert.ok(!contents.includes('expired note'), 'expired entries must be excluded');
   assert.ok(contents.includes('active note'),   'non-expired entries must be included');
