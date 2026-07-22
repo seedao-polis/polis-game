@@ -3,7 +3,7 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 import path from 'node:path';
 import { resolveLarkRun, RUNTIME_DIR } from './paths.js';
-import { runFileSync } from './subprocess.js';
+import { runFileAsync } from './subprocess.js';
 import { log } from './log.js';
 
 // ── lark-cli wrapper (Feishu official CLI, dual user/bot identity) ─────────────────
@@ -74,7 +74,7 @@ export interface LarkExecOptions {
   profile?: string;
 }
 
-function larkExec(args: string[], opts: LarkExecOptions = {}): any {
+async function larkExec(args: string[], opts: LarkExecOptions = {}): Promise<any> {
   const run = resolveLarkRun();
   if (!run) {
     throw new Error(
@@ -85,7 +85,9 @@ function larkExec(args: string[], opts: LarkExecOptions = {}): any {
   // stdio: pipe stdout AND stderr so we CAPTURE them rather than letting Node forward the child's
   // stderr straight to our own — lark-cli prints its full error envelope (e.g. a 232009 "chat
   // dissolved") to stderr, which would otherwise leak to the console/log on every failed call.
-  const r = runFileSync('node', [run, ...finalArgs], {
+  // Async exec: the CLI call (0.5-2s per invocation) must not block the event loop, or every
+  // pending DB promise in the process stalls behind it.
+  const r = await runFileAsync('node', [run, ...finalArgs], {
     maxBuffer: MAX_BUFFER,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -124,10 +126,9 @@ export function isRateLimited(res: any): boolean {
   return /http.?429|429 too many|too many request|rate.?limit|frequency.?limit|too_many_request/.test(text);
 }
 
-// Synchronous sleep. larkExec runs synchronously (execFileSync), so async timers cannot be awaited on
-// the reply worker's critical path; Atomics.wait blocks the thread for the backoff interval instead.
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+// Async sleep for the 429 backoff below; yields the event loop instead of blocking the thread.
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // Bounded backoff schedule for a rate-limited send.
@@ -140,17 +141,19 @@ const SEND_RETRY_DELAYS_MS = [1000, 2500, 5000];
  * and leaving the user without confirmation. Only rate limits are retried; timeouts/crashes are not,
  * since those may already have been delivered and retrying could duplicate.
  */
-function larkExecSend(args: string[], opts: LarkExecOptions = {}): any {
-  let res = larkExec(args, opts);
+async function larkExecSend(args: string[], opts: LarkExecOptions = {}): Promise<any> {
+  let res = await larkExec(args, opts);
+  // Retry ONLY on a rate limit (isRateLimited): a 429 was rejected before processing, so retrying
+  // cannot duplicate. Any other failure (timeout/crash) may already have been delivered — no retry.
   for (let i = 0; i < SEND_RETRY_DELAYS_MS.length && isRateLimited(res); i++) {
     log.warn(`飞书发送被限流（429），${SEND_RETRY_DELAYS_MS[i]}ms 后重试（第 ${i + 1}/${SEND_RETRY_DELAYS_MS.length} 次）`);
-    sleepSync(SEND_RETRY_DELAYS_MS[i]);
-    res = larkExec(args, opts);
+    await sleep(SEND_RETRY_DELAYS_MS[i]);
+    res = await larkExec(args, opts);
   }
   return res;
 }
 
-export function authStatus(profile?: string): any {
+export async function authStatus(profile?: string): Promise<any> {
   return larkExec(['auth', 'status'], { profile });
 }
 
@@ -159,9 +162,9 @@ export function authStatus(profile?: string): any {
  * Uses the user identity (--as user) because the bot identity cannot retrieve names from the contact API.
  * Returns an empty string when the name is unavailable or the call fails; never throws.
  */
-export function getUserName(openId: string, profile?: string): string {
+export async function getUserName(openId: string, profile?: string): Promise<string> {
   try {
-    const res = larkExec(
+    const res = await larkExec(
       ['contact', '+get-user', '--user-id', openId, '--user-id-type', 'open_id', '--as', 'user', '--format', 'json'],
       { profile }
     );
@@ -181,7 +184,7 @@ export function getUserName(openId: string, profile?: string): string {
  * kicked out, no permission): that is THROWN as a LarkApiError so callers can stand the chat down,
  * instead of being silently swallowed into an empty roster and re-polled forever.
  */
-export function listChatMembers(chatId: string, opts: { profile?: string } = {}): Map<string, string> {
+export async function listChatMembers(chatId: string, opts: { profile?: string } = {}): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   let pageToken = '';
   for (let page = 0; page < 20; page++) {
@@ -190,7 +193,7 @@ export function listChatMembers(chatId: string, opts: { profile?: string } = {})
     if (pageToken) params.page_token = pageToken;
     let res: any;
     try {
-      res = larkExec(
+      res = await larkExec(
         ['im', 'chat.members', 'get', '--params', JSON.stringify(params), '--as', 'user', '--format', 'json'],
         { profile: opts.profile }
       );
@@ -217,8 +220,8 @@ export function listChatMembers(chatId: string, opts: { profile?: string } = {})
   return out;
 }
 
-export function isLoggedIn(profile?: string): boolean {
-  const auth = authStatus(profile);
+export async function isLoggedIn(profile?: string): Promise<boolean> {
+  const auth = await authStatus(profile);
   const user = auth?.identities?.user;
   return !!(user && (user.available || user.status === 'ready'));
 }
@@ -254,13 +257,13 @@ export function recurringSeriesKey(eventId: string): string {
  * converted to unix seconds. Fields missing or producing NaN are defaulted to 0. Best-effort: any
  * failure returns [] and never throws into the caller's poll loop.
  */
-export function listUpcomingCalendarEvents(opts: {
+export async function listUpcomingCalendarEvents(opts: {
   profile?: string;
   startIso: string;
   endIso: string;
-}): CalendarEvent[] {
+}): Promise<CalendarEvent[]> {
   try {
-    const res = larkExec(
+    const res = await larkExec(
       ['calendar', '+agenda', '--start', opts.startIso, '--end', opts.endIso, '--as', 'user', '--format', 'json'],
       { profile: opts.profile }
     );
@@ -311,11 +314,11 @@ export interface CalendarAttendee {
  * paging structure: page_token-based loop, 20-page safety cap, best-effort on partial failures.
  * is_external only appears on external attendees; internal members omit the field (treated as false).
  */
-export function listEventAttendees(
+export async function listEventAttendees(
   calendarId: string,
   eventId: string,
   opts: { profile?: string } = {}
-): CalendarAttendee[] {
+): Promise<CalendarAttendee[]> {
   const out: CalendarAttendee[] = [];
   let pageToken = '';
   for (let page = 0; page < 20; page++) {
@@ -329,7 +332,7 @@ export function listEventAttendees(
     if (pageToken) params.page_token = pageToken;
     let res: any;
     try {
-      res = larkExec(
+      res = await larkExec(
         ['calendar', 'event.attendees', 'list', '--params', JSON.stringify(params), '--as', 'user', '--format', 'json'],
         { profile: opts.profile }
       );
@@ -359,9 +362,9 @@ export function listEventAttendees(
  * id (the agenda's `<uuid>_<ts>` form; the bare uuid is rejected). Best-effort: returns '' on any failure
  * so the caller can fall back to the in-app app_link.
  */
-export function getEventShareLink(calendarId: string, eventId: string, opts: { profile?: string } = {}): string {
+export async function getEventShareLink(calendarId: string, eventId: string, opts: { profile?: string } = {}): Promise<string> {
   try {
-    const res = larkExec(
+    const res = await larkExec(
       ['calendar', 'events', 'share_info', '--calendar-id', calendarId, '--event-id', eventId, '--as', 'user', '--format', 'json'],
       { profile: opts.profile }
     );
@@ -419,7 +422,7 @@ export interface DriveFile {
  * success is code===0, items in data.items, paged via has_more/page_token. Best-effort: returns what
  * it gathered, never throws.
  */
-export function listWikiSpaces(opts: { profile?: string } = {}): WikiSpace[] {
+export async function listWikiSpaces(opts: { profile?: string } = {}): Promise<WikiSpace[]> {
   const out: WikiSpace[] = [];
   let pageToken = '';
   for (let page = 0; page < 20; page++) {
@@ -427,7 +430,7 @@ export function listWikiSpaces(opts: { profile?: string } = {}): WikiSpace[] {
     if (pageToken) params.page_token = pageToken;
     let res: any;
     try {
-      res = larkExec(
+      res = await larkExec(
         ['wiki', 'spaces', 'list', '--params', JSON.stringify(params), '--as', 'user', '--format', 'json'],
         { profile: opts.profile }
       );
@@ -452,7 +455,7 @@ export function listWikiSpaces(opts: { profile?: string } = {}): WikiSpace[] {
  * List the direct child nodes under a wiki space root (parentNodeToken empty) or a parent node, paging
  * until exhausted. Native command — success is code===0. Best-effort: returns what it gathered.
  */
-function listWikiChildNodes(spaceId: string, parentNodeToken: string, opts: { profile?: string }): WikiNode[] {
+async function listWikiChildNodes(spaceId: string, parentNodeToken: string, opts: { profile?: string }): Promise<WikiNode[]> {
   const out: WikiNode[] = [];
   let pageToken = '';
   for (let page = 0; page < 50; page++) {
@@ -461,7 +464,7 @@ function listWikiChildNodes(spaceId: string, parentNodeToken: string, opts: { pr
     if (pageToken) params.page_token = pageToken;
     let res: any;
     try {
-      res = larkExec(
+      res = await larkExec(
         ['wiki', 'nodes', 'list', '--params', JSON.stringify(params), '--as', 'user', '--format', 'json'],
         { profile: opts.profile }
       );
@@ -496,7 +499,7 @@ function listWikiChildNodes(spaceId: string, parentNodeToken: string, opts: { pr
  * has_child to recurse. Bounded breadth-first traversal (caps visited parents and total nodes) to stay
  * safe on very large spaces or shortcut cycles. Best-effort: returns what it could gather.
  */
-export function listWikiNodesDeep(spaceId: string, opts: { profile?: string } = {}): WikiNode[] {
+export async function listWikiNodesDeep(spaceId: string, opts: { profile?: string } = {}): Promise<WikiNode[]> {
   const all: WikiNode[] = [];
   const seen = new Set<string>();
   const queue: string[] = ['']; // '' = space root
@@ -504,7 +507,7 @@ export function listWikiNodesDeep(spaceId: string, opts: { profile?: string } = 
   while (queue.length > 0 && visited < 500 && all.length < 5000) {
     const parent = queue.shift() as string;
     visited += 1;
-    for (const node of listWikiChildNodes(spaceId, parent, opts)) {
+    for (const node of await listWikiChildNodes(spaceId, parent, opts)) {
       if (seen.has(node.nodeToken)) continue;
       seen.add(node.nodeToken);
       all.push(node);
@@ -528,19 +531,19 @@ export interface CreatedWikiNode {
  *
  * Throws {@link LarkApiError} on API rejection; returns the pair (nodeToken, documentId) on success.
  */
-export function createWikiNode(
+export async function createWikiNode(
   spaceId: string,
   parentNodeToken: string,
   title: string,
   opts: { profile?: string } = {}
-): CreatedWikiNode {
+): Promise<CreatedWikiNode> {
   const body = {
     parent_node_token: parentNodeToken,
     obj_type: 'docx',
     node_type: 'origin',
     title,
   };
-  const res = larkExec(
+  const res = await larkExec(
     ['api', 'POST', `/open-apis/wiki/v2/spaces/${spaceId}/nodes`,
       '--data', JSON.stringify(body),
       '--as', 'user',
@@ -571,11 +574,11 @@ export function createWikiNode(
  * Returns true when the shortcut reports ok; returns false when the API rejects the request, so the
  * caller can degrade gracefully without crashing the pipeline.
  */
-export function appendDocxContent(
+export async function appendDocxContent(
   documentId: string,
   content: string,
   opts: { profile?: string; overwrite?: boolean; format?: 'markdown' | 'xml' } = {}
-): boolean {
+): Promise<boolean> {
   const args = ['docs', '+update',
     '--api-version', 'v2',
     '--doc', documentId,
@@ -584,7 +587,7 @@ export function appendDocxContent(
     '--as', 'user',
     '--format', 'json'];
   if (opts.format === 'markdown') args.push('--doc-format', 'markdown');
-  const res = larkExec(args, { profile: opts.profile });
+  const res = await larkExec(args, { profile: opts.profile });
   return res?.ok === true;
 }
 
@@ -596,13 +599,13 @@ export function appendDocxContent(
  * `filePath` must be either an absolute path or a path relative to the current working directory.
  * Returns true on success, false on any failure; never throws so it can safely wrap optional steps.
  */
-export function insertDocxImage(
+export async function insertDocxImage(
   documentId: string,
   filePath: string,
   opts: { profile?: string } = {}
-): boolean {
+): Promise<boolean> {
   try {
-    const res = larkExec(
+    const res = await larkExec(
       ['docs', '+media-insert',
         '--doc', documentId,
         '--file', filePath,
@@ -631,11 +634,11 @@ export interface InsertedImageBlock {
  * rejects absolute out-of-tree paths). `width` sets the display width in px (height auto-scales for
  * PNG/JPEG/GIF). Returns null on any failure; never throws.
  */
-export function insertDocxImageBlock(
+export async function insertDocxImageBlock(
   documentId: string,
   filePath: string,
   opts: { profile?: string; width?: number } = {}
-): InsertedImageBlock | null {
+): Promise<InsertedImageBlock | null> {
   try {
     const args = ['docs', '+media-insert',
       '--doc', documentId,
@@ -644,7 +647,7 @@ export function insertDocxImageBlock(
       '--as', 'user',
       '--format', 'json'];
     if (opts.width) args.push('--width', String(opts.width));
-    const res = larkExec(args, { profile: opts.profile });
+    const res = await larkExec(args, { profile: opts.profile });
     if (res?.ok !== true) return null;
     const blockId = typeof res?.data?.block_id === 'string' ? res.data.block_id : '';
     const fileToken = typeof res?.data?.file_token === 'string' ? res.data.file_token : '';
@@ -660,15 +663,15 @@ export function insertDocxImageBlock(
  * inside a table cell as the anchor relocates the sources INTO that cell. Returns true on success,
  * false on any failure; never throws.
  */
-export function moveDocxBlocksAfter(
+export async function moveDocxBlocksAfter(
   documentId: string,
   anchorBlockId: string,
   srcBlockIds: string[],
   opts: { profile?: string } = {}
-): boolean {
+): Promise<boolean> {
   if (!anchorBlockId || srcBlockIds.length === 0) return false;
   try {
-    const res = larkExec(
+    const res = await larkExec(
       ['docs', '+update',
         '--api-version', 'v2',
         '--doc', documentId,
@@ -689,9 +692,9 @@ export function moveDocxBlocksAfter(
  * Fetch a docx's full body as the block-XML string (with block ids), used to locate blocks for
  * subsequent targeted edits. Returns '' on any failure; never throws.
  */
-export function fetchDocxRawContent(documentId: string, opts: { profile?: string } = {}): string {
+export async function fetchDocxRawContent(documentId: string, opts: { profile?: string } = {}): Promise<string> {
   try {
-    const res = larkExec(
+    const res = await larkExec(
       ['docs', '+fetch',
         '--doc', documentId,
         '--scope', 'full',
@@ -712,7 +715,7 @@ export function fetchDocxRawContent(documentId: string, opts: { profile?: string
  * empty), paging until exhausted. Native command — success is code===0, entries in data.files.
  * Best-effort: returns what it gathered.
  */
-function listDriveFolder(folderToken: string, opts: { profile?: string }): DriveFile[] {
+async function listDriveFolder(folderToken: string, opts: { profile?: string }): Promise<DriveFile[]> {
   const out: DriveFile[] = [];
   let pageToken = '';
   for (let page = 0; page < 50; page++) {
@@ -721,7 +724,7 @@ function listDriveFolder(folderToken: string, opts: { profile?: string }): Drive
     if (pageToken) params.page_token = pageToken;
     let res: any;
     try {
-      res = larkExec(
+      res = await larkExec(
         ['drive', 'files', 'list', '--params', JSON.stringify(params), '--as', 'user', '--format', 'json'],
         { profile: opts.profile }
       );
@@ -753,7 +756,7 @@ function listDriveFolder(folderToken: string, opts: { profile?: string }): Drive
  * into subfolders. Bounded breadth-first traversal (caps folders visited and files collected) to stay
  * cheap on large drives. Best-effort: returns what it could gather.
  */
-export function listDriveFilesDeep(opts: { profile?: string; rootFolderToken?: string } = {}): DriveFile[] {
+export async function listDriveFilesDeep(opts: { profile?: string; rootFolderToken?: string } = {}): Promise<DriveFile[]> {
   const files: DriveFile[] = [];
   const seen = new Set<string>();
   const queue: string[] = [opts.rootFolderToken ?? ''];
@@ -763,7 +766,7 @@ export function listDriveFilesDeep(opts: { profile?: string; rootFolderToken?: s
     if (seen.has(folder)) continue;
     seen.add(folder);
     visited += 1;
-    for (const entry of listDriveFolder(folder, opts)) {
+    for (const entry of await listDriveFolder(folder, opts)) {
       if (entry.type === 'folder') queue.push(entry.token);
       else files.push(entry);
     }
@@ -778,11 +781,11 @@ export function listDriveFilesDeep(opts: { profile?: string; rootFolderToken?: s
  * a transient blip. Each record carries the viewer's open_id, display name, and most-recent view time
  * (unix seconds). file_type must be one of doc/docx/sheet/bitable/mindnote/wiki/file.
  */
-export function listFileViewRecords(
+export async function listFileViewRecords(
   fileToken: string,
   fileType: string,
   opts: { profile?: string } = {}
-): FileViewRecord[] {
+): Promise<FileViewRecord[]> {
   const out: FileViewRecord[] = [];
   let pageToken = '';
   for (let page = 0; page < 40; page++) {
@@ -794,7 +797,7 @@ export function listFileViewRecords(
       page_size: 50,
     };
     if (pageToken) params.page_token = pageToken;
-    const res = larkExec(
+    const res = await larkExec(
       ['drive', 'file.view_records', 'list', '--params', JSON.stringify(params), '--as', 'user', '--format', 'json'],
       { profile: opts.profile }
     );
@@ -963,14 +966,14 @@ export function isChatInaccessibleError(e: unknown): boolean {
   );
 }
 
-export function listMessages(
+export async function listMessages(
   chatId: string,
   opts: { pageSize?: number; sort?: 'asc' | 'desc'; profile?: string; includeReactions?: boolean } = {}
-): LarkMessage[] {
+): Promise<LarkMessage[]> {
   // The message-list API returns each message's emoji reactions inline (reactions.details[]); the poll
   // loop suppresses them with --no-reactions since it doesn't need them. Pass includeReactions to keep
   // them (used by the reaction-harvest sync for the like-maniac milestone).
-  const res = larkExec(
+  const res = await larkExec(
     [
       'im',
       '+chat-messages-list',
@@ -1027,12 +1030,12 @@ function mapLarkMessage(m: any, includeReactions?: boolean): LarkMessage {
  * this is the ONLY way to see thread replies: they never appear in the chat-level message list.
  * Returns [] on any error (backfill is best-effort and must never throw into the event loop).
  */
-export function listThreadMessages(
+export async function listThreadMessages(
   threadOrMessageId: string,
   opts: { pageSize?: number; order?: 'asc' | 'desc'; profile?: string } = {}
-): LarkMessage[] {
+): Promise<LarkMessage[]> {
   if (!threadOrMessageId) return [];
-  const res = larkExec(
+  const res = await larkExec(
     [
       'im', '+threads-messages-list',
       '--thread', threadOrMessageId,
@@ -1101,13 +1104,13 @@ export interface LarkMessageDetail {
  * keep this for looking up a message the handler only has an id for (e.g. resolving a quoted message's
  * author, or linkage for an id that arrived from somewhere other than the event stream).
  */
-export function getMessageById(
+export async function getMessageById(
   messageId: string,
   opts: { as?: 'user' | 'bot'; profile?: string } = {},
-): LarkMessageDetail | null {
+): Promise<LarkMessageDetail | null> {
   if (!messageId) return null;
   try {
-    const res = larkExec(
+    const res = await larkExec(
       ['api', 'GET', `/open-apis/im/v1/messages/${messageId}`, '--as', opts.as ?? 'bot', '--format', 'json'],
       { profile: opts.profile },
     );
@@ -1167,14 +1170,14 @@ function extractReactions(m: any): MessageReaction[] {
  * (e.g. keep only internal groups where external===false).
  * +chat-list caps at 100 per page, so it exhausts pages one by one via page_token.
  */
-export function listChats(profile?: string): LarkChat[] {
+export async function listChats(profile?: string): Promise<LarkChat[]> {
   const out: LarkChat[] = [];
   let pageToken = '';
   for (let page = 0; page < 100; page++) {
     // Safety cap: at most 100 pages (10,000 groups in theory), to avoid infinite paging on anomalies
     const args = ['im', '+chat-list', '--as', 'user', '--page-size', '100', '--format', 'json'];
     if (pageToken) args.push('--page-token', pageToken);
-    const res = larkExec(args, { profile });
+    const res = await larkExec(args, { profile });
     if (!res.ok) {
       throw new LarkApiError('读取群清单失败', res);
     }
@@ -1206,16 +1209,16 @@ function parseExternal(c: any): boolean {
   return false;
 }
 
-export function sendText(
+export async function sendText(
   target: { chatId?: string; userId?: string },
   text: string,
   opts: { as?: 'user' | 'bot'; profile?: string } = {}
-): { ok: boolean; messageId?: string } {
+): Promise<{ ok: boolean; messageId?: string }> {
   const idArgs = target.chatId
     ? ['--chat-id', target.chatId]
     : ['--user-id', target.userId as string];
   const asArgs = opts.as ? ['--as', opts.as] : [];
-  const res = larkExecSend(
+  const res = await larkExecSend(
     [
       'im',
       '+messages-send',
@@ -1239,11 +1242,11 @@ export function sendText(
  * or null on failure. Used by the event system to send rendered images.
  * Invocation: `im images create --data '{"image_type":"message"}' --file image=<path> --as bot`.
  */
-export function uploadImage(filePath: string, opts: { profile?: string } = {}): string | null {
+export async function uploadImage(filePath: string, opts: { profile?: string } = {}): Promise<string | null> {
   // lark-cli sandboxes --file to a cwd-relative path (absolute paths are rejected with
   // "cannot open file"). Convert to a path relative to the process cwd before passing.
   const rel = path.isAbsolute(filePath) ? path.relative(process.cwd(), filePath) : filePath;
-  const res = larkExec(
+  const res = await larkExec(
     [
       'im',
       'images',
@@ -1270,11 +1273,11 @@ export function uploadImage(filePath: string, opts: { profile?: string } = {}): 
  * `--output` must be a cwd-relative path with no `..` traversal, so the cache dir lives under the repo
  * root (the process cwd for the running agent); if a safe relative path cannot be expressed, returns null.
  */
-export function downloadMessageResource(
+export async function downloadMessageResource(
   messageId: string,
   fileKey: string,
   opts: { type?: 'file' | 'image'; profile?: string; fileName?: string; as?: 'user' | 'bot' } = {}
-): string | null {
+): Promise<string | null> {
   if (!messageId || !fileKey) return null;
   const type = opts.type ?? 'file';
   const as = opts.as ?? 'user';
@@ -1287,7 +1290,7 @@ export function downloadMessageResource(
     fs.mkdirSync(cacheDir, { recursive: true });
     const rel = path.relative(process.cwd(), abs);
     if (rel.startsWith('..') || path.isAbsolute(rel)) return null; // outside cwd → can't pass a safe relative --output
-    const res = larkExec(
+    const res = await larkExec(
       [
         'im',
         '+messages-resources-download',
@@ -1323,17 +1326,17 @@ export type PostElement =
  * (text / markdown / @-mention / image), letting an event mix an image, blank lines and an @-mention
  * in a single message. Send to a group (target.chatId) or P2P (target.userId = open_id).
  */
-export function sendPost(
+export async function sendPost(
   target: { chatId?: string; userId?: string },
   post: { title?: string; content: PostElement[][] },
   opts: { as?: 'user' | 'bot'; profile?: string } = {}
-): { ok: boolean; messageId?: string } {
+): Promise<{ ok: boolean; messageId?: string }> {
   const idArgs = target.chatId
     ? ['--chat-id', target.chatId]
     : ['--user-id', target.userId as string];
   const asArgs = opts.as ? ['--as', opts.as] : ['--as', 'bot'];
   const body = { zh_cn: { title: post.title ?? '', content: post.content } };
-  const res = larkExecSend(
+  const res = await larkExecSend(
     [
       'im',
       '+messages-send',
@@ -1362,11 +1365,11 @@ export function sendPost(
  * Returns true on success; returns false on any API or CLI failure so callers can degrade
  * gracefully (e.g. fall back to sending a new message) without crashing.
  */
-export function updateMessage(
+export async function updateMessage(
   messageId: string,
   post: { title?: string; content: PostElement[][] },
   opts: { as?: 'user' | 'bot'; profile?: string } = {},
-): boolean {
+): Promise<boolean> {
   if (!messageId) return false;
   const innerBody = { zh_cn: { title: post.title ?? '', content: post.content } };
   const body = JSON.stringify({
@@ -1374,7 +1377,7 @@ export function updateMessage(
     content: JSON.stringify(innerBody),
   });
   try {
-    const res = larkExecSend(
+    const res = await larkExecSend(
       [
         'api',
         'PUT',
@@ -1400,14 +1403,14 @@ export function updateMessage(
  * (topic mode) this avoids being treated as a new topic and the reply appears in the original thread; in a
  * regular group it becomes an in-thread reply to that message.
  */
-export function replyText(
+export async function replyText(
   messageId: string,
   text: string,
   opts: { as?: 'user' | 'bot'; profile?: string; inThread?: boolean } = {}
-): { ok: boolean; messageId?: string } {
+): Promise<{ ok: boolean; messageId?: string }> {
   const asArgs = opts.as ? ['--as', opts.as] : [];
   const threadArgs = opts.inThread ? ['--reply-in-thread'] : [];
-  const res = larkExecSend(
+  const res = await larkExecSend(
     [
       'im',
       '+messages-reply',
@@ -1433,12 +1436,12 @@ export function replyText(
  * message can only be recalled by its sender, so use the identity that sent it (events are bot-sent,
  * so `as` defaults to 'bot'). Returns { ok, error } rather than throwing, so callers can report.
  */
-export function recallMessage(
+export async function recallMessage(
   messageId: string,
   opts: { as?: 'user' | 'bot'; profile?: string } = {}
-): { ok: boolean; error?: string } {
+): Promise<{ ok: boolean; error?: string }> {
   const asArgs = ['--as', opts.as ?? 'bot'];
-  const res = larkExec(
+  const res = await larkExec(
     ['im', 'messages', 'delete', '--message-id', messageId, ...asArgs, '--yes', '--format', 'json'],
     { profile: opts.profile }
   );
@@ -1454,13 +1457,13 @@ export function recallMessage(
  * for later removal. This is best-effort: when the permission is not enabled or emoji_type is invalid it returns
  * null instead of throwing, so the reply flow is unaffected.
  */
-export function addReaction(
+export async function addReaction(
   messageId: string,
   emojiType: string,
   opts: { as?: 'user' | 'bot'; profile?: string } = {}
-): string | null {
+): Promise<string | null> {
   const asArgs = opts.as ? ['--as', opts.as] : [];
-  const res = larkExec(
+  const res = await larkExec(
     [
       'im',
       'reactions',
@@ -1480,13 +1483,13 @@ export function addReaction(
 }
 
 /** Remove a previously added emoji reaction (by reaction_id); can only remove ones you added. Returns false on failure, does not throw. */
-export function removeReaction(
+export async function removeReaction(
   messageId: string,
   reactionId: string,
   opts: { as?: 'user' | 'bot'; profile?: string } = {}
-): boolean {
+): Promise<boolean> {
   const asArgs = opts.as ? ['--as', opts.as] : [];
-  const res = larkExec(
+  const res = await larkExec(
     [
       'im',
       'reactions',
@@ -1507,9 +1510,9 @@ export function removeReaction(
  * returns true on success (envelope code 0), false on any failure (bot not in the chat, missing scope,
  * message deleted, …) and never throws — safe to call from a poll loop. Needs the bot to be in the chat.
  */
-export function pinMessage(messageId: string, opts: { as?: 'user' | 'bot'; profile?: string } = {}): boolean {
+export async function pinMessage(messageId: string, opts: { as?: 'user' | 'bot'; profile?: string } = {}): Promise<boolean> {
   const asArgs = opts.as ? ['--as', opts.as] : [];
-  const res = larkExec(
+  const res = await larkExec(
     ['im', 'pins', 'create', '--data', JSON.stringify({ message_id: messageId }), ...asArgs, '--format', 'json'],
     { profile: opts.profile }
   );
@@ -1520,9 +1523,9 @@ export function pinMessage(messageId: string, opts: { as?: 'user' | 'bot'; profi
  * Remove a message's pin (Feishu "移除 Pin 消息", native `im pins delete`). The CLI requires the --yes
  * confirmation flag (a client-side gate, not sent to the backend). Best-effort boolean, never throws.
  */
-export function unpinMessage(messageId: string, opts: { as?: 'user' | 'bot'; profile?: string } = {}): boolean {
+export async function unpinMessage(messageId: string, opts: { as?: 'user' | 'bot'; profile?: string } = {}): Promise<boolean> {
   const asArgs = opts.as ? ['--as', opts.as] : [];
-  const res = larkExec(
+  const res = await larkExec(
     ['im', 'pins', 'delete', '--params', JSON.stringify({ message_id: messageId }), '--yes', ...asArgs, '--format', 'json'],
     { profile: opts.profile }
   );
@@ -1555,7 +1558,7 @@ export interface CreatedCalendarEvent {
  * recurrence must be an RFC 5545 RRULE string (e.g. "FREQ=WEEKLY;BYDAY=TH;COUNT=10"); omit
  * or leave empty for a one-off event. Timestamps are Unix seconds (integer strings to the API).
  */
-export function createCalendarEvent(opts: {
+export async function createCalendarEvent(opts: {
   calendarId: string;
   title: string;
   startTimeSec: number;
@@ -1566,7 +1569,7 @@ export function createCalendarEvent(opts: {
   profile?: string;
   /** open_id of the organizer to add as an accepted attendee (so they don't show as "not attending"). */
   organizerOpenId?: string;
-}): CreatedCalendarEvent | null {
+}): Promise<CreatedCalendarEvent | null> {
   const data: Record<string, unknown> = {
     summary: opts.title,
     start_time: { timestamp: String(opts.startTimeSec) },
@@ -1579,7 +1582,7 @@ export function createCalendarEvent(opts: {
 
   let res: any;
   try {
-    res = larkExec(
+    res = await larkExec(
       ['calendar', 'events', 'create',
         '--calendar-id', opts.calendarId,
         '--data', JSON.stringify(data),
@@ -1599,14 +1602,14 @@ export function createCalendarEvent(opts: {
   // Add the organizer as an accepted attendee. Attendees can't be set in the create body, and an
   // event with an empty attendee list shows the organizer as "not attending" in the Feishu UI.
   if (opts.organizerOpenId) {
-    addEventAttendees(opts.calendarId, rawEventId, [opts.organizerOpenId], { profile: opts.profile });
+    await addEventAttendees(opts.calendarId, rawEventId, [opts.organizerOpenId], { profile: opts.profile });
   }
 
   const eventId = recurringSeriesKey(rawEventId);
   const meetupUrl = typeof ev?.vchat?.meeting_url === 'string' ? ev.vchat.meeting_url : '';
   const appLink = typeof ev?.app_link === 'string' ? ev.app_link : '';
   // Fetch the public calendar share link for the created series (uses the raw _0 occurrence id).
-  const shareLink = getEventShareLink(opts.calendarId, rawEventId, { profile: opts.profile });
+  const shareLink = await getEventShareLink(opts.calendarId, rawEventId, { profile: opts.profile });
   return { eventId, meetupUrl, appLink, shareLink };
 }
 
@@ -1616,11 +1619,11 @@ export function createCalendarEvent(opts: {
  * (an empty attendee list makes the Feishu UI show the organizer as "not attending"). Best-effort:
  * returns true on code===0, false otherwise; never throws.
  */
-export function addEventAttendees(calendarId: string, eventId: string, openIds: string[], opts: { profile?: string } = {}): boolean {
+export async function addEventAttendees(calendarId: string, eventId: string, openIds: string[], opts: { profile?: string } = {}): Promise<boolean> {
   if (openIds.length === 0) return false;
   const data = { attendees: openIds.map((id) => ({ type: 'user', user_id: id })), need_notification: false };
   try {
-    const res = larkExec(
+    const res = await larkExec(
       ['calendar', 'event.attendees', 'create',
         '--calendar-id', calendarId, '--event-id', eventId,
         '--user-id-type', 'open_id', '--data', JSON.stringify(data),
@@ -1647,21 +1650,21 @@ function occurrenceEventId(eventId: string): string {
   return eventId.includes('_') ? eventId : `${eventId}_0`;
 }
 
-export function updateCalendarEvent(opts: {
+export async function updateCalendarEvent(opts: {
   eventId: string;
   summary?: string;
   startIso?: string;
   endIso?: string;
   rrule?: string;
   profile?: string;
-}): boolean {
+}): Promise<boolean> {
   const args = ['calendar', '+update', '--event-id', occurrenceEventId(opts.eventId), '--as', 'user', '--format', 'json'];
   if (opts.summary) { args.push('--summary', opts.summary); }
   if (opts.startIso) { args.push('--start', opts.startIso); }
   if (opts.endIso) { args.push('--end', opts.endIso); }
   if (opts.rrule) { args.push('--rrule', opts.rrule); }
   try {
-    const res = larkExec(args, { profile: opts.profile });
+    const res = await larkExec(args, { profile: opts.profile });
     return isLarkOk(res);
   } catch {
     return false;
@@ -1673,13 +1676,13 @@ export function updateCalendarEvent(opts: {
  * bare stored series UUID is normalized to <UUID>_0, which removes the entire recurring series (a full
  * occurrence id deletes only that instance). Uses --as user. Returns true on success (code===0).
  */
-export function cancelCalendarEvent(
+export async function cancelCalendarEvent(
   calendarId: string,
   eventId: string,
   opts: { profile?: string } = {}
-): boolean {
+): Promise<boolean> {
   try {
-    const res = larkExec(
+    const res = await larkExec(
       ['calendar', 'events', 'delete',
         '--calendar-id', calendarId,
         '--event-id', occurrenceEventId(eventId),
@@ -1756,7 +1759,7 @@ function parseConsumeError(stderr: string): { message: string; hint?: string } |
  */
 export function consumeEvents(
   profile: string | undefined,
-  onEvent: (ev: Record<string, any>) => void,
+  onEvent: (ev: Record<string, any>) => void | Promise<void>,
   opts: { eventKey?: string; onReady?: () => void } = {}
 ): EventConsumer {
   const run = resolveLarkRun();
@@ -1768,6 +1771,11 @@ export function consumeEvents(
   let running = true;
   let child: ChildProcess | undefined;
   let backoffMs = BASE_BACKOFF_MS;
+  // Serializes possibly-async onEvent calls so events are processed strictly one at a time, in
+  // arrival order — the same ordering guarantee a synchronous onEvent gave for free. Without this,
+  // a slow async handler (e.g. one awaiting a DB round-trip) would let the next 'line' event start
+  // its own onEvent call before the previous one finishes, interleaving two events' side effects.
+  let eventChain: Promise<void> = Promise.resolve();
 
   // A child that ran at least STABLE_MS (including every clean --timeout recycle) reconnects fast at
   // the base interval; a fast failure (bad scope / already-connected) backs off to avoid flooding.
@@ -1803,7 +1811,11 @@ export function consumeEvents(
           return;
         }
         backoffMs = BASE_BACKOFF_MS; // Reset backoff once an event is successfully received
-        onEvent(ev);
+        eventChain = eventChain
+          .then(() => onEvent(ev))
+          .catch((e) => {
+            log.error(`event handler failed: ${(e as Error)?.message ?? e}`);
+          });
       });
     }
     // Both info and errors from the event subprocess go through stderr (including ok:false subscription/permission validation errors);
