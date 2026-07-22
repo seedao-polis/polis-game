@@ -1,0 +1,14 @@
+services:
+  # Local-only PostgreSQL for `pnpm test` isolation. Never used in production; the real target is
+  # the remote feishu_biz database configured via AGENT_PG_URL in .env. Version pinned to match the
+  # production server's PostgreSQL 15.x line.
+  pg-test:
+    image: postgres:15.18
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: tudigong_test
+    ports:
+      - "15432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data # test-only, no persistence needed
