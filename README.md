@@ -166,7 +166,7 @@ agent tg-test [消息...]                       发一条测试消息到 Telegra
 
 ## 采集与数据
 
-服务在后台持续采集，落地到本地 SQLite（`.agent/`，schema 自动迁移）：
+服务在后台持续采集，落地到数据库（schema 自动迁移）。**默认 SQLite（`.agent/`）**；`tudigong` 已迁到远端 PostgreSQL（其余 soul 仍留 SQLite），两种后端由同一套 `SqlExecutor` 抽象透明支撑，并带断线容错（断路器 + LP 暂拒 + 遥测降级队列）——细节见 `pg-migration-playbook.md`：
 
 - **群成员名册 / 同步时序**（每 5 分钟）：在群 / 新增 / 离开 / 改名、去重人数。
 - **活动报名时序**（每 5 分钟）：飞书日历未开始活动的报名 / 拒绝 / 待定 / 待回复，变化才记。
@@ -234,7 +234,7 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt   # matplotlib + netwo
 
 ## 知识库 / 开发约定
 
-项目的操作经验与踩坑沉淀在 **`workspaces/tudigong/memory/`**（默认 soul）。先读 `memories.md` 索引，再按需打开对应 playbook：lark-cli、执行器（agent-executor）、本地库、事件系统、LP（pt-gamification）、Telegram、**徽章系统（badge-system）**、**社区推播事件（community-notify-events）**、**运营数据报告（ops-report）**、**社区动态周报（weekly-report）**、**点赞封神方案草案（like-ascension-proposal，点赞狂魔升级 · 未开发）**、**多人多群组记忆管理 + 群组三级分类（memory-access）**、**技能系统装载（agent-skill）**、**共用 skill 创作房规（skill-authoring）**、**身份 / 品牌标识（identity-branding，改代表 emoji 等视觉标识：源头在 IDENTITY.md、部分硬编码在 events.ts / agents.json）**、**seedaodb 数据库网关工具（seedaodb-tool，`tools/` 下独立 Rust 服务端 + 客户端、与框架解耦、只共享 SQLite 文件）**。**改动飞书 / 数据 / 大脑相关代码前先读它。** 约定：日志用简体中文 + 大陆用语、不带 emoji；代码注释用英文。
+项目的操作经验与踩坑沉淀在 **`workspaces/tudigong/memory/`**（默认 soul）。先读 `memories.md` 索引，再按需打开对应 playbook：lark-cli、执行器（agent-executor）、本地库、**SQLite→PostgreSQL 迁移 + 断线容错（pg-migration，tudigong 已割接、含断路器/LP 暂拒/遥测降级队列；⚠️同步阻塞调用会饿死 async DB 这条教训务必读）**、事件系统、LP（pt-gamification）、Telegram、**徽章系统（badge-system）**、**社区推播事件（community-notify-events）**、**运营数据报告（ops-report）**、**社区动态周报（weekly-report）**、**点赞封神方案草案（like-ascension-proposal，点赞狂魔升级 · 未开发）**、**多人多群组记忆管理 + 群组三级分类（memory-access）**、**技能系统装载（agent-skill）**、**共用 skill 创作房规（skill-authoring）**、**身份 / 品牌标识（identity-branding，改代表 emoji 等视觉标识：源头在 IDENTITY.md、部分硬编码在 events.ts / agents.json）**、**seedaodb 数据库网关工具（seedaodb-tool，`tools/` 下独立 Rust 服务端 + 客户端、与框架解耦、只共享 SQLite 文件）**。**改动飞书 / 数据 / 大脑相关代码前先读它。** 约定：日志用简体中文 + 大陆用语、不带 emoji；代码注释用英文。
 
 **升级 lark-cli 后先跑 `pnpm lark:contract`。** lark-cli 会静默改输出、编译不会报错：1.0.69 同时改了成功信封（`{code:0}` → `{ok:true}`）和 `+` 便捷命令的时间格式（`create_time` 从 epoch 变成 `"2026-07-17 14:51"`），后者让一个功能安静地死了两周。这个检查拿真实输出喂进我们真正在用的解析器，格式变了但还解析得动就算过，解析不动才红。凡是吃 CLI 输出的时间，一律走 `larkTimeToMs()`，别写裸 `Number()`；判成功一律 `isLarkOk()`，别写裸 `res.code`。细节见 `lark-cli-playbook.md` §11 / §11.1。
 

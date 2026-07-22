@@ -159,3 +159,42 @@
 - **测试**：`src/core/commands.test.ts`（模糊签到 + 改名端到端）、`name-overrides.test.ts` 补了自助层与优先级用例（都要 `AGENT_DB_PATH` 隔离，因 `applyNameOverride` 现在会读库）。
 - **上线**：改了 `db.ts`（+migration v27）与核心命令层 → **要完整重启 serve** 才生效（`pnpm agent update`；新 worker 开库自动迁移）。
 - **已知取舍**：模糊签到只看结尾是否 `签`/`签到`（`$` 锚定），所以带尾标点的"我要怎么签到？"**不会**被判成签到；但不带标点、结尾正好是"签到"的短句（如"我该怎么签到"）会——按操作者明确要求的启发式实现；如需再收紧告诉我。
+
+## 12. LP 帐本迁移到 PostgreSQL
+
+> 完整迁移细节（架构决策、驱动选型、双后端设计、逐档改法、ETL 脚本、正式割接手册）独立成册：`pg-migration-playbook.md` + `local-db-playbook.md §11`。这里只记 LP 经济这条主线该知道的结论。
+
+- **`spendPt()` 原子化重写**：SQLite 时代靠单文件锁天然序列化"查余额→扣款"这两步；PostgreSQL 是真并发连线池，原本的 check-then-act 会有竞态（两笔并发的扣款都读到"够扣"，都真的扣下去，余额可能变负）。改法是**一条带条件的 UPDATE 顶到底**：
+  ```sql
+  UPDATE profiles SET pt_balance = pt_balance - $1
+    WHERE open_id = $2 AND pt_balance >= $1
+    RETURNING pt_balance
+  ```
+  这条 UPDATE 本身就是原子的（MVCC 下同一行的并发 UPDATE 会自动排队），`RETURNING` 有没有回到行就是"这笔扣款有没有成功"的唯一真相——不再需要额外查一次余额。**专属并发测试**：`gamification.pg.test.ts` 对一个 100 LP 的帐户并发跑两笔各 60 LP 的 `spendPt`，断言恰好一笔成功、余额精确落在 40（不会变负、不会双扣）。
+- **§0 拍板决策"所有 LP 变动一律走 `grantPt`/`spendPt`/`checkIn`，绝不直接 `UPDATE profiles`"这条不变量在 PostgreSQL 版本下依然成立**——`ledgerRaw`（写 `pt_ledger`）仍是唯一的写入收口，`spendPt` 的原子 UPDATE 也只改自己的余额栏位、紧接着照样写一笔 `pt_ledger` 记录，帐本仍是唯一事实来源（呼应 §6.1）。
+- **`cmd_lp_migrate`（原 `pnpm agent lp-migrate`）已废弃**：这个命令原本是靠 `node:sqlite` 的 `ATTACH DATABASE` 把某个 soul 库的 LP 集群整批 `INSERT OR IGNORE` 种进 `.agent/shared.db`（§9 提到的"首次已跑过"那次）。`ATTACH DATABASE` 是 SQLite 专属语法，PostgreSQL 没有对应物，也不再需要——LP 迁移到 PostgreSQL 后不会再有"新 soul 库要种进共享库"这种场景（新 soul 直接对着同一个 PostgreSQL `shared` schema）。现在这个命令一旦侦测到 `AGENT_PG_URL` 已设定就直接报错拒跑（防呆闸门），避免有人误跑对着 PostgreSQL 时代的帐本做一次性 SQLite 专属迁移操作。
+- **`cmd_link`（`pnpm agent link`）重写后的新程式码形状**：原本直接用 SQLite `?` 占位符对 `getLpDb()` 拿到的原始 handle 下 `.prepare().run()`；现在改用 `lpTx()` 包住整段（`DELETE FROM pt_ledger/checkins/user_badges/profiles WHERE user_open_id = $1` + `UPDATE/INSERT identity_links` 这一串在同一笔交易里做完，同 PostgreSQL 也同 SQLite），SQL 文字全部改 `$N` 占位符、经由 `SqlExecutor.query()` 下达。行为不变（把 `from` 的 LP 归并到 `to` 的 canonical、`from` 自己的 LP 作废），只是底层执行路径换了。
+- **实际验收数字**：ETL 脚本（`scripts/etl-shared-to-pg.mjs`）做金额分毫不差检查（`SUM(delta)` 与 `SUM(pt_balance)` 两边各自相等、且互相相等）。dry-run 当时是 5315.8、**正式割接（2026-07-22）当时是 5441.8**——都是当次跑的即时结果、不是写死的期望值（生产一直在写、金额随时间变，验证逻辑是"跟 SQLite 现况比对"而非"跟历史数字比对"）。
+- **✅ 正式割接已执行（2026-07-22）**：LP 帐本现在跑在 PostgreSQL `shared` schema 上。**割接后踩到一个关键性能坑（同步 `execFileSync` 饿死事件循环、拖慢所有 async PG 查询）已根治**——完整经过、诊断日志、两台手术、回滚方式全在 `pg-migration-playbook.md §6/§7`（那份是 PG 迁移这条线的权威册，找命令/找教训去那份）。
+
+## 13. 停机漏签的补签套路（2026-07-21 实战定案）
+
+场景：tudigong 停机窗口内有人在签到话题里 `@城邦土地神 签到`，没回复也没入帐。重启后 G2 补扫**救不了**这种情况——它的扫描窗口是 `sinceMs = max(now-30min, epoch)`（防刷屏，见 `community-notify-events-playbook.md §17`），停机超过 30 分钟的漏 @ 不会自动补回，只能手动。原则：**完整复刻 `commands.ts` sign 命令的确定性流程**（LP 入帐 + 话题内回复 + activity + handled 标记四件套），不是只补 LP。
+
+1. **确认没签过**（幂等前置）：`sqlite3 .agent/shared.db "SELECT 1 FROM checkins WHERE user_open_id='<ou_>' AND checkin_date=date('now','localtime')"` 空=没签。名字反查 open_id：`chat_members` 或 `profiles`。
+2. **定位那条消息拿 message_id**：⚠️ 签到都发生在**话题串**里，`im +chat-messages-list`（容器视图）**看不到**话题内回复——实测漏签消息在容器列表完全不出现（同一人几分钟后发的顶层消息反而在），本地 `messages` 表也没有（停机期间采集同样断了）。套路：从话题根消息（当天第一条 `@土地神 签` 会出现在容器列表、带 thread_id `omt_...`）拿到 thread_id → `listThreadMessages(threadId)`（`im +threads-messages-list`）遍历找目标消息的 `message_id`。
+3. **一次性脚本重放**（`AGENT_SOUL=tudigong node --env-file=.env <script>`，import `dist/core/store.js` + `dist/core/lark.js`）：
+   ```js
+   const r = await store.checkIn(openId);          // 幂等闸门：r.firstToday=false 就中止、别发消息
+   const reply = '在 SeeDAO 数字城邦签到' + (await store.buildStatusFooter(openId, r.awarded));
+   replyText(msgId, reply, { as: 'bot', inThread: true });  // 话题内 + bot 身份，格式与正常签到零差异
+   await store.recordActivity('command', openId, chatId, msgId, { command: 'sign', args: [] });
+   await store.markMessageHandled(msgId);          // 防未来 backfill 重回这条
+   ```
+4. **验证**：`pt_ledger` 多一笔 `daily_checkin +3`、`checkins` 当日恰一笔、`profiles.pt_balance` +3。
+
+注意事项：
+- **只能补"当天"的漏签**：`checkIn` 以执行当下的本地日历日为键（§5），跨日后再跑会记成新一天的签到而不是补昨天。真要补历史日期只能手动 `grantPt` + 手写 `checkins` 行，慎用。
+- serve 正在跑也能直接补（SQLite WAL 并发无碍）；`replyText` 走 `larkExecSend` 自带 429 退避，不经过 outbound-guard（那是 MCP `feishu_send` 的闸门，CLI/脚本路径本来就不走）。
+- 通用化：同样的"确定性命令重放"思路适用于所有纯 code 命令（sign/profile/follow 等）——查 DB 确认没处理过 → API 找 message_id → 调对应 store 函数 → 复刻回复文案 → 补 activity/handled 标记。订阅类的先例见 `community-notify-events-playbook.md §17` 手动补回段。
+- 实战记录：Sean `ou_d393dd21d9777070ec86b4ea21c4fda4` 15:48 漏签，21:51 补，191.9 → 194.9，回复消息 `om_x100b6ac3dbc938acc445fe3dc030e18`。

@@ -53,6 +53,7 @@
 - **边界**：这是外部 CLI 的**行为观察、不是契约保证**。升级执行器后若依赖 env 的功能出现异常（如 LP 尾注数字不对），**先重跑下面的探针复验**。
 - **复验探针（可重跑）**：写一个最小 MCP stdio server（手搓 JSON-RPC 即可、不必依赖 MCP SDK，避开模块解析问题），只注册一个工具回传它**在进程启动时**从 env 读到的值——**必须在模块顶层读**，才和 `mcp-server.ts` 的失效模式一致。然后：写 `mcp.json`（env=A）→ 跑第 1 轮 → 改写 `mcp.json`（env=B）→ 带 `--continue` 跑第 2 轮 → 看第 2 轮拿到 A 还是 B。拿到 B＝每轮重读（假设成立）；拿到 A＝被定格（假设不成立）。**判读标准要在跑之前先定死**，别事后合理化。完整脚本与原始输出见 `thoughts/shared/research/2026-07-16-lp-net-change-per-turn.md` 附录 A。
 - **两个探针踩坑**：① **macOS 没有 `timeout` 命令**（那是 GNU coreutils 的 `gtimeout`），脚本包了 `timeout 180` 会直接 `exit=127`，**看起来像执行器挂了、其实根本没跑到**；② 探针写到 stderr 的诊断**不会出现在执行器的 stderr**（`--output-format stream-json` 下执行器自己的 stderr 也是空的），所以拿不到 pid 佐证，只能靠回传值变化推——但回传值变化本身已是充分证据（值若被定格必然不变）。
+- **⚠️ PostgreSQL 迁移的防御性 env 转送（2026-07-21，尚未端到端实测）**：`src/core/paths.ts` 的 `buildAgentMcpConfig` 组 MCP 子行程的 `env` 时，明确把 `AGENT_PG_URL`/`AGENT_PG_POOL_MAX`（有设才写）也塞进去，跟既有 `AGENT_SOUL`/`LARK_PROFILE`/`AGENT_TURN_REF` 同一套写法——起因是**没验证过执行器把 `mcp.json` 的 `env` 当成子行程的完整环境变数是"取代"还是跟自己（执行器本身）的环境变数"合并"**，穩健做法是不管哪种语意都显式带上，避免 MCP 子行程（`pt_grant` 等会写 LP 的工具就跑在里面）在父行程明明有 `AGENT_PG_URL` 时反而读不到、悄悄退回 SQLite。**这条本身沿用的是本节"mcp.json 每轮重读"的既有结论，不是新发现**；真正没验证的是"取代 vs 合并"这个问题本身——因为要端到端验证需要**真的处于 PostgreSQL 已上线的状态**下触发一次 `pt_grant` 调用并观察子行程连线，而截至目前（PG 迁移代码与 ETL 已就绪，正式割接尚未执行，见 `pg-migration-playbook.md`）还没有这个窗口。**待正式割接执行后，找一次 LLM 主动调用 `pt_grant` 的真实对话轮，确认 MCP 子行程真的连上了 PostgreSQL**（可在 `mcp-server.ts` 暂时加一行 `process.stderr.write` 除错、验证后移除），把结论回填到这里。
 
 ## 5. node 运行环境
 

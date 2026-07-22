@@ -27,6 +27,7 @@
 - 两颗库跑**同一份** `runMigrations()`，所以物理上 schema 完全相同（`/tables` 对 soul/shared 返回同一张表清单）；「哪张表该读哪颗」纯属应用约定，非 schema 强制。
 - 都是 **WAL 模式**。**⚠️ per-soul `getDb()` 没设 `busy_timeout`，只有 shared 的 `getLpDb()` 设了 5000ms**（`src/core/db.ts`）——seedaodb 一旦写入就是 serve worker + supervisor + MCP 子进程之外的第三方写者，所以 seedaodb 端**必须**自己设 `busy_timeout` + 退避。
 - **⚠️ 写 shared.db（LP 账本）会绕过主程序 `grantPt()` 记账**（`pt_ledger` append-only + `profiles.pt_balance` 派生），造成账本/余额不一致。**双层保护**：datasources 里把 `shared` 设 `readonly=true`（连接层只读，连 admin 也挡下，实测报 500 DATABASE_ERROR），且 ACL 只给 admin 写 shared；`soul` 才 `readonly=false`。要放开 shared 写入是刻意动作，改 `readonly=false`。
+- **⚠️ `shared.db`／`tudigong.db` 有一份 PostgreSQL 迁移计划已在 2026-07-21 完成代码与 ETL 验证**（`feishu_biz` 库的 `shared`/`soul_tudigong` schema，见 `pg-migration-playbook.md`），**但截至目前正式割接尚未执行**——tudigong 生产行程仍在跑本节说的这两颗 SQLite 档案，`tools/seedaodb` 目前读到的就是**即时生产数据**，不是冻结快照。**等正式割接真的执行之后**（详见 `pg-migration-playbook.md` 的执行手册），这两颗 `.agent/*.db` 会改唯读权限、封存至少 30 天，届时 `tools/seedaodb` 读到的才会变成"迁移前的冻结快照"，需要另外接上 PostgreSQL 才能读到即时数据（`tools/seedaodb` 本身尚未规划接 PG，见该 playbook 的后续工作）——**维护者看到这份 playbook 时请先确认割接是否已执行**（检查 `.agent/tudigong.db` 的档案权限，或问操作者），别想当然套用旧结论。
 
 ## 4. 客户端（seedaodb-client）
 
