@@ -127,9 +127,9 @@ export class FeishuBotChannel implements Channel {
     // Download a message's file attachment on demand (cached) so its content can be inlined for the LLM.
     // 'bot' for files delivered to us as events (the bot was @-mentioned → can read its resources);
     // 'user' for files pulled from chat history (never delivered to the bot, only the user token sees them).
-    const fetchFile = (messageId: string, fileKey: string, fileName: string): string | null =>
+    const fetchFile = (messageId: string, fileKey: string, fileName: string): Promise<string | null> =>
       downloadMessageResource(messageId, fileKey, { type: 'file', profile, fileName, as: 'bot' });
-    const fetchFileFromHistory = (messageId: string, fileKey: string, fileName: string): string | null =>
+    const fetchFileFromHistory = (messageId: string, fileKey: string, fileName: string): Promise<string | null> =>
       downloadMessageResource(messageId, fileKey, { type: 'file', profile, fileName, as: 'user' });
     // 静默模式（serve --quiet → AGENT_QUIET）：照常采集消息、记录互动、触发同步等，但绝不回复任何
     // 飞书 p2p/群/@，也不调用 LLM（不耗 kimi、不扣 LP、不加表情）。CLI 频道是独立进程，不受影响。
@@ -144,7 +144,7 @@ export class FeishuBotChannel implements Channel {
         : `${cfg.id}-${cid}-${senderOpenId}`;
 
     // Context assembly (recent window + pinned reply quote) lives in core/reply-context.ts.
-    const resolveName = (openId: string): string => store.memberName(openId);
+    const resolveName = (openId: string): Promise<string> => store.memberName(openId);
 
     // ── serial reply worker ─────────────────────────────────────
     // Replies are generated one at a time (a kimi turn can run minutes). Receiving stays async, so a
@@ -160,27 +160,27 @@ export class FeishuBotChannel implements Channel {
     const replyCounts = new Map<string, number>();
     const SUMMARY_INTERVAL = 8;
 
-    const setReaction = (job: BotJob, to: 'coffee' | 'thinking'): void => {
+    const setReaction = async (job: BotJob, to: 'coffee' | 'thinking'): Promise<void> => {
       if (!job.messageId || job.reaction === to) return;
       const emoji = to === 'coffee' ? cfg.queuedReactionEmoji : cfg.reactionEmoji;
       try {
         if (job.reactionId) {
-          removeReaction(job.messageId, job.reactionId, { as: 'bot', profile });
+          await removeReaction(job.messageId, job.reactionId, { as: 'bot', profile });
           job.reactionId = null;
         }
-        job.reactionId = addReaction(job.messageId, emoji, { as: 'bot', profile });
+        job.reactionId = await addReaction(job.messageId, emoji, { as: 'bot', profile });
         job.reaction = to;
         // Persist the live reaction id so a restart can clear this orphaned reaction.
-        if (job.pendingId) store.updatePendingReply(job.pendingId, { reactionId: job.reactionId });
+        if (job.pendingId) await store.updatePendingReply(job.pendingId, { reactionId: job.reactionId });
       } catch {
         /* reactions are best-effort; never block a reply on them */
       }
     };
 
-    const clearReaction = (job: BotJob): void => {
+    const clearReaction = async (job: BotJob): Promise<void> => {
       try {
         if (job.messageId && job.reactionId) {
-          removeReaction(job.messageId, job.reactionId, { as: 'bot', profile });
+          await removeReaction(job.messageId, job.reactionId, { as: 'bot', profile });
         }
       } catch {
         /* best-effort */
@@ -189,7 +189,7 @@ export class FeishuBotChannel implements Channel {
       job.reaction = null;
     };
 
-    const send = (messageId: string | undefined, chatId: string, reply: string, isP2p: boolean): void => {
+    const send = async (messageId: string | undefined, chatId: string, reply: string, isP2p: boolean): Promise<void> => {
       if (!reply) return;
       if (quiet) { log.info(`quiet 模式：不发送回复（${preview(reply)}）`); return; }
       try {
@@ -198,12 +198,12 @@ export class FeishuBotChannel implements Channel {
         // send when there is no message_id.
         // Bot identity already shows the agent's display name in Feishu, so a reply needs no name prefix
         // (replyPrefix is for the user channel, where messages appear under the operator's own account).
-        if (isP2p) sendText({ chatId }, reply, { as: 'bot', profile });
+        if (isP2p) await sendText({ chatId }, reply, { as: 'bot', profile });
         // peerCast agents post group replies at the top level (not inside the @-message thread) so the
         // cross-agent exchange reads as a normal group chat rather than a buried topic thread.
-        else if (cfg.peerCast) sendText({ chatId }, reply, { as: 'bot', profile });
-        else if (messageId) replyText(messageId, reply, { as: 'bot', profile, inThread: true });
-        else sendText({ chatId }, reply, { as: 'bot', profile });
+        else if (cfg.peerCast) await sendText({ chatId }, reply, { as: 'bot', profile });
+        else if (messageId) await replyText(messageId, reply, { as: 'bot', profile, inThread: true });
+        else await sendText({ chatId }, reply, { as: 'bot', profile });
         const { body, footer } = store.splitStatusFooter(reply);
         log.info(`已回复：${preview(body)}`);
         if (footer) log.info(`尾部状态：${footer}`);
@@ -235,12 +235,12 @@ export class FeishuBotChannel implements Channel {
         // LP gating: deduct before calling the LLM; refund on error; show balance in footer on success.
         const strategy = loadLpStrategy(cfg.soul);
         const cost = strategy.cost;
-        const spent = store.spendPt(job.senderOpenId, cost, 'llm_reply', job.messageId ?? undefined);
+        const spent = await store.spendPt(job.senderOpenId, cost, 'llm_reply', job.messageId ?? undefined);
         if (!spent) {
           reply = '你的 LP 不足，明天 05:00 会自动补到 10，或完成任务赚取。';
         } else {
           // Record the charge so a restart mid-reply can refund it before re-running.
-          if (job.pendingId) store.updatePendingReply(job.pendingId, { ptSpent: true });
+          if (job.pendingId) await store.updatePendingReply(job.pendingId, { ptSpent: true });
           try {
             // Turn number for this reply (1-based, per session); injected into the prompt so the
             // persona can pace turn-based behaviors (e.g. periodic interview-progress updates).
@@ -258,15 +258,15 @@ export class FeishuBotChannel implements Channel {
             // Classify the reply, grant bonus LP if applicable, then build the footer with the net delta.
             const { category, reply: judged } = judgeReply(reply, strategy);
             if (category.grant > 0) {
-              store.grantPt(job.senderOpenId, category.grant, category.reason, job.messageId ?? undefined);
+              await store.grantPt(job.senderOpenId, category.grant, category.reason, job.messageId ?? undefined);
             }
             // Prefer the ledger's own per-turn total (SUM over ref_message_id) so any LP change the
             // model made mid-turn via the pt_grant MCP tool is reflected too; fall back to the
             // framework's own two-entry delta when there is no message id to key the lookup off of.
             const netDelta = job.messageId
-              ? store.netPtChangeForRef(job.messageId, job.senderOpenId)
+              ? await store.netPtChangeForRef(job.messageId, job.senderOpenId)
               : category.grant - cost;
-            reply = store.stripStatusFooter(judged) + store.buildStatusFooter(job.senderOpenId, netDelta, category.footerLabel || undefined);
+            reply = store.stripStatusFooter(judged) + (await store.buildStatusFooter(job.senderOpenId, netDelta, category.footerLabel || undefined));
             replyOk = true;
 
             // Fire-and-forget rolling user memory summary every SUMMARY_INTERVAL successful replies.
@@ -279,7 +279,7 @@ export class FeishuBotChannel implements Channel {
             // Detail (classification, postmortem, ledger) is already logged inside respondAsync(); here
             // we only refund LP and hand the user a short, internal-detail-free notice.
             log.error('agent 回复失败（已回退通用回复）：', (e as Error).message);
-            store.grantPt(job.senderOpenId, cost, 'refund_on_error', job.messageId ?? undefined);
+            await store.grantPt(job.senderOpenId, cost, 'refund_on_error', job.messageId ?? undefined);
             reply = '（抱歉，我这边出错了，请稍后再试。）';
           }
         }
@@ -343,7 +343,7 @@ export class FeishuBotChannel implements Channel {
               } catch { /* config unavailable */ }
 
               if (activityCalendarId) {
-                const created = createCalendarEvent({
+                const created = await createCalendarEvent({
                   calendarId: activityCalendarId,
                   title: intent.title,
                   startTimeSec: startSec,
@@ -355,7 +355,7 @@ export class FeishuBotChannel implements Channel {
                   organizerOpenId: userOpenIdForProfile(profile),
                 });
                 if (created) {
-                  const meetupDbId = insertMeetup({
+                  const meetupDbId = await insertMeetup({
                     larkEventId: created.eventId,
                     title: intent.title,
                     description: intent.description ?? '',
@@ -369,7 +369,7 @@ export class FeishuBotChannel implements Channel {
                     createdBy: job.senderOpenId,
                   });
                   const tagList = Array.isArray(intent.tags) ? intent.tags.filter(Boolean) : [];
-                  if (tagList.length > 0) setMeetupTags(meetupDbId, tagList);
+                  if (tagList.length > 0) await setMeetupTags(meetupDbId, tagList);
 
                   // Append a deterministic footer to the LLM reply: calendar link, VC link, and a
                   // tag/subscribe hint so other members know how to follow this activity's tag.
@@ -389,7 +389,7 @@ export class FeishuBotChannel implements Channel {
                   if (footer.length > 0) reply = `${reply}\n\n${footer.join('\n')}`.trimEnd();
 
                   // Mirror the change to the "SeeDAO 活动日历" wiki page immediately (deterministic, no LLM).
-                  refreshMeetupWiki({ profile });
+                  await refreshMeetupWiki({ profile });
                   log.info(`活动会议已创建：id=${meetupDbId}  title=${intent.title}  vc=${created.meetupUrl}`);
                 } else {
                   log.warn(`MEETUP_CREATE：飞书日历创建失败（title=${intent.title}）`);
@@ -438,7 +438,7 @@ export class FeishuBotChannel implements Channel {
                 : (Number.isFinite(intent.endTimeSec as number) && (intent.endTimeSec as number) > nowSec + 60
                     ? (intent.endTimeSec as number)
                     : nowSec + 86400);
-              const { id: tcId, num } = insertTcProposal({
+              const { id: tcId, num } = await insertTcProposal({
                 title: intent.title,
                 optionType: intent.optionType,
                 options: intent.options as string[] | [number, number],
@@ -447,18 +447,18 @@ export class FeishuBotChannel implements Channel {
                 createdBy: job.senderOpenId,
                 chatId: job.chatId,
               });
-              const tcProposal = getTcById(tcId);
+              const tcProposal = await getTcById(tcId);
               if (tcProposal) {
                 const postContent = buildTcProposalPost(tcProposal);
                 let topMsgId = '';
                 try {
-                  const sent = sendPost({ chatId: job.chatId }, postContent, { as: 'bot', profile });
+                  const sent = await sendPost({ chatId: job.chatId }, postContent, { as: 'bot', profile });
                   topMsgId = sent.messageId ?? '';
                 } catch (e) {
                   log.warn(`TC_CREATE：发送制式提案消息失败（num=${num}）：${(e as Error).message}`);
                 }
                 if (topMsgId) {
-                  updateTcTopMessageId(tcId, topMsgId);
+                  await updateTcTopMessageId(tcId, topMsgId);
                 }
                 log.info(`TC 提案已创建：TC-${num}  id=${tcId}  title=${intent.title}  topMsgId=${topMsgId}`);
               }
@@ -504,7 +504,7 @@ export class FeishuBotChannel implements Channel {
                 : (Number.isFinite(intent.endTimeSec as number) && (intent.endTimeSec as number) > nowSec + 60
                     ? (intent.endTimeSec as number)
                     : nowSec + 86400);
-              const { id: predictId, num } = insertPredictProposal({
+              const { id: predictId, num } = await insertPredictProposal({
                 title: intent.title,
                 options: intent.options,
                 endTime: endTimeSec,
@@ -512,18 +512,18 @@ export class FeishuBotChannel implements Channel {
                 createdBy: job.senderOpenId,
                 chatId: job.chatId,
               });
-              const predictProposal = getPredictById(predictId);
+              const predictProposal = await getPredictById(predictId);
               if (predictProposal) {
                 const postContent = buildPredictProposalPost(predictProposal);
                 let topMsgId = '';
                 try {
-                  const sent = sendPost({ chatId: job.chatId }, postContent, { as: 'bot', profile });
+                  const sent = await sendPost({ chatId: job.chatId }, postContent, { as: 'bot', profile });
                   topMsgId = sent.messageId ?? '';
                 } catch (e) {
                   log.warn(`BET_CREATE：发送制式提案消息失败（num=${num}）：${(e as Error).message}`);
                 }
                 if (topMsgId) {
-                  updatePredictTopMessageId(predictId, topMsgId);
+                  await updatePredictTopMessageId(predictId, topMsgId);
                 }
                 log.info(`社区预测提案已创建：BET-${num}  id=${predictId}  title=${intent.title}  topMsgId=${topMsgId}`);
               }
@@ -536,7 +536,7 @@ export class FeishuBotChannel implements Channel {
         }
       }
 
-      send(job.messageId, job.chatId, reply, job.isP2p);
+      await send(job.messageId, job.chatId, reply, job.isP2p);
       // Peer kickoff: after a genuine group reply, broadcast a cue so same-chat colleague agents can
       // opt into the conversation. Deterministic (not LLM-driven) so collaboration reliably appears.
       if (replyOk && cfg.peerCast && !job.isP2p) {
@@ -561,14 +561,14 @@ export class FeishuBotChannel implements Channel {
       if (!job) return;
       processing = true;
       try {
-        setReaction(job, 'thinking'); // it's this job's turn now → switch queued(coffee) → thinking
+        await setReaction(job, 'thinking'); // it's this job's turn now → switch queued(coffee) → thinking
         await processJob(job);
       } catch (e) {
         log.error('处理消息失败：', (e as Error).message);
       } finally {
-        clearReaction(job);
+        await clearReaction(job);
         // Reply completed (success or handled error) → drop the recovery row.
-        if (job.pendingId) store.removePendingReply(job.pendingId);
+        if (job.pendingId) await store.removePendingReply(job.pendingId);
         processing = false;
         if (queue.length > 0) void pump();
       }
@@ -577,7 +577,7 @@ export class FeishuBotChannel implements Channel {
     // handleOpts.backfill marks a message replayed by the post-reconnect scan (see runBackfill): it
     // bypasses the startup-age gate (the whole point is to process something older than startup) and
     // relies on the persistent handled_messages dedupe instead of the in-memory event_id `seen` set.
-    const handleEvent = (ev: Record<string, any>, handleOpts: { backfill?: boolean } = {}): void => {
+    const handleEvent = async (ev: Record<string, any>, handleOpts: { backfill?: boolean } = {}): Promise<void> => {
       if (ev.type && ev.type !== 'im.message.receive_v1') return;
       const msgType: string = ev.message_type ?? 'text';
       if (!HANDLED_MSG_TYPES.has(msgType)) {
@@ -598,7 +598,7 @@ export class FeishuBotChannel implements Channel {
       let llmText: string = text;
       if (msgType !== 'text') {
         try {
-          const rendered = renderMessageBody({ msgType, content: rawContent, messageId }, { fetchFile, maxInlineChars: 2000 });
+          const rendered = await renderMessageBody({ msgType, content: rawContent, messageId }, { fetchFile, maxInlineChars: 2000 });
           if (rendered) llmText = rendered;
         } catch (e) {
           log.warn('附件解析失败（按标注处理）：', (e as Error).message);
@@ -648,8 +648,8 @@ export class FeishuBotChannel implements Channel {
       // Marked here, after the age gate, so a normal pre-startup skip does NOT mark it — leaving it
       // available for the backfill to pick up if it was genuinely missed.
       if (messageId) {
-        if (store.wasMessageHandled(messageId)) return;
-        store.markMessageHandled(messageId);
+        if (await store.wasMessageHandled(messageId)) return;
+        await store.markMessageHandled(messageId);
       }
 
       log.info(`收到 [${ev.chat_type ?? 'group'}]${handleOpts.backfill ? '（补扫）' : ''} ${preview(text)}`);
@@ -687,15 +687,15 @@ export class FeishuBotChannel implements Channel {
       let isFirstInteraction = false;
       if (senderOpenId) {
         try {
-          isFirstInteraction = store.recordInteraction(senderOpenId, '', chatId, messageId ?? '').isNew;
+          isFirstInteraction = (await store.recordInteraction(senderOpenId, '', chatId, messageId ?? '')).isNew;
         } catch { /* best-effort */ }
         // Backfill the display name from the contact API when the profile has none yet (so event
         // placeholders like {{name}} resolve before the reply is processed).
         try {
-          const prof = store.getProfile(senderOpenId);
+          const prof = await store.getProfile(senderOpenId);
           if (prof && !prof.name) {
-            const fetchedName = getUserName(senderOpenId, cfg.larkProfile);
-            if (fetchedName) store.upsertProfileRaw(senderOpenId, fetchedName);
+            const fetchedName = await getUserName(senderOpenId, cfg.larkProfile);
+            if (fetchedName) await store.upsertProfileRaw(senderOpenId, fetchedName);
           }
         } catch { /* best-effort */ }
       }
@@ -705,10 +705,10 @@ export class FeishuBotChannel implements Channel {
       // discrete option token — is never misread as a bet on the chat's active proposal. Announcing
       // requires the predict_judge badge; cancelling accepts the proposal creator OR that badge.
       if (senderOpenId) {
-        const predictCmd = tryHandlePredictCommand(text, senderOpenId, profile);
+        const predictCmd = await tryHandlePredictCommand(text, senderOpenId, profile);
         if (predictCmd !== false) {
           log.info(`社区预测命令：${preview(predictCmd.reply)}`);
-          send(messageId, chatId, predictCmd.reply, isP2p);
+          await send(messageId, chatId, predictCmd.reply, isP2p);
           return;
         }
       }
@@ -717,10 +717,10 @@ export class FeishuBotChannel implements Channel {
       // parser so "宝箱 X 转出 @某人 3" — which ends in a number — is never misread as a bet. Deposit
       // and withdrawal are gated on chest ownership inside tryHandleChestCommand itself.
       if (senderOpenId) {
-        const chestCmd = tryHandleChestCommand(text, senderOpenId);
+        const chestCmd = await tryHandleChestCommand(text, senderOpenId);
         if (chestCmd !== false) {
           log.info(`宝箱命令：${preview(chestCmd.reply)}`);
-          send(messageId, chatId, chestCmd.reply, isP2p);
+          await send(messageId, chatId, chestCmd.reply, isP2p);
           return;
         }
       }
@@ -729,10 +729,10 @@ export class FeishuBotChannel implements Channel {
       // "@agent tc cancel <num>" — which ends in a number — is never misread as a bet on the chat's
       // active proposal. Only the proposal creator or an admin may cancel; cancelling refunds all bets.
       if (senderOpenId) {
-        const tcCmd = tryHandleTcCommand(text, senderOpenId, profile);
+        const tcCmd = await tryHandleTcCommand(text, senderOpenId, profile);
         if (tcCmd !== false) {
           log.info(`TC 命令：${preview(tcCmd.reply)}`);
-          send(messageId, chatId, tcCmd.reply, isP2p);
+          await send(messageId, chatId, tcCmd.reply, isP2p);
           return;
         }
       }
@@ -745,15 +745,15 @@ export class FeishuBotChannel implements Channel {
       // LP amount, so non-bet mentions naturally return false and pass through.
       let tcBetHandled = false;
       if (senderOpenId && chatId) {
-        const actives = listActiveTcsByChat(chatId);
+        const actives = await listActiveTcsByChat(chatId);
         const tcProposal = actives.length === 1
           ? actives[0]
           : actives.find(p => new RegExp(`\\bTC-${p.num}\\b`, 'i').test(text)) ?? null;
         if (tcProposal) {
-          const betResult = tryParseTcBet(text, tcProposal, senderOpenId, messageId ?? '', profile);
+          const betResult = await tryParseTcBet(text, tcProposal, senderOpenId, messageId ?? '', profile);
           if (betResult !== false) {
             tcBetHandled = true;
-            send(messageId, chatId, betResult.reply, isP2p);
+            await send(messageId, chatId, betResult.reply, isP2p);
           }
         }
       }
@@ -763,15 +763,15 @@ export class FeishuBotChannel implements Channel {
       // chat-scoped association and disambiguation rule as TC bets above, using BET-N tokens.
       let predictBetHandled = false;
       if (senderOpenId && chatId) {
-        const actives = listActivePredictsByChat(chatId);
+        const actives = await listActivePredictsByChat(chatId);
         const predictProposal = actives.length === 1
           ? actives[0]
           : actives.find(p => new RegExp(`\\bBET-${p.num}\\b`, 'i').test(text)) ?? null;
         if (predictProposal) {
-          const betResult = tryParsePredictBet(text, predictProposal, senderOpenId, messageId ?? '', profile);
+          const betResult = await tryParsePredictBet(text, predictProposal, senderOpenId, messageId ?? '', profile);
           if (betResult !== false) {
             predictBetHandled = true;
-            send(messageId, chatId, betResult.reply, isP2p);
+            await send(messageId, chatId, betResult.reply, isP2p);
           }
         }
       }
@@ -783,14 +783,14 @@ export class FeishuBotChannel implements Channel {
       // self-intro of the chain, so it is passed straight through; handleRecordSelfIntro only falls back
       // to fetching the command message when the envelope carried no linkage.
       if (isRecordSelfIntroCommand(text)) {
-        const reply = handleRecordSelfIntro({ commandMessageId: messageId ?? '', eventRootId: rootId, eventParentId: replyToId, senderOpenId, profile });
+        const reply = await handleRecordSelfIntro({ commandMessageId: messageId ?? '', eventRootId: rootId, eventParentId: replyToId, senderOpenId, profile });
         log.info(`收录自介：${preview(reply)}`);
-        send(messageId, chatId, reply, isP2p);
+        await send(messageId, chatId, reply, isP2p);
         return;
       }
 
       // Command mode first (pure code, no kimi call): reply instantly, no queue / reaction needed.
-      const dr = dispatchCommand(text, {
+      const dr = await dispatchCommand(text, {
         agentName: agent.name,
         identity: cfg.identity,
         source: channelName,
@@ -800,9 +800,9 @@ export class FeishuBotChannel implements Channel {
       if (dr.handled) {
         log.info(`命令：${dr.command}`);
         try {
-          store.recordActivity('command', senderOpenId || null, chatId, messageId ?? null, { command: dr.command, args: dr.args ?? [] });
+          await store.recordActivity('command', senderOpenId || null, chatId, messageId ?? null, { command: dr.command, args: dr.args ?? [] });
         } catch { /* best-effort */ }
-        send(messageId, chatId, dr.reply ?? '', isP2p);
+        await send(messageId, chatId, dr.reply ?? '', isP2p);
         return;
       }
 
@@ -825,17 +825,17 @@ export class FeishuBotChannel implements Channel {
         // dropped rather than guessed. A topic's backstory stays uncapped — a thread is one
         // conversation however long it took.
         const rows = threadId
-          ? store.getThreadContext(threadId, { limit: 15, excludeMessageId: messageId })
-          : store.getRecentChatMessages(chatId, {
+          ? await store.getThreadContext(threadId, { limit: 15, excludeMessageId: messageId })
+          : await store.getRecentChatMessages(chatId, {
               limit: 8,
               excludeMessageId: messageId,
               sinceMs: createMs ? createMs - RECENT_CONTEXT_MAX_AGE_MS : undefined,
             });
         // The replied-to message is the referent and is routinely older than the window reaches, so it
         // is pinned above the window rather than left to it.
-        const replyTarget = replyToId ? store.getMessageRow(replyToId) : null;
+        const replyTarget = replyToId ? await store.getMessageRow(replyToId) : null;
         if (replyToId && !replyTarget) log.debug(`回复目标未采集到，无法引用原文：${replyToId}`);
-        context = buildReplyContext(rows, replyTarget, resolveName(senderOpenId) || '对方', resolveName);
+        context = await buildReplyContext(rows, replyTarget, (await resolveName(senderOpenId)) || '对方', resolveName);
       } catch { /* best-effort */ }
 
       // Attachment backfill: a file sent as its own message carries no @mention, so the bot never
@@ -848,8 +848,8 @@ export class FeishuBotChannel implements Channel {
         try {
           const triggerMs = larkTimeToMs(ev.create_time);
           const RECENT_WINDOW_MS = 30 * 60 * 1000;
-          const recent = listMessages(chatId, { pageSize: 15, sort: 'desc', profile });
-          const inlined = recent
+          const recent = await listMessages(chatId, { pageSize: 15, sort: 'desc', profile });
+          const candidates = recent
             .filter((m) => m.messageId !== messageId)
             .filter((m) => m.msgType === 'file' || m.msgType === 'image' || m.msgType === 'media')
             .filter((m) => {
@@ -858,10 +858,17 @@ export class FeishuBotChannel implements Channel {
               return triggerMs - t < RECENT_WINDOW_MS && t - triggerMs < 2 * 60 * 1000; // within ~30min before (small skew after)
             })
             .slice(0, 3)
-            .reverse()
-            .map((m) => renderMessageBody({ msgType: m.msgType, content: m.content, messageId: m.messageId }, { fetchFile: fetchFileFromHistory, maxInlineChars: 2000 }))
-            .filter(Boolean)
-            .map((line) => `本群近期共享的材料：${line}`);
+            .reverse();
+          // Sequential rendering: each may download a file via lark-cli, and the inlined order must
+          // mirror chat order (oldest first after the reverse above).
+          const inlined: string[] = [];
+          for (const m of candidates) {
+            const line = await renderMessageBody(
+              { msgType: m.msgType, content: m.content, messageId: m.messageId },
+              { fetchFile: fetchFileFromHistory, maxInlineChars: 2000 },
+            );
+            if (line) inlined.push(`本群近期共享的材料：${line}`);
+          }
           if (inlined.length) {
             context = inlined.join('\n') + (context ? '\n' + context : '');
             log.info(`已回填 ${inlined.length} 份近期附件到上下文`);
@@ -877,7 +884,7 @@ export class FeishuBotChannel implements Channel {
       // seen: "coffee" if they must wait behind another reply, "thinking" if they're up next.
       const job: BotJob = { messageId, chatId, text: llmText, senderOpenId, threadId: threadId || undefined, context, sessionKey, reaction: null, reactionId: null, pendingId: 0, isFirstInteraction, isP2p };
       // Persist BEFORE reacting/answering, so a crash at any point is recoverable on restart.
-      job.pendingId = store.addPendingReply({
+      job.pendingId = await store.addPendingReply({
         agentId: cfg.id,
         channel: channelName,
         chatId,
@@ -890,7 +897,7 @@ export class FeishuBotChannel implements Channel {
         attempts: 0,
       });
       const mustWait = processing || queue.length > 0;
-      setReaction(job, mustWait ? 'coffee' : 'thinking');
+      await setReaction(job, mustWait ? 'coffee' : 'thinking');
       queue.push(job);
       void pump();
     };
@@ -900,12 +907,12 @@ export class FeishuBotChannel implements Channel {
     // its orphaned reaction, refund the LP it was charged, then re-run it (bypassing the startup
     // grace, since we explicitly owe this answer). The corrupt session the kill may have left is
     // cleaned by the startup sweep + inline self-heal, so the re-run starts clean.
-    const recover = (): void => {
+    const recover = async (): Promise<void> => {
       // 静默模式不重发被打断的回复（保留 pending 行，等下次非静默启动再恢复）。
       if (quiet) return;
-      let pendings: ReturnType<typeof store.listPendingReplies> = [];
+      let pendings: Awaited<ReturnType<typeof store.listPendingReplies>> = [];
       try {
-        pendings = store.listPendingReplies(cfg.id, channelName);
+        pendings = await store.listPendingReplies(cfg.id, channelName);
       } catch {
         return;
       }
@@ -915,28 +922,28 @@ export class FeishuBotChannel implements Channel {
         // 1) clear the leftover reaction on the original message
         if (p.messageId && p.reactionId) {
           try {
-            removeReaction(p.messageId, p.reactionId, { as: 'bot', profile });
+            await removeReaction(p.messageId, p.reactionId, { as: 'bot', profile });
           } catch { /* best-effort */ }
         }
         // 2) refund the LP charged before the interruption (the re-run will charge again)
         if (p.ptSpent && p.senderOpenId) {
           try {
-            store.grantPt(p.senderOpenId, LLM_PT_COST, 'refund_interrupted', p.messageId ?? undefined);
+            await store.grantPt(p.senderOpenId, LLM_PT_COST, 'refund_interrupted', p.messageId ?? undefined);
           } catch { /* best-effort */ }
         }
         // 3) give up after too many re-runs (a message that keeps killing the worker)
         if (p.attempts >= MAX_RECOVERY_ATTEMPTS) {
           log.warn(`放弃重试（已 ${p.attempts} 次）：${preview(p.text)}`);
-          store.removePendingReply(p.id);
+          await store.removePendingReply(p.id);
           if (p.messageId) {
             try {
-              replyText(p.messageId, '（抱歉，刚刚的处理被打断了，请重新问我一次。）', { as: 'bot', profile, inThread: true });
+              await replyText(p.messageId, '（抱歉，刚刚的处理被打断了，请重新问我一次。）', { as: 'bot', profile, inThread: true });
             } catch { /* best-effort */ }
           }
           continue;
         }
         // 4) re-enqueue, reusing the same recovery row (attempts bumped, reaction reset)
-        store.updatePendingReply(p.id, { attempts: p.attempts + 1, reactionId: null });
+        await store.updatePendingReply(p.id, { attempts: p.attempts + 1, reactionId: null });
         const job: BotJob = {
           messageId: p.messageId ?? undefined,
           chatId: p.chatId,
@@ -952,7 +959,7 @@ export class FeishuBotChannel implements Channel {
           isP2p: false, // chat_type isn't persisted; recovered replies keep the original in-thread send
         };
         const mustWait = processing || queue.length > 0;
-        setReaction(job, mustWait ? 'coffee' : 'thinking');
+        await setReaction(job, mustWait ? 'coffee' : 'thinking');
         queue.push(job);
       }
       void pump();
@@ -977,12 +984,12 @@ export class FeishuBotChannel implements Channel {
     const BACKFILL_THREAD_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
     const BACKFILL_MAX = 30;
     let backfilling = false;
-    const synthAndHandle = (m: {
+    const synthAndHandle = async (m: {
       messageId?: string; chatId?: string; chatType?: string; msgType?: string; content?: string;
       createTimeMs: number; senderOpenId?: string; senderType?: string;
       threadId?: string; replyToId?: string; rootId?: string;
-    }): boolean => {
-      if (!m.messageId || !m.chatId || store.wasMessageHandled(m.messageId)) return false;
+    }): Promise<boolean> => {
+      if (!m.messageId || !m.chatId || (await store.wasMessageHandled(m.messageId))) return false;
       const ev: Record<string, any> = {
         type: 'im.message.receive_v1',
         message_id: m.messageId,
@@ -998,7 +1005,7 @@ export class FeishuBotChannel implements Channel {
         root_id: m.rootId,
       };
       try {
-        handleEvent(ev, { backfill: true });
+        await handleEvent(ev, { backfill: true });
         return true;
       } catch (e) {
         log.warn('补扫单条处理失败（忽略）：', (e as Error).message);
@@ -1015,16 +1022,16 @@ export class FeishuBotChannel implements Channel {
         // Never look back past the feature's own epoch: before handled_messages existed nothing was
         // marked, so pre-deploy @-mentions would all look unhandled and be re-answered. This makes the
         // first run a no-op on history.
-        const epochMs = store.backfillEpochMs();
+        const epochMs = await store.backfillEpochMs();
         const sinceMs = Math.max(nowMs - BACKFILL_LOOKBACK_MS, epochMs);
         let processed = 0;
 
         // 1) top-level @-mentions the poll captured but the event stream missed — DB only.
-        for (const row of store.unhandledPolledMessagesSince(sinceMs, 100)) {
+        for (const row of await store.unhandledPolledMessagesSince(sinceMs, 100)) {
           if (processed >= BACKFILL_MAX) break;
           if (!row.mentions.includes(self)) continue;
           if (row.senderType === 'app') continue;
-          if (synthAndHandle({
+          if (await synthAndHandle({
             messageId: row.messageId, chatId: row.chatId, msgType: row.msgType, content: row.text,
             createTimeMs: row.createTime, senderOpenId: row.senderOpenId, senderType: row.senderType,
             threadId: row.threadId, replyToId: row.replyToId, rootId: row.rootId,
@@ -1035,17 +1042,17 @@ export class FeishuBotChannel implements Channel {
         // DISCOVERY reaches back a week to surface dormant threads (whose only DB linkage is days old),
         // but a thread message is only PROCESSED when newer than sinceMs — so the epoch floor there,
         // not the discovery window, is what keeps history from being re-answered.
-        const keys = store.recentThreadScanKeysSince(nowMs - BACKFILL_THREAD_WINDOW_MS, 40);
+        const keys = await store.recentThreadScanKeysSince(nowMs - BACKFILL_THREAD_WINDOW_MS, 40);
         for (const key of keys) {
           if (processed >= BACKFILL_MAX) break;
           let msgs: LarkMessage[] = [];
-          try { msgs = listThreadMessages(key, { pageSize: 20, order: 'desc', profile }); } catch { continue; }
+          try { msgs = await listThreadMessages(key, { pageSize: 20, order: 'desc', profile }); } catch { continue; }
           for (const m of msgs) {
             if (processed >= BACKFILL_MAX) break;
             const tMs = larkTimeToMs(m.createTime);
             if (tMs === 0 || tMs < sinceMs) continue; // only the recent window
             if (!m.mentions.includes(self) || m.senderType === 'app') continue;
-            if (synthAndHandle({
+            if (await synthAndHandle({
               messageId: m.messageId, chatId: m.chatId, msgType: m.msgType, content: m.content,
               createTimeMs: tMs, senderOpenId: m.senderOpenId, senderType: m.senderType,
               threadId: m.threadId, replyToId: m.replyToId, rootId: m.rootId,
@@ -1068,7 +1075,7 @@ export class FeishuBotChannel implements Channel {
     });
 
     // Re-run any replies a previous restart interrupted (clear orphaned reactions, refund LP, retry).
-    recover();
+    void recover();
 
     // ── Peer-bus inbox watcher (cross-agent group collaboration) ──────────
     // When a same-chat colleague broadcasts a cue into this soul's inbox, fs.watch fires. After a
@@ -1145,7 +1152,7 @@ export class FeishuBotChannel implements Channel {
             if (isLowContentAck(body)) { log.info(`peer 判定为纯应答、按沉默处理（话题：${cue.topic}）：${preview(body)}`); continue; }
 
             try {
-              sendText({ chatId: cue.chatId }, body, { as: 'bot', profile });
+              await sendText({ chatId: cue.chatId }, body, { as: 'bot', profile });
               log.info(`peer 接话已发送（${cue.chatId}）：${preview(body)}`);
             } catch (e) {
               log.error(`peer 发送失败：${(e as Error).message}`);

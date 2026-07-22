@@ -41,7 +41,7 @@ export class CliChannel implements Channel {
     );
 
     const ask = (): void => {
-      rl.question('你 > ', (line) => {
+      rl.question('你 > ', async (line) => {
         const text = line.trim();
         if (text === '/exit' || text === '/quit') {
           rl.close();
@@ -58,7 +58,7 @@ export class CliChannel implements Channel {
           return;
         }
         // Try command mode first (pure code, no kimi call); only hand off to the agent if nothing matches.
-        const dr = dispatchCommand(text, { agentName: agent.name, source: this.name });
+        const dr = await dispatchCommand(text, { agentName: agent.name, source: this.name });
         if (dr.handled) {
           process.stdout.write(`\n${agent.name} > ${dr.reply ?? ''}\n\n`);
           ask();
@@ -66,7 +66,7 @@ export class CliChannel implements Channel {
         }
         try {
           process.stdout.write('（思考中…）\n');
-          const reply = agent.respond({ message: text, session: session() });
+          const reply = await agent.respondAsync({ message: text, session: session() });
           process.stdout.write(`\n${agent.name} > ${reply}\n\n`);
         } catch (e) {
           log.error((e as Error).message);

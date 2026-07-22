@@ -86,7 +86,7 @@ export class FeishuUserChannel implements Channel {
     this.cfg = cfg;
   }
 
-  run(agent: Agent): Promise<void> {
+  async run(agent: Agent): Promise<void> {
     const cfg = this.cfg;
     const profile = cfg.larkProfile;
     this.startedAtMs = Date.now();
@@ -101,7 +101,7 @@ export class FeishuUserChannel implements Channel {
         ? '，quiet 静默模式：只采集不回复'
         : '';
 
-    if (!isLoggedIn(profile)) {
+    if (!(await isLoggedIn(profile))) {
       throw new Error(
         `lark-cli 尚未登录（profile=${profile}）：请先 lark-cli --profile ${profile} auth login --domain im`
       );
@@ -129,11 +129,11 @@ export class FeishuUserChannel implements Channel {
 
     // Chats whose listening loop has already started (deduplicated by chatId), to avoid starting duplicate loops on rescan.
     const started = new Set<string>();
-    const startNew = (chats: { chatId: string; name: string; external: boolean }[]): number => {
+    const startNew = async (chats: { chatId: string; name: string; external: boolean }[]): Promise<number> => {
       let added = 0;
       for (const chat of chats) {
         if (!chat.chatId || started.has(chat.chatId)) continue;
-        const reason = store.chatInactiveReason(chat.chatId);
+        const reason = await store.chatInactiveReason(chat.chatId);
         // A dissolved chat (232009) is permanently gone — never re-listen. Mark it started so repeated
         // rescans don't keep logging the skip.
         if (reason === 'dissolved') {
@@ -144,7 +144,7 @@ export class FeishuUserChannel implements Channel {
         // An 'inaccessible' chat that shows up here again is in our live discovery list → we can reach
         // it once more (re-added). Clear the flag and resume monitoring it.
         if (reason === 'inaccessible') {
-          store.clearChatInactive(chat.chatId);
+          await store.clearChatInactive(chat.chatId);
           log.info(`群【${chat.name || chat.chatId}】恢复可访问，重新开始监听。`);
         }
         started.add(chat.chatId);
@@ -154,12 +154,12 @@ export class FeishuUserChannel implements Channel {
         // immediately and each subsequent one is pushed back by one stagger step.
         const startDelayMs = added * cfg.discoveryStaggerMs;
         added += 1;
-        this.startChatLoop(agent, chat.chatId, chat.name, chat.external, () => running, startDelayMs);
+        void this.startChatLoop(agent, chat.chatId, chat.name, chat.external, () => running, startDelayMs);
       }
       return added;
     };
 
-    startNew(cfg.chats);
+    void startNew(cfg.chats);
 
 
     // Sync the full member roster of every monitored chat into the directory (chat_members): captures
@@ -190,11 +190,11 @@ export class FeishuUserChannel implements Channel {
       for (const chat of chats) {
         if (!running) return;
         if (!chat.chatId) continue;
-        if (store.isChatInactive(chat.chatId)) continue; // known gone/inaccessible → skip silently
+        if (await store.isChatInactive(chat.chatId)) continue; // known gone/inaccessible → skip silently
         if (polled > 0 && staggerMs > 0) await sleep(staggerMs);
         polled += 1;
         try {
-          const roster = listChatMembers(chat.chatId, { profile });
+          const roster = await listChatMembers(chat.chatId, { profile });
           // We're always a member of a chat we monitor, so a truly empty roster means the fetch failed
           // transiently (and was swallowed). Skip rather than let syncChatMembers mark EVERYONE left —
           // which would corrupt the present count and the member_sync_rounds analytics. Retries next round.
@@ -203,8 +203,8 @@ export class FeishuUserChannel implements Channel {
             continue;
           }
           // Capture the watched group's pre-sync count so a crossing can be detected against this round.
-          const watchPrev = chat.chatId === VISITOR_WATCH_CHAT_ID ? store.presentMemberCount(chat.chatId) : -1;
-          const r = store.syncChatMembers(chat.chatId, roster);
+          const watchPrev = chat.chatId === VISITOR_WATCH_CHAT_ID ? await store.presentMemberCount(chat.chatId) : -1;
+          const r = await store.syncChatMembers(chat.chatId, roster);
           added += r.added;
           present += r.total;
           left += r.left;
@@ -224,11 +224,11 @@ export class FeishuUserChannel implements Channel {
           if (watchPrev >= 0) {
             const visitorNum = r.total;
             const milestone = Math.floor(visitorNum / VISITOR_STEP) * VISITOR_STEP;
-            if (milestone >= VISITOR_STEP && !isMilestoneRecorded(cfg.soul, chat.chatId, milestone)) {
-              const person = store.nthPresentMemberByArrival(chat.chatId, milestone)
+            if (milestone >= VISITOR_STEP && !(await isMilestoneRecorded(cfg.soul, chat.chatId, milestone))) {
+              const person = (await store.nthPresentMemberByArrival(chat.chatId, milestone))
                 ?? { openId: '', name: '', firstSeen: Math.floor(Date.now() / 1000) };
-              recordMilestone(cfg.soul, chat.chatId, milestone, person, Math.floor(Date.now() / 1000));
-              refreshVisitorMilestonesWiki(chat.chatId, { profile });
+              await recordMilestone(cfg.soul, chat.chatId, milestone, person, Math.floor(Date.now() / 1000));
+              await refreshVisitorMilestonesWiki(chat.chatId, { profile });
               log.info(`访客里程碑达成【${chat.name || chat.chatId}】：第 ${milestone} 人（${person.name || person.openId || '未知'}），记录并发送通知`);
               void fireEvent('visitor-num-notify', {
                 profile,
@@ -249,7 +249,7 @@ export class FeishuUserChannel implements Channel {
           // appears in joinedMembers only the first time they show up, so nobody is queued twice.
           if (chat.chatId === VISITOR_WATCH_CHAT_ID && watchPrev > 0 && r.joinedMembers.length > 0) {
             try {
-              store.enqueuePendingWelcome(chat.chatId, r.joinedMembers);
+              await store.enqueuePendingWelcome(chat.chatId, r.joinedMembers);
               log.info(`迎新：已把 ${r.joinedMembers.length} 位新成员加入迎新队列【${chat.name || chat.chatId}】，待下次播报（08:30/14:30/20:30）统一欢迎`);
             } catch (e) {
               log.warn(`迎新入队失败【${chat.name || chat.chatId}】：${(e as Error).message}`);
@@ -259,7 +259,7 @@ export class FeishuUserChannel implements Channel {
           // A dissolved group (232009) is permanently gone: flag it (members→离开), stop syncing it,
           // and don't treat it as a sync failure worth a warning every 5 minutes.
           if (isChatGoneError(e)) {
-            const n = store.markChatInactive(chat.chatId, 'dissolved');
+            const n = await store.markChatInactive(chat.chatId, 'dissolved');
             log.warn(`群成员同步：群【${chat.name || chat.chatId}】已解散（code 232009），已标记 ${n} 名成员离开，今后不再同步该群。`);
             continue;
           }
@@ -272,10 +272,10 @@ export class FeishuUserChannel implements Channel {
           log.warn(`群成员同步失败【${chat.name || chat.chatId}】：`, (e as Error).message);
         }
       }
-      const dir = store.directoryStats();
+      const dir = await store.directoryStats();
       // Persist this round to the ops time-series (every round, even no-change ones, so the series is
       // continuous). Best-effort: a failed write never disrupts the sync loop.
-      store.recordMemberSyncRound({
+      await store.recordMemberSyncRound({
         syncedAt: Math.floor(Date.now() / 1000),
         chatCount: chats.length,
         presentTotal: present,
@@ -333,23 +333,28 @@ export class FeishuUserChannel implements Channel {
       for (const chat of chats) {
         if (!running) return;
         if (!chat.chatId) continue;
-        if (store.isChatInactive(chat.chatId)) continue; // known gone/inaccessible → skip silently
+        if (await store.isChatInactive(chat.chatId)) continue; // known gone/inaccessible → skip silently
         const doLikeTally = getChatTier(chat.chatId) !== 'work'; // likes are only harvested in non-work groups
         const pinThreshold = getAutoPinThreshold(chat.chatId); // 0 = auto-pin disabled for this chat
         if (!doLikeTally && pinThreshold === 0) continue; // nothing to do for this chat
         if (polled > 0 && staggerMs > 0) await sleep(staggerMs);
         polled += 1;
         try {
-          const messages = listMessages(chat.chatId, {
+          const messages = await listMessages(chat.chatId, {
             pageSize: REACTION_SCAN_MESSAGES,
             sort: 'desc',
             includeReactions: true,
             profile,
           });
           scannedChats += 1;
+          // Reactions are collected across the whole chat and written in one statement below: a sweep
+          // re-observes every reaction still visible on these messages, so writing them one at a time
+          // spent a round trip each on what are almost all no-ops. The pin check below is unaffected —
+          // it reads pinned_messages, never chat_reactions.
+          const pendingReactions: store.ChatReactionRow[] = [];
           for (const msg of messages) {
             // Single pass over this message's reactions: collect distinct human reactors (for the pin
-            // check) and, in non-work groups, record each reaction (for the like tally).
+            // check) and, in non-work groups, queue each reaction (for the like tally).
             const humanReactors = new Set<string>();
             for (const rx of msg.reactions ?? []) {
               if (rx.operatorType && rx.operatorType !== 'user') continue; // skip app/bot reactions
@@ -357,21 +362,17 @@ export class FeishuUserChannel implements Channel {
               if (INDICATOR_EMOJIS.has(rx.emojiType)) continue; // skip processing-indicator reactions
               humanReactors.add(rx.reactorOpenId);
               if (doLikeTally) {
-                const fresh = store.recordChatReaction({
+                pendingReactions.push({
                   messageId: msg.messageId,
                   chatId: chat.chatId,
                   reactorOpenId: rx.reactorOpenId,
                   emojiType: rx.emojiType,
                   actionTime: rx.actionTime,
                 });
-                if (fresh) {
-                  newByMember.set(rx.reactorOpenId, (newByMember.get(rx.reactorOpenId) ?? 0) + 1);
-                  totalNew += 1;
-                }
               }
             }
             // Auto-pin: a today's message reacted to by >= threshold distinct people gets pinned once.
-            if (pinThreshold > 0 && humanReactors.size >= pinThreshold && !store.isMessagePinned(msg.messageId)) {
+            if (pinThreshold > 0 && humanReactors.size >= pinThreshold && !(await store.isMessagePinned(msg.messageId))) {
               // createTime arrives either as an epoch or as a formatted "YYYY-MM-DD HH:MM" string
               // depending on the lark-cli version; larkTimeToMs normalises both (0 = unparseable).
               // An unparseable time must be loud: this gate fails closed, so a silent skip disables
@@ -382,8 +383,8 @@ export class FeishuUserChannel implements Channel {
                   `热门消息置顶跳过【${chat.name || chat.chatId}】：无法解析消息时间 create_time=${msg.createTime}，message_id=${msg.messageId}`
                 );
               } else if (createMs >= todayStartMs) {
-                if (pinMessage(msg.messageId, { as: 'bot', profile })) {
-                  store.recordPinnedMessage(msg.messageId, chat.chatId, humanReactors.size);
+                if (await pinMessage(msg.messageId, { as: 'bot', profile })) {
+                  await store.recordPinnedMessage(msg.messageId, chat.chatId, humanReactors.size);
                   pinned += 1;
                   log.info(
                     `热门消息置顶【${chat.name || chat.chatId}】：${humanReactors.size} 人反应（阈值 ${pinThreshold}），已置顶 message_id=${msg.messageId}`
@@ -392,9 +393,9 @@ export class FeishuUserChannel implements Channel {
                   // Drop each from tracking regardless of the unpin result — an unpin failure almost always
                   // means the pin is already gone (message deleted / unpinned by hand), so keeping the row
                   // would wedge the cap; the small risk is one extra visible pin after a transient blip.
-                  for (const oldId of store.pinnedMessagesOldestBeyond(chat.chatId, PIN_CAP)) {
-                    const removed = unpinMessage(oldId, { as: 'bot', profile });
-                    store.removePinnedMessage(oldId);
+                  for (const oldId of await store.pinnedMessagesOldestBeyond(chat.chatId, PIN_CAP)) {
+                    const removed = await unpinMessage(oldId, { as: 'bot', profile });
+                    await store.removePinnedMessage(oldId);
                     unpinnedOld += 1;
                     if (removed) {
                       log.info(`热门消息取消置顶【${chat.name || chat.chatId}】：超过 ${PIN_CAP} 条上限，取消最旧 message_id=${oldId}`);
@@ -410,9 +411,13 @@ export class FeishuUserChannel implements Channel {
               }
             }
           }
+          for (const fresh of await store.recordChatReactions(pendingReactions)) {
+            newByMember.set(fresh.reactorOpenId, (newByMember.get(fresh.reactorOpenId) ?? 0) + 1);
+            totalNew += 1;
+          }
         } catch (e) {
           if (isChatGoneError(e)) {
-            store.markChatInactive(chat.chatId, 'dissolved');
+            await store.markChatInactive(chat.chatId, 'dissolved');
             continue;
           }
           // Inaccessible: the per-chat poll loop owns the conservative stand-down; just skip here.
@@ -442,17 +447,17 @@ export class FeishuUserChannel implements Channel {
       const weekEndSec = weekStartSec + Math.floor((7 * DAY_MS) / 1000);
       for (const [openId, delta] of newByMember) {
         if (delta <= 0) continue;
-        const weeklyCount = store.weeklyMemberReactionCount(openId, weekStartSec, weekEndSec);
-        const name = store.memberName(openId) || openId;
+        const weeklyCount = await store.weeklyMemberReactionCount(openId, weekStartSec, weekEndSec);
+        const name = (await store.memberName(openId)) || openId;
         if (weeklyCount < LIKE_MANIAC_WEEKLY_THRESHOLD) {
           log.debug(`点赞监测【${name}】：本周 ${weeklyCount}（本轮 +${delta}），阈值 ${LIKE_MANIAC_WEEKLY_THRESHOLD}`);
           continue;
         }
-        if (store.isLikeManiacWeekRecorded(weekStartSec, openId)) {
+        if (await store.isLikeManiacWeekRecorded(weekStartSec, openId)) {
           log.debug(`点赞监测【${name}】：本周 ${weeklyCount}，已触发过点赞狂魔，跳过`);
           continue;
         }
-        if (!store.recordLikeManiacWeek(weekStartSec, openId, name, weeklyCount)) continue; // lost the race
+        if (!(await store.recordLikeManiacWeek(weekStartSec, openId, name, weeklyCount))) continue; // lost the race
         log.info(`点赞狂魔提醒触发【${name}】：本周点赞 ${weeklyCount}（本轮 +${delta}）达 ${LIKE_MANIAC_WEEKLY_THRESHOLD}，发送通知`);
         void fireEvent('like-maniac-notify', {
           profile,
@@ -474,7 +479,7 @@ export class FeishuUserChannel implements Channel {
         const nowSec = Math.floor(Date.now() / 1000);
         const startIso = new Date().toISOString().slice(0, 10);
         const endIso = new Date(Date.now() + 30 * 86400_000).toISOString().slice(0, 10);
-        const events = listUpcomingCalendarEvents({ profile, startIso, endIso });
+        const events = await listUpcomingCalendarEvents({ profile, startIso, endIso });
         // Only track events that have not yet started; past/ongoing events have no meaningful signup trend.
         const upcoming = events.filter((e) => e.startTimeSec > nowSec);
         // +agenda expands a recurring event into one item per occurrence (same series uuid, different
@@ -502,7 +507,7 @@ export class FeishuUserChannel implements Channel {
           if (polledEv > 0 && staggerMs > 0) await sleep(staggerMs);
           polledEv += 1;
           try {
-            const attendees = listEventAttendees(e.calendarId, e.eventId, { profile });
+            const attendees = await listEventAttendees(e.calendarId, e.eventId, { profile });
             let accepted = 0;
             let declined = 0;
             let tentative = 0;
@@ -515,8 +520,8 @@ export class FeishuUserChannel implements Channel {
               else if (a.rsvpStatus === 'needs_action') needsAction += 1;
             }
             const signupTotal = accepted + declined + tentative + needsAction;
-            const prev = store.latestCalendarEventRsvpRound(e.eventId);
-            store.recordCalendarEventRsvpRound({
+            const prev = await store.latestCalendarEventRsvpRound(e.eventId);
+            await store.recordCalendarEventRsvpRound({
               syncedAt: nowSec,
               eventId: e.eventId,
               calendarId: e.calendarId,
@@ -561,7 +566,7 @@ export class FeishuUserChannel implements Channel {
               if (crossed.length > 0) {
                 // Prefer the browser-openable web share link; fall back to the in-app app_link. Only
                 // fetched here (on a crossing), so the extra API call stays off the hot poll path.
-                const eventLink = getEventShareLink(e.calendarId, e.eventId, { profile }) || e.appLink;
+                const eventLink = (await getEventShareLink(e.calendarId, e.eventId, { profile })) || e.appLink;
                 log.info(`${status}；本轮跨越 ${crossed.join('/')}，触发报名提醒`);
                 void fireEvent('class-event-notify', {
                   profile,
@@ -604,13 +609,13 @@ export class FeishuUserChannel implements Channel {
       try {
         // Reduce every candidate document to the object token + type the access-record API expects.
         const targets: Array<{ fileToken: string; fileType: string; source: string; spaceId: string; title: string }> = [];
-        for (const space of listWikiSpaces({ profile })) {
-          for (const node of listWikiNodesDeep(space.spaceId, { profile })) {
+        for (const space of await listWikiSpaces({ profile })) {
+          for (const node of await listWikiNodesDeep(space.spaceId, { profile })) {
             if (!VIEW_RECORD_FILE_TYPES.has(node.objType)) continue;
             targets.push({ fileToken: node.objToken, fileType: node.objType, source: 'wiki', spaceId: space.spaceId, title: node.title });
           }
         }
-        for (const file of listDriveFilesDeep({ profile })) {
+        for (const file of await listDriveFilesDeep({ profile })) {
           if (!VIEW_RECORD_FILE_TYPES.has(file.type)) continue;
           targets.push({ fileToken: file.token, fileType: file.type, source: 'drive', spaceId: '', title: file.name });
         }
@@ -636,7 +641,7 @@ export class FeishuUserChannel implements Channel {
           scanAttempts += 1;
           let records;
           try {
-            records = listFileViewRecords(t.fileToken, t.fileType, { profile });
+            records = await listFileViewRecords(t.fileToken, t.fileType, { profile });
           } catch (e) {
             if (isViewRecordForbiddenError(e)) {
               forbidden += 1;
@@ -647,27 +652,22 @@ export class FeishuUserChannel implements Channel {
             continue;
           }
           scanned += 1;
-          let fresh = 0;
-          const freshNames: string[] = [];
-          for (const r of records) {
-            const inserted = store.recordDocViewEvent({
-              fileToken: t.fileToken,
-              fileType: t.fileType,
-              source: t.source,
-              spaceId: t.spaceId,
-              title: t.title,
-              viewerId: r.viewerId,
-              viewerName: r.name,
-              lastViewTime: r.lastViewTimeSec,
-            });
-            if (inserted) {
-              fresh += 1;
-              if (r.name) freshNames.push(r.name);
-            }
-          }
-          if (fresh > 0) {
-            newViews += fresh;
-            log.info(`文档访问采集【${t.title}】：新增 ${fresh} 条访问（${freshNames.slice(0, 8).join('、')}）`);
+          // One write per document, not per observed view: most of a document's viewers are already
+          // recorded, and each of those no-op INSERTs used to cost its own round trip.
+          const inserted = await store.recordDocViewEvents(records.map((r) => ({
+            fileToken: t.fileToken,
+            fileType: t.fileType,
+            source: t.source,
+            spaceId: t.spaceId,
+            title: t.title,
+            viewerId: r.viewerId,
+            viewerName: r.name,
+            lastViewTime: r.lastViewTimeSec,
+          })));
+          if (inserted.length > 0) {
+            newViews += inserted.length;
+            const freshNames = inserted.map((e) => e.viewerName).filter(Boolean);
+            log.info(`文档访问采集【${t.title}】：新增 ${inserted.length} 条访问（${freshNames.slice(0, 8).join('、')}）`);
           }
         }
         const truncated = unique.length > capped.length ? `（候选 ${unique.length} 个，本轮只扫前 ${capped.length} 个）` : '';
@@ -719,8 +719,8 @@ export class FeishuUserChannel implements Channel {
     const rescan = async (): Promise<void> => {
       if (!running) return;
       try {
-        const chats = cfg.rediscover();
-        const added = startNew(chats);
+        const chats = await cfg.rediscover();
+        const added = await startNew(chats);
         if (added > 0) log.info(`重扫群清单：新增监听 ${added} 个群（共 ${started.size}）`);
         await syncMembers(chats);
         await syncChatReactions(chats);
@@ -737,28 +737,32 @@ export class FeishuUserChannel implements Channel {
     });
   }
 
-  /** Start an independent polling loop for a single chat (each with its own cursor). */
-  private startChatLoop(
+  /**
+   * Start an independent polling loop for a single chat (each with its own cursor). Async only for
+   * its own setup (cursor init + chat registration); it returns as soon as the first tick is kicked
+   * off, without waiting for the polling loop's lifetime, so callers still treat this as fire-and-forget.
+   */
+  private async startChatLoop(
     agent: Agent,
     chatId: string,
     chatName: string,
     external: boolean,
     isRunning: () => boolean,
     initialDelayMs = 0
-  ): void {
+  ): Promise<void> {
     const cfg = this.cfg;
     const profile = cfg.larkProfile;
     // 采集不回复（serve --quiet → AGENT_QUIET，或本频道 collectOnly）：照常采集/记录，但 handle() 不回复、
     // 不调用 LLM、不加表情。collectOnly 让 user-token 数据采集运行时永不替操作者本人发言。
     const quiet = process.env.AGENT_QUIET === '1' || cfg.collectOnly === true;
     // Register this chat in the database so messages can reference it via foreign key.
-    try { upsertChat({ chatId, name: chatName, external }); } catch { /* best-effort */ }
+    void upsertChat({ chatId, name: chatName, external }).catch(() => { /* best-effort */ });
     const key = `feishu-user-${profile}-${chatId}`;
     const cursor = loadCursor(key);
 
     if (cursor.lastPosition === null) {
       try {
-        const latest = listMessages(chatId, { pageSize: 1, sort: 'desc', profile });
+        const latest = await listMessages(chatId, { pageSize: 1, sort: 'desc', profile });
         cursor.lastPosition = latest.length ? latest[0].position : -1;
         cursor.lastMessageId = latest.length ? latest[0].messageId : null;
         saveCursor(key, cursor);
@@ -767,7 +771,7 @@ export class FeishuUserChannel implements Channel {
         // A chat that's already dissolved at startup: mark it and don't start a poll loop for it
         // (otherwise the first tick would just stand it down anyway, after a scary init error).
         if (isChatGoneError(e)) {
-          const n = store.markChatInactive(chatId, 'dissolved');
+          const n = await store.markChatInactive(chatId, 'dissolved');
           log.warn(`[${chatName || chatId}] 群已解散（code 232009），不启动轮询；已标记 ${n} 名成员离开。`);
           return;
         }
@@ -778,7 +782,7 @@ export class FeishuUserChannel implements Channel {
     }
 
     // Download a message's file attachment on demand (cached), so the context can inline its content.
-    const fetchFile = (messageId: string, fileKey: string, fileName: string): string | null =>
+    const fetchFile = (messageId: string, fileKey: string, fileName: string): Promise<string | null> =>
       downloadMessageResource(messageId, fileKey, { type: 'file', profile, fileName });
 
     // Message types the model should see in the conversation context: text, plus file/image/video
@@ -786,25 +790,28 @@ export class FeishuUserChannel implements Channel {
     // interactive cards, shares, ...) stays out of the context as before.
     const CONTEXT_MSG_TYPES = new Set(['text', 'file', 'image', 'media']);
 
-    const buildContext = (descMessages: LarkMessage[], upto: number): string =>
-      descMessages
+    // Sequential rendering (not .map): renderMessageBody may download a file via lark-cli, and the
+    // context lines must keep chat order (oldest first after the reverse).
+    const buildContext = async (descMessages: LarkMessage[], upto: number): Promise<string> => {
+      const window = descMessages
         .filter((m) => m.position <= upto && CONTEXT_MSG_TYPES.has(m.msgType))
         .slice(0, cfg.contextSize)
-        .reverse()
-        .map((m) => {
-          const agentMsg = isAgentMessage(m.content);
-          const who = agentMsg ? agent.name : '使用者';
-          let text: string;
-          if (m.msgType === 'text') {
-            text = agentMsg ? m.content.replace(/^🤖\s*[^:：]*[:：]\s*/, '') : m.content;
-          } else {
-            // File/image/video attachment: render a marker and inline text-file content when possible.
-            text = renderMessageBody(m, { fetchFile, maxInlineChars: 2000 });
-          }
-          return text ? `${who}: ${text}` : '';
-        })
-        .filter(Boolean)
-        .join('\n');
+        .reverse();
+      const lines: string[] = [];
+      for (const m of window) {
+        const agentMsg = isAgentMessage(m.content);
+        const who = agentMsg ? agent.name : '使用者';
+        let text: string;
+        if (m.msgType === 'text') {
+          text = agentMsg ? m.content.replace(/^🤖\s*[^:：]*[:：]\s*/, '') : m.content;
+        } else {
+          // File/image/video attachment: render a marker and inline text-file content when possible.
+          text = await renderMessageBody(m, { fetchFile, maxInlineChars: 2000 });
+        }
+        if (text) lines.push(`${who}: ${text}`);
+      }
+      return lines.join('\n');
+    };
 
     // Self-identification: if the sender open_id equals our own open_id, the message was sent by us.
     const isSelf = (msg: LarkMessage): boolean => {
@@ -831,16 +838,16 @@ export class FeishuUserChannel implements Channel {
       return { hit: false, text: msg.content };
     };
 
-    const handle = (msg: LarkMessage, all: LarkMessage[], userText: string): void => {
+    const handle = async (msg: LarkMessage, all: LarkMessage[], userText: string): Promise<void> => {
       log.info(`[${chatName || chatId}] 收到：${preview(userText)}`);
       // Processing indicator: once we detect we should respond, add a reaction first and remove it after the reply is sent (best-effort; failures do not affect the reply).
       // 静默模式不加“处理中”表情（那也是一种对外可见的回应）。
       const reactionId = !quiet && msg.messageId
-        ? addReaction(msg.messageId, cfg.reactionEmoji, { as: 'user', profile })
+        ? await addReaction(msg.messageId, cfg.reactionEmoji, { as: 'user', profile })
         : null;
       let reply: string;
       // Try command mode first (pure code, no kimi call); only hand off to the agent if nothing matches.
-      const dr = dispatchCommand(userText, {
+      const dr = await dispatchCommand(userText, {
         agentName: agent.name,
         identity: cfg.identity,
         source: this.name,
@@ -856,7 +863,7 @@ export class FeishuUserChannel implements Channel {
         reply = dr.reply ?? '';
         // Record command activity for analytics.
         try {
-          store.recordActivity('command', senderOpenId || null, chatId, msg.messageId || null, { command: dr.command, args: dr.args ?? [] });
+          await store.recordActivity('command', senderOpenId || null, chatId, msg.messageId || null, { command: dr.command, args: dr.args ?? [] });
         } catch { /* best-effort */ }
       } else if (quiet) {
         // 静默模式：消息已采集 + 互动已记录，不调用 LLM、不回复。
@@ -866,14 +873,14 @@ export class FeishuUserChannel implements Channel {
         // LP gating: deduct before calling the LLM; refund on error; show balance in footer on success.
         if (senderOpenId) {
           const cost = strategy.cost;
-          const spent = store.spendPt(senderOpenId, cost, 'llm_reply', msg.messageId || undefined);
+          const spent = await store.spendPt(senderOpenId, cost, 'llm_reply', msg.messageId || undefined);
           if (!spent) {
             reply = '你的 LP 不足，明天 05:00 会自动补到 10，或完成任务赚取。';
           } else {
             try {
-              reply = agent.respond({
+              reply = await agent.respondAsync({
                 message: userText,
-                context: buildContext(all, msg.position),
+                context: await buildContext(all, msg.position),
                 session: `${cfg.id}-${chatId}`,
                 userOpenId: senderOpenId,
                 chatId,
@@ -883,26 +890,26 @@ export class FeishuUserChannel implements Channel {
               // Classify the reply, grant bonus LP if applicable, then build the footer with the net delta.
               const { category, reply: judged } = judgeReply(reply, strategy);
               if (category.grant > 0) {
-                store.grantPt(senderOpenId, category.grant, category.reason, msg.messageId || undefined);
+                await store.grantPt(senderOpenId, category.grant, category.reason, msg.messageId || undefined);
               }
               // Prefer the ledger's own per-turn total (SUM over ref_message_id) so any LP change the
               // model made mid-turn via the pt_grant MCP tool is reflected too; fall back to the
               // framework's own two-entry delta when there is no message id to key the lookup off of.
               const netDelta = msg.messageId
-                ? store.netPtChangeForRef(msg.messageId, senderOpenId)
+                ? await store.netPtChangeForRef(msg.messageId, senderOpenId)
                 : category.grant - cost;
-              reply = store.stripStatusFooter(judged) + store.buildStatusFooter(senderOpenId, netDelta, category.footerLabel || undefined);
+              reply = store.stripStatusFooter(judged) + (await store.buildStatusFooter(senderOpenId, netDelta, category.footerLabel || undefined));
             } catch (e) {
               log.error('agent 回复失败（已回退通用回复）：', (e as Error).message);
-              store.grantPt(senderOpenId, cost, 'refund_on_error', msg.messageId || undefined);
+              await store.grantPt(senderOpenId, cost, 'refund_on_error', msg.messageId || undefined);
               reply = '（抱歉，我这边出错了，请稍后再试。）';
             }
           }
         } else {
           try {
-            reply = agent.respond({
+            reply = await agent.respondAsync({
               message: userText,
-              context: buildContext(all, msg.position),
+              context: await buildContext(all, msg.position),
               session: `${cfg.id}-${chatId}`,
               chatId,
               source: this.name,
@@ -917,9 +924,9 @@ export class FeishuUserChannel implements Channel {
         if (!quiet && reply) {
           // Reply within the original message's thread (do not start a new topic in topic-based chats); fall back to sending to the chat directly when there is no message_id.
           if (msg.messageId) {
-            replyText(msg.messageId, cfg.replyPrefix + reply, { as: 'user', profile, inThread: true });
+            await replyText(msg.messageId, cfg.replyPrefix + reply, { as: 'user', profile, inThread: true });
           } else {
-            sendText({ chatId }, cfg.replyPrefix + reply, { as: 'user', profile });
+            await sendText({ chatId }, cfg.replyPrefix + reply, { as: 'user', profile });
           }
           const { body, footer } = store.splitStatusFooter(reply);
           log.info(`[${chatName || chatId}] 已回复：${preview(body)}`);
@@ -928,16 +935,20 @@ export class FeishuUserChannel implements Channel {
       } catch (e) {
         log.error('发送失败：', (e as Error).message);
       } finally {
-        if (msg.messageId && reactionId) removeReaction(msg.messageId, reactionId, { as: 'user', profile });
+        if (msg.messageId && reactionId) await removeReaction(msg.messageId, reactionId, { as: 'user', profile });
       }
     };
 
-    const pollOnce = (): void => {
-      const messages = listMessages(chatId, { pageSize: 20, sort: 'desc', profile });
+    const pollOnce = async (): Promise<void> => {
+      const messages = await listMessages(chatId, { pageSize: 20, sort: 'desc', profile });
       const fresh = messages
         .filter((m) => Number.isFinite(m.position) && m.position > (cursor.lastPosition ?? -1))
         .sort((a, b) => a.position - b.position);
 
+      // Sequential await (not fire-and-forget): a message's handling — including every LP debit/credit
+      // and query it triggers — fully completes, and only then does the cursor advance past it, before
+      // the next message in this batch starts. This preserves the ordering guarantee the previous
+      // synchronous handle() gave for free.
       for (const msg of fresh) {
         cursor.lastPosition = msg.position;
         cursor.lastMessageId = msg.messageId;
@@ -945,7 +956,7 @@ export class FeishuUserChannel implements Channel {
         // ① Full capture (before self-identification and trigger checks); runs for both internal and external chats.
         if (cfg.capture) {
           try {
-            appendTranscript(chatId, {
+            await appendTranscript(chatId, {
               message_id: msg.messageId,
               create_time: msg.createTime,
               sender_open_id: msg.senderOpenId,
@@ -984,10 +995,10 @@ export class FeishuUserChannel implements Channel {
             // Record the interaction best-effort before handing off to the handler.
             if (msg.senderOpenId) {
               try {
-                store.recordInteraction(msg.senderOpenId, msg.senderName, chatId, msg.messageId);
+                await store.recordInteraction(msg.senderOpenId, msg.senderName, chatId, msg.messageId);
               } catch { /* best-effort: do not block reply on gamification errors */ }
             }
-            handle(msg, messages, text);
+            await handle(msg, messages, text);
           }
         }
         saveCursor(key, cursor);
@@ -1008,20 +1019,20 @@ export class FeishuUserChannel implements Channel {
     let inaccessibleStreak = 0;
     const INACCESSIBLE_STANDDOWN_AFTER = 3;
 
-    const tick = (): void => {
+    const tick = async (): Promise<void> => {
       if (!isRunning()) return;
       let nextDelay = cfg.pollIntervalMs;
       try {
-        pollOnce();
+        await pollOnce();
         consecutiveFails = 0; // recovered → back to the normal cadence
         inaccessibleStreak = 0;
       } catch (e) {
         // Dissolved group (232009): permanently gone. Flag it (members→离开), stop this poll loop
         // entirely (no reschedule below), and don't keep logging it as a recurring failure.
         if (isChatGoneError(e)) {
-          const n = store.markChatInactive(chatId, 'dissolved');
+          const n = await store.markChatInactive(chatId, 'dissolved');
           log.warn(`[${chatName || chatId}] 群已解散（code 232009），停止轮询；已标记 ${n} 名成员离开。`);
-          try { store.recordActivity('chat_dissolved', null, chatId, null); } catch { /* best-effort */ }
+          try { await store.recordActivity('chat_dissolved', null, chatId, null); } catch { /* best-effort */ }
           return; // do NOT setTimeout(tick) → this chat's loop ends
         }
         // Inaccessible (kicked out / no permission): possibly recoverable, so stand down only after it
@@ -1029,9 +1040,9 @@ export class FeishuUserChannel implements Channel {
         if (isChatInaccessibleError(e)) {
           inaccessibleStreak += 1;
           if (inaccessibleStreak >= INACCESSIBLE_STANDDOWN_AFTER) {
-            const n = store.markChatInactive(chatId, 'inaccessible');
+            const n = await store.markChatInactive(chatId, 'inaccessible');
             log.warn(`[${chatName || chatId}] 已连续 ${inaccessibleStreak} 次无法访问该群（疑似被移出/无权限），停止轮询；已标记 ${n} 名成员离开。重新入群后会在下次重扫/重启时自动恢复。`);
-            try { store.recordActivity('chat_inaccessible', null, chatId, null); } catch { /* best-effort */ }
+            try { await store.recordActivity('chat_inaccessible', null, chatId, null); } catch { /* best-effort */ }
             return; // stand down: no reschedule
           }
           consecutiveFails += 1;
@@ -1040,7 +1051,7 @@ export class FeishuUserChannel implements Channel {
             `[${chatName || chatId}] 暂时无法访问该群（第 ${inaccessibleStreak}/${INACCESSIBLE_STANDDOWN_AFTER} 次），${Math.round(nextDelay / 1000)}s 后重试：`,
             (e as Error).message
           );
-          if (isRunning()) setTimeout(tick, nextDelay);
+          if (isRunning()) setTimeout(() => void tick(), nextDelay);
           return;
         }
         // Any other failure → require the inaccessible streak to be CONSECUTIVE, so reset it here.
@@ -1069,11 +1080,11 @@ export class FeishuUserChannel implements Channel {
           );
         }
       }
-      if (isRunning()) setTimeout(tick, nextDelay);
+      if (isRunning()) setTimeout(() => void tick(), nextDelay);
     };
     // Defer the first poll by the caller-supplied stagger offset so sibling chat loops don't all fire
     // their first tick at the same instant (0 = start immediately, preserving the original behavior).
-    if (initialDelayMs > 0) setTimeout(tick, initialDelayMs);
-    else tick();
+    if (initialDelayMs > 0) setTimeout(() => void tick(), initialDelayMs);
+    else void tick();
   }
 }
