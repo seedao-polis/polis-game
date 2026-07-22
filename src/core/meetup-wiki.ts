@@ -90,7 +90,7 @@ function buildPastTable(meetups: ActivityMeetup[]): string {
  * page always mirrors the live meetup list. Returns false when the wiki document id is not
  * configured or the overwrite fails; callers treat that as a non-fatal no-op.
  */
-export function refreshMeetupWiki(opts: { profile?: string } = {}): boolean {
+export async function refreshMeetupWiki(opts: { profile?: string } = {}): Promise<boolean> {
   let docId: string | undefined;
   try {
     docId = loadConfigs().lark.activityWikiDocId;
@@ -98,6 +98,6 @@ export function refreshMeetupWiki(opts: { profile?: string } = {}): boolean {
     return false;
   }
   if (!docId) return false;
-  const markdown = generateMeetupWikiMarkdown(listAllMeetupsForWiki());
+  const markdown = generateMeetupWikiMarkdown(await listAllMeetupsForWiki());
   return appendDocxContent(docId, markdown, { profile: opts.profile, overwrite: true, format: 'markdown' });
 }

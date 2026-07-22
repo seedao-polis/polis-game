@@ -46,24 +46,27 @@ function rowToChest(row: Record<string, unknown>): Chest {
   };
 }
 
-export function getChest(chestId: string): Chest | null {
-  const row = getLpDb().prepare('SELECT * FROM chests WHERE chest_id = ?').get(chestId) as Record<string, unknown> | undefined;
-  return row ? rowToChest(row) : null;
+export async function getChest(chestId: string): Promise<Chest | null> {
+  const db = await getLpDb();
+  const { rows } = await db.query<Record<string, unknown>>('SELECT * FROM chests WHERE chest_id = $1', [chestId]);
+  return rows[0] ? rowToChest(rows[0]) : null;
 }
 
 /** Look up a chest by its display name (the name members type in "宝箱 <名称>" commands). */
-export function getChestByName(name: string): Chest | null {
-  const row = getLpDb()
-    .prepare('SELECT * FROM chests WHERE name = ? ORDER BY created_at ASC LIMIT 1')
-    .get(name) as Record<string, unknown> | undefined;
-  return row ? rowToChest(row) : null;
+export async function getChestByName(name: string): Promise<Chest | null> {
+  const db = await getLpDb();
+  const { rows } = await db.query<Record<string, unknown>>(
+    'SELECT * FROM chests WHERE name = $1 ORDER BY created_at ASC LIMIT 1', [name],
+  );
+  return rows[0] ? rowToChest(rows[0]) : null;
 }
 
 /** All chests owned by a given open_id. */
-export function listChestsByOwner(ownerOpenId: string): Chest[] {
-  const rows = getLpDb()
-    .prepare('SELECT * FROM chests WHERE owner_open_id = ? ORDER BY created_at ASC')
-    .all(ownerOpenId) as Array<Record<string, unknown>>;
+export async function listChestsByOwner(ownerOpenId: string): Promise<Chest[]> {
+  const db = await getLpDb();
+  const { rows } = await db.query<Record<string, unknown>>(
+    'SELECT * FROM chests WHERE owner_open_id = $1 ORDER BY created_at ASC', [ownerOpenId],
+  );
   return rows.map(rowToChest);
 }
 
@@ -75,32 +78,33 @@ export function listChestsByOwner(ownerOpenId: string): Chest[] {
  * 120 LP first-contact gift (that gift lives in ensureProfileRaw, which only spendPt/recordInteraction
  * call — grantPt's upsertProfileRaw is a plain no-side-effect upsert).
  */
-export function createChest(input: CreateChestInput): { chest: Chest; created: boolean } {
-  const db = getLpDb();
-  const res = db.prepare(`
-    INSERT OR IGNORE INTO chests(chest_id, name, owner_open_id, is_public)
-    VALUES (?, ?, ?, ?)
-  `).run(input.chestId, input.name, input.ownerOpenId, input.isPublic ? 1 : 0);
-  const created = (res.changes as number) > 0;
+export async function createChest(input: CreateChestInput): Promise<{ chest: Chest; created: boolean }> {
+  const db = await getLpDb();
+  const { rowCount } = await db.query(`
+    INSERT INTO chests(chest_id, name, owner_open_id, is_public)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (chest_id) DO NOTHING
+  `, [input.chestId, input.name, input.ownerOpenId, input.isPublic ? 1 : 0]);
+  const created = rowCount > 0;
   if (created) {
-    grantPt(input.chestId, 0, 'chest_create');
+    await grantPt(input.chestId, 0, 'chest_create');
   }
-  return { chest: getChest(input.chestId)!, created };
+  return { chest: (await getChest(input.chestId))!, created };
 }
 
 /** Idempotently ensure the one public-welfare chest exists, owned by Ricky. Safe to call every settlement. */
-export function ensurePublicWelfareChest(): Chest {
-  return createChest({
+export async function ensurePublicWelfareChest(): Promise<Chest> {
+  return (await createChest({
     chestId: PUBLIC_WELFARE_CHEST_ID,
     name: '公益宝箱',
     ownerOpenId: PUBLIC_WELFARE_CHEST_OWNER,
     isPublic: true,
-  }).chest;
+  })).chest;
 }
 
 /** Current LP balance of a chest (or any account) — a thin read over the shared profiles table. */
-export function chestBalance(chestId: string): number {
-  return getProfile(chestId)?.ptBalance ?? 0;
+export async function chestBalance(chestId: string): Promise<number> {
+  return (await getProfile(chestId))?.ptBalance ?? 0;
 }
 
 /**
@@ -108,50 +112,50 @@ export function chestBalance(chestId: string): number {
  * covered by grantPt/spendPt's own lpTx). Debits first with reason `${reason}:out`; on success credits
  * with `${reason}:in`. Returns insufficient_balance without any write when the debit fails.
  */
-export function transferPt(
+export async function transferPt(
   from: string,
   to: string,
   amount: number,
   reason: string,
   ref?: string,
-): { ok: true } | { ok: false; error: 'insufficient_balance' } {
-  const spent = spendPt(from, amount, `${reason}:out`, ref);
+): Promise<{ ok: true } | { ok: false; error: 'insufficient_balance' }> {
+  const spent = await spendPt(from, amount, `${reason}:out`, ref);
   if (!spent) return { ok: false, error: 'insufficient_balance' };
-  grantPt(to, amount, `${reason}:in`, ref);
+  await grantPt(to, amount, `${reason}:in`, ref);
   return { ok: true };
 }
 
 /** Deposit LP from the chest's owner into the chest. Owner-only. */
-export function chestDeposit(
+export async function chestDeposit(
   chestId: string,
   senderOpenId: string,
   amount: number,
   ref?: string,
-): { ok: true; balance: number } | { ok: false; error: ChestOpError } {
-  const chest = getChest(chestId);
+): Promise<{ ok: true; balance: number } | { ok: false; error: ChestOpError }> {
+  const chest = await getChest(chestId);
   if (!chest) return { ok: false, error: 'not_found' };
   if (senderOpenId !== chest.ownerOpenId) return { ok: false, error: 'not_owner' };
   if (!(amount > 0)) return { ok: false, error: 'invalid_amount' };
-  const result = transferPt(senderOpenId, chestId, amount, 'chest_deposit', ref);
+  const result = await transferPt(senderOpenId, chestId, amount, 'chest_deposit', ref);
   if (!result.ok) return result;
-  return { ok: true, balance: chestBalance(chestId) };
+  return { ok: true, balance: await chestBalance(chestId) };
 }
 
 /** Withdraw LP from the chest to a target account. Owner-only. */
-export function chestWithdraw(
+export async function chestWithdraw(
   chestId: string,
   senderOpenId: string,
   targetOpenId: string,
   amount: number,
   ref?: string,
-): { ok: true; balance: number } | { ok: false; error: ChestOpError } {
-  const chest = getChest(chestId);
+): Promise<{ ok: true; balance: number } | { ok: false; error: ChestOpError }> {
+  const chest = await getChest(chestId);
   if (!chest) return { ok: false, error: 'not_found' };
   if (senderOpenId !== chest.ownerOpenId) return { ok: false, error: 'not_owner' };
   if (!(amount > 0)) return { ok: false, error: 'invalid_amount' };
-  const result = transferPt(chestId, targetOpenId, amount, 'chest_withdraw', ref);
+  const result = await transferPt(chestId, targetOpenId, amount, 'chest_withdraw', ref);
   if (!result.ok) return result;
-  return { ok: true, balance: chestBalance(chestId) };
+  return { ok: true, balance: await chestBalance(chestId) };
 }
 
 /** Deterministic, human-legible chest id derived from its display name. */
@@ -171,10 +175,10 @@ const CHEST_USAGE =
  * deposit / withdraw are gated on `sender === chest.ownerOpenId`. Must run before the bet parser (like
  * the community-prediction announce/cancel commands), since "宝箱 X 转出 @某人 3" ends in a number.
  */
-export function tryHandleChestCommand(
+export async function tryHandleChestCommand(
   rawText: string,
   senderOpenId: string,
-): { reply: string } | false {
+): Promise<{ reply: string } | false> {
   const cmd = parseCommand(rawText);
   if (!cmd) return false;
   if (cmd.name !== '宝箱' && cmd.name !== 'chest') return false;
@@ -184,14 +188,14 @@ export function tryHandleChestCommand(
 
   const first = args[0]!;
   if (first === '创建' || first.toLowerCase() === 'create') {
-    if (!hasBadge(senderOpenId, CHEST_KEEPER_BADGE_ID)) {
+    if (!(await hasBadge(senderOpenId, CHEST_KEEPER_BADGE_ID))) {
       return { reply: '只有持有【宝箱怪的朋友】徽章的成员才能创建宝箱，先找管理员申请这枚徽章吧。' };
     }
     const name = args.slice(1).join(' ').trim();
     if (!name) return { reply: '用法：宝箱 创建 <名称>' };
     if ([...name].length > 40) return { reply: '宝箱名称太长，请换一个短一点的（≤40 字）再试。' };
     const chestId = deriveChestId(name);
-    const { chest, created } = createChest({ chestId, name, ownerOpenId: senderOpenId });
+    const { chest, created } = await createChest({ chestId, name, ownerOpenId: senderOpenId });
     if (!created) {
       return chest.ownerOpenId === senderOpenId
         ? { reply: `宝箱【${name}】你之前已经创建过了，直接发【宝箱 ${name}】即可查询。` }
@@ -206,14 +210,14 @@ export function tryHandleChestCommand(
 
   // Everything else: args[0] is the chest name; an optional args[1] is the sub-action.
   const name = first.trim();
-  const chest = getChestByName(name);
+  const chest = await getChestByName(name);
   if (!chest) return { reply: `找不到宝箱【${name}】。用【宝箱 创建 <名称>】新建一个。` };
 
   const sub = args[1];
   if (!sub) {
     // Bare "宝箱 <名称>" — balance query, open to anyone.
-    const balance = chestBalance(chest.chestId);
-    const ownerName = memberName(chest.ownerOpenId) || chest.ownerOpenId;
+    const balance = await chestBalance(chest.chestId);
+    const ownerName = (await memberName(chest.ownerOpenId)) || chest.ownerOpenId;
     return { reply: `宝箱【${chest.name}】当前余额：${balance.toFixed(1)} LP（拥有者：${ownerName}）` };
   }
 
@@ -221,7 +225,7 @@ export function tryHandleChestCommand(
     if (senderOpenId !== chest.ownerOpenId) return { reply: `只有宝箱【${chest.name}】的拥有者才能存入。` };
     const amount = parseLpAmount(args.slice(2));
     if (amount === null) return { reply: `用法：宝箱 ${chest.name} 存入 <金额>，例如「宝箱 ${chest.name} 存入 5」。` };
-    const result = chestDeposit(chest.chestId, senderOpenId, amount);
+    const result = await chestDeposit(chest.chestId, senderOpenId, amount);
     if (!result.ok) {
       return { reply: result.error === 'insufficient_balance' ? 'LP 余额不足，存入失败。' : '存入失败，请重试。' };
     }
@@ -244,16 +248,16 @@ export function tryHandleChestCommand(
     if (targetToken.startsWith('ou_')) {
       targetOpenId = targetToken;
     } else {
-      const matches = findOpenIdsByName(targetToken);
+      const matches = await findOpenIdsByName(targetToken);
       if (matches.length === 0) return { reply: `找不到成员【${targetToken}】，请确认名字或改用 open_id（ou_ 开头）。` };
       if (matches.length > 1) return { reply: `【${targetToken}】匹配到多个成员，请改用 open_id（ou_ 开头）指定。` };
       targetOpenId = matches[0]!.openId;
     }
-    const result = chestWithdraw(chest.chestId, senderOpenId, targetOpenId, amount);
+    const result = await chestWithdraw(chest.chestId, senderOpenId, targetOpenId, amount);
     if (!result.ok) {
       return { reply: result.error === 'insufficient_balance' ? `宝箱【${chest.name}】余额不足，转出失败。` : '转出失败，请重试。' };
     }
-    const targetName = memberName(targetOpenId) || targetOpenId;
+    const targetName = (await memberName(targetOpenId)) || targetOpenId;
     return { reply: `已从宝箱【${chest.name}】转出 ${amount.toFixed(1)} LP 给 ${targetName}，宝箱当前余额：${result.balance.toFixed(1)} LP。` };
   }
 

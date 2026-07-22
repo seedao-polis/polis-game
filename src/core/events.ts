@@ -184,10 +184,10 @@ registerEvent({
   overlays: [],
   gapLines: 1,
   schedule: { kind: 'weekly', weekday: 1, windowStart: '19:00', windowEnd: '20:00', probability: 0.25, note: '每周一·19:00-20:00随机·25%触发' },
-  prepare: (opts) => {
+  prepare: async (opts) => {
     // messages.create_time is in milliseconds, so the cutoff is too.
     const cutoffMs = Date.now() - LURKER_SILENT_DAYS * 86400 * 1000;
-    const report = store.silentMemberReport(cutoffMs, {
+    const report = await store.silentMemberReport(cutoffMs, {
       sourceChatIds: LURKER_SOURCE_CHAT_IDS,
       excludeOpenIds: [SELF_BOT_OPEN_ID], // exclude only the bot; everyone else (incl. the operator) is fair game
     });
@@ -196,31 +196,35 @@ registerEvent({
     // which names CROSS-TENANT/EXTERNAL members too) -> the contact API (internal users only). Live
     // rosters are fetched once per chat and cached for this call; a resolved name is written back to
     // the directory (NOT profiles, to keep gamification clean). Falls back to the open_id if all fail.
-    const rosterCache = new Map<string, Map<string, string>>();
-    const roster = (chatId: string): Map<string, string> => {
+    // Caches the fetch PROMISE (not the resolved map) so concurrent resolveName calls for the same
+    // chat share one in-flight listChatMembers call instead of each spawning their own.
+    const rosterCache = new Map<string, Promise<Map<string, string>>>();
+    const roster = (chatId: string): Promise<Map<string, string>> => {
       let r = rosterCache.get(chatId);
       if (!r) {
-        try {
-          r = listChatMembers(chatId, { profile: opts.profile });
-        } catch (e) {
-          // A source chat that's gone shouldn't fail the whole event — flag it and use an empty roster.
-          // Only mark on 'dissolved' (definitive); 'inaccessible' is left to the poll loop's conservative
-          // stand-down so a transient permission blip during an event doesn't sideline the chat.
-          if (isChatGoneError(e)) store.markChatInactive(chatId, 'dissolved');
-          else if (!isChatInaccessibleError(e)) log.warn(`潜水事件读取群成员失败【${chatId}】：`, (e as Error).message);
-          r = new Map();
-        }
+        r = (async (): Promise<Map<string, string>> => {
+          try {
+            return await listChatMembers(chatId, { profile: opts.profile });
+          } catch (e) {
+            // A source chat that's gone shouldn't fail the whole event — flag it and use an empty roster.
+            // Only mark on 'dissolved' (definitive); 'inaccessible' is left to the poll loop's conservative
+            // stand-down so a transient permission blip during an event doesn't sideline the chat.
+            if (isChatGoneError(e)) void store.markChatInactive(chatId, 'dissolved');
+            else if (!isChatInaccessibleError(e)) log.warn(`潜水事件读取群成员失败【${chatId}】：`, (e as Error).message);
+            return new Map();
+          }
+        })();
         rosterCache.set(chatId, r);
       }
       return r;
     };
-    const resolveName = (m: store.SilentMember): string => {
-      if (!m.name) m.name = store.memberName(m.openId); // directory (already-synced)
+    const resolveName = async (m: store.SilentMember): Promise<string> => {
+      if (!m.name) m.name = await store.memberName(m.openId); // directory (already-synced)
       if (!m.name) {
-        const fetched = (m.chatId ? roster(m.chatId).get(m.openId) : '') || getUserName(m.openId, opts.profile);
+        const fetched = (m.chatId ? (await roster(m.chatId)).get(m.openId) : '') || (await getUserName(m.openId, opts.profile));
         if (fetched) {
           m.name = fetched;
-          try { store.recordChatMember(m.chatId, m.openId, fetched); } catch { /* cache best-effort */ }
+          try { await store.recordChatMember(m.chatId, m.openId, fetched); } catch { /* cache best-effort */ }
         }
       }
       return m.name || m.openId;
@@ -240,7 +244,7 @@ registerEvent({
     // In dry-run, also list who qualifies (capped), resolving real names for any bare ou_ ids.
     if (opts.dryRun) {
       const sample = (report.silent.length ? report.silent : report.members).slice(0, 20);
-      const lines = sample.map((m) => `    - ${resolveName(m)}（最后发言 ${fmtLast(m.lastSpoke)}）`);
+      const lines = await Promise.all(sample.map(async (m) => `    - ${await resolveName(m)}（最后发言 ${fmtLast(m.lastSpoke)}）`));
       log.info(
         `${report.silent.length ? '潜水候选名单' : '当前无潜水者，全体成员名单'}（${report.silent.length || report.members.length} 人，取前 ${sample.length}）：\n${lines.join('\n')}`
       );
@@ -252,7 +256,7 @@ registerEvent({
       lurker = report.silent[Math.floor(Math.random() * report.silent.length)];
     } else if (opts.force && report.members.length) {
       lurker = report.members[0]; // members are sorted oldest-spoke first → the quietest one
-      log.info(`潜水事件【手动强制】近 ${LURKER_SILENT_DAYS} 天无人潜水，改选最久未发言者：${resolveName(lurker)}`);
+      log.info(`潜水事件【手动强制】近 ${LURKER_SILENT_DAYS} 天无人潜水，改选最久未发言者：${await resolveName(lurker)}`);
     }
     if (!lurker) {
       // Scheduled (non-force): everyone has spoken recently → don't send even though it triggered.
@@ -263,8 +267,8 @@ registerEvent({
       );
       return null;
     }
-    const reward = store.hasFirstContact(lurker.openId); // only reward if they've ever @-ed the bot
-    const lurkerName = resolveName(lurker); // resolve real name (and cache it) for the @-mention + log
+    const reward = await store.hasFirstContact(lurker.openId); // only reward if they've ever @-ed the bot
+    const lurkerName = await resolveName(lurker); // resolve real name (and cache it) for the @-mention + log
     log.info(`潜水事件选中：${lurkerName}（最后发言 ${fmtLast(lurker.lastSpoke)}，first_contact=${reward}）`);
     const firstLine =
       `今天某个成员的 AI Agent，发现了一个久未发言的社区成员 {{@lurker}}，让我们大家一起来认识他一下吧！` +
@@ -276,10 +280,10 @@ registerEvent({
       // Target = the 运营小天地 group (scope global + targetChatId). The lurker is a member of it, so
       // {{@lurker}} stays a real @. Under `--test` the CLI redirects the send to the operator's P2P,
       // where the lurker isn't a participant, so it auto-downgrades to "@name" text.
-      afterSend: () => {
+      afterSend: async () => {
         if (reward) {
           try {
-            store.grantPt(lurker.openId, LURKER_PT_REWARD, 'event:lurker-discovered');
+            await store.grantPt(lurker.openId, LURKER_PT_REWARD, 'event:lurker-discovered');
             log.info(`潜水被发现奖励：${lurker.openId} +${LURKER_PT_REWARD} LP`);
           } catch (e) {
             log.warn('潜水事件发 LP 失败：', (e as Error).message);
@@ -464,10 +468,10 @@ registerEvent({
   prepare: (opts) => {
     const actor = opts.actorOpenId;
     return {
-      afterSend: () => {
+      afterSend: async () => {
         if (!actor) return;
         try {
-          store.grantPt(actor, LIKE_MANIAC_PT_REWARD, 'event:like-maniac-notify');
+          await store.grantPt(actor, LIKE_MANIAC_PT_REWARD, 'event:like-maniac-notify');
           log.info(`点赞狂魔奖励：${actor} +${LIKE_MANIAC_PT_REWARD} LP`);
         } catch (e) {
           log.warn('点赞狂魔事件发 LP 失败：', (e as Error).message);
@@ -505,10 +509,10 @@ registerEvent({
   prepare: (opts) => {
     const actor = opts.actorOpenId;
     return {
-      afterSend: () => {
+      afterSend: async () => {
         if (!actor) return;
         try {
-          store.grantPt(actor, FIRST_TRY_PT_REWARD, 'event:first-try-notify');
+          await store.grantPt(actor, FIRST_TRY_PT_REWARD, 'event:first-try-notify');
           log.info(`首次尝新功能奖励：${actor} +${FIRST_TRY_PT_REWARD} LP`);
         } catch (e) {
           log.warn('首次尝新功能事件发 LP 失败：', (e as Error).message);
@@ -522,13 +526,13 @@ registerEvent({
  * Human-readable target label for logs: "群名（chat_id）" for a group / "用户名（open_id）" for a P2P,
  * falling back to the bare id when the name isn't known (e.g. chat not yet synced into the directory).
  */
-function describeTarget(target: { chatId?: string; userId?: string }): string {
+async function describeTarget(target: { chatId?: string; userId?: string }): Promise<string> {
   if (target.chatId) {
-    const name = store.chatName(target.chatId);
+    const name = await store.chatName(target.chatId);
     return name ? `${name}（${target.chatId}）` : target.chatId;
   }
   if (target.userId) {
-    const name = store.memberName(target.userId);
+    const name = await store.memberName(target.userId);
     return name ? `${name}（${target.userId}）` : target.userId;
   }
   return '(无)';
@@ -586,16 +590,16 @@ function buildLine(line: string, mentions: Record<string, { id: string; name?: s
 }
 
 /** Game-info placeholders for a user (name/pt/level/badges). */
-function actorVars(openId: string): Record<string, string | number> {
+async function actorVars(openId: string): Promise<Record<string, string | number>> {
   const out: Record<string, string | number> = {};
   try {
-    const p = store.getProfile(openId);
+    const p = await store.getProfile(openId);
     if (p) {
       out.name = p.name || '';
       out.pt = p.ptBalance;
       out.level = p.level;
     }
-    const badges = store.listBadges(openId);
+    const badges = await store.listBadges(openId);
     out.badges = badges.map((b) => `${b.emoji || ''}${b.name}`).join('、');
     out.badge_count = badges.length;
   } catch {
@@ -738,7 +742,7 @@ export async function rollScheduledEvent(eventTypeId: string, profile?: string):
   if (!cfg || !cfg.schedule) return 'no-schedule';
   // Probability miss → consume the plan, nothing sent.
   if (Math.random() >= cfg.schedule.probability) {
-    store.resolveScheduleRoll(eventTypeId, 'missed');
+    await store.resolveScheduleRoll(eventTypeId, 'missed');
     log.info(`事件未命中【${eventTypeId}】（概率 ${Math.round(cfg.schedule.probability * 100)}%）`);
     return 'missed';
   }
@@ -746,7 +750,7 @@ export async function rollScheduledEvent(eventTypeId: string, profile?: string):
   log.info(`事件命中【${eventTypeId}】，准备发送…`);
   const res = await fireEvent(eventTypeId, { triggerReason: 'scheduled', profile });
   const outcome: 'fired' | 'skipped' | 'send-failed' = res.skipped ? 'skipped' : res.ok ? 'fired' : 'send-failed';
-  store.resolveScheduleRoll(eventTypeId, outcome);
+  await store.resolveScheduleRoll(eventTypeId, outcome);
   return outcome;
 }
 
@@ -755,12 +759,12 @@ export async function rollScheduledEvent(eventTypeId: string, profile?: string):
  * DM — its two participants (the recipient + this bot). Returns null when membership can't be
  * determined (then we don't touch the @-mentions). Used to downgrade @ of non-members to plain text.
  */
-function destinationMemberIds(
+async function destinationMemberIds(
   target: { chatId?: string; userId?: string },
   profile?: string,
-): Set<string> | null {
+): Promise<Set<string> | null> {
   try {
-    if (target.chatId) return new Set(listChatMembers(target.chatId, { profile }).keys());
+    if (target.chatId) return new Set((await listChatMembers(target.chatId, { profile })).keys());
     if (target.userId) return new Set([target.userId, SELF_BOT_OPEN_ID]);
   } catch {
     /* ignore — treat as unknown */
@@ -820,7 +824,7 @@ export async function fireEvent(eventTypeId: string, opts: FireEventOptions = {}
   // Assemble placeholder vars: date -> actor game info -> prepared -> caller overrides.
   const vars: Record<string, string | number> = {
     ...dateVars(),
-    ...(opts.actorOpenId ? actorVars(opts.actorOpenId) : {}),
+    ...(opts.actorOpenId ? await actorVars(opts.actorOpenId) : {}),
     ...(prepared?.vars ?? {}),
     ...(opts.vars ?? {}),
   };
@@ -847,7 +851,7 @@ export async function fireEvent(eventTypeId: string, opts: FireEventOptions = {}
 
   // Mirror the event definition into the DB (so dispatches can reference it and it's maintainable).
   try {
-    store.upsertEventType({
+    await store.upsertEventType({
       eventTypeId: cfg.eventTypeId,
       title: cfg.title,
       description: cfg.description,
@@ -863,7 +867,7 @@ export async function fireEvent(eventTypeId: string, opts: FireEventOptions = {}
   // Record a pending dispatch up front (skipped in dry-run — a preview leaves no trace).
   let dispatchId = 0;
   if (!opts.dryRun) try {
-    dispatchId = store.insertEventDispatch({
+    dispatchId = await store.insertEventDispatch({
       eventTypeId: cfg.eventTypeId,
       triggerReason: opts.triggerReason ?? 'manual',
       scope: cfg.scope,
@@ -875,13 +879,13 @@ export async function fireEvent(eventTypeId: string, opts: FireEventOptions = {}
     log.warn(`事件 dispatch 记录失败【${eventTypeId}】：`, (e as Error).message);
   }
 
-  const fail = (error: string): FireEventResult => {
+  const fail = async (error: string): Promise<FireEventResult> => {
     log.error(`事件发送失败【${eventTypeId}】(dispatch=${dispatchId})：${error}`);
     try {
-      store.updateEventDispatch(dispatchId, { status: 'failed', errorMsg: error });
+      await store.updateEventDispatch(dispatchId, { status: 'failed', errorMsg: error });
     } catch { /* best-effort */ }
     try {
-      store.recordError({ kind: 'event', summary: `事件【${eventTypeId}】发送失败：${error}`.slice(0, 300), source: 'events' });
+      await store.recordError({ kind: 'event', summary: `事件【${eventTypeId}】发送失败：${error}`.slice(0, 300), source: 'events' });
     } catch { /* best-effort */ }
     return { dispatchId, ok: false, error };
   };
@@ -897,12 +901,12 @@ export async function fireEvent(eventTypeId: string, opts: FireEventOptions = {}
     // Who is actually in the destination? Used to downgrade @ of non-members to plain text (an `at`
     // to someone not in the chat is rejected; naming them as text is fine). Only looked up when there
     // are mentions to check.
-    const destIds = Object.keys(mentions).length ? destinationMemberIds(target, opts.profile) : null;
+    const destIds = Object.keys(mentions).length ? await destinationMemberIds(target, opts.profile) : null;
 
     // Dry-run: stop here — show who would be picked and what the message would say, then bail out
     // before uploading / sending / recording / rewarding.
     if (opts.dryRun) {
-      const previewTo = describeTarget(target);
+      const previewTo = await describeTarget(target);
       const mentionList = Object.entries(mentions).map(([k, v]) => {
         const inChat = destIds ? destIds.has(v.id) : null;
         const tag = inChat === false ? '[不在目标→降级为@文本]' : inChat === true ? '[可@]' : '';
@@ -916,7 +920,7 @@ export async function fireEvent(eventTypeId: string, opts: FireEventOptions = {}
     }
 
     // 2) Upload to get an image_key.
-    const imageKey = uploadImage(rendered.outPath, { profile: opts.profile });
+    const imageKey = await uploadImage(rendered.outPath, { profile: opts.profile });
     if (!imageKey) return fail('上传图片失败（uploadImage 返回 null）');
 
     // 3) Build the post content: title -> (blank) -> image -> (blank) -> body, with @-mentions.
@@ -936,17 +940,17 @@ export async function fireEvent(eventTypeId: string, opts: FireEventOptions = {}
     if (downgraded > 0) log.info(`事件【${eventTypeId}】：${downgraded} 个 @ 对象不在目标会话，已改为 @名字 文本`);
 
     // 4) Send to the single target.
-    const res = sendPost(target, { title, content }, { as: 'bot', profile: opts.profile });
+    const res = await sendPost(target, { title, content }, { as: 'bot', profile: opts.profile });
 
     // 5) Write back success + message_id.
     try {
-      store.updateEventDispatch(dispatchId, {
+      await store.updateEventDispatch(dispatchId, {
         status: 'sent',
         messageId: res.messageId ?? null,
         sentAt: Math.floor(Date.now() / 1000),
       });
     } catch { /* best-effort */ }
-    log.info(`事件已发送【${eventTypeId}】，目标 ${describeTarget(target)}（message_id=${res.messageId ?? '?'}）`);
+    log.info(`事件已发送【${eventTypeId}】，目标 ${await describeTarget(target)}（message_id=${res.messageId ?? '?'}）`);
     const result: FireEventResult = { dispatchId, ok: true, messageId: res.messageId };
 
     // 6) Post-send side effects (e.g. grant LP). Best-effort: a reward failure must not undo the send.

@@ -30,10 +30,10 @@ const MAX_INLINE = 15;
  * activities or the activity module is absent for this soul, so it self-gates to the soul that
  * actually runs the module (others simply get no block).
  */
-export function buildMeetupContextBlock(): string {
-  let meetups: ReturnType<typeof listActiveMeetupsForContext>;
+export async function buildMeetupContextBlock(): Promise<string> {
+  let meetups: Awaited<ReturnType<typeof listActiveMeetupsForContext>>;
   try {
-    meetups = listActiveMeetupsForContext();
+    meetups = await listActiveMeetupsForContext();
   } catch {
     return ''; // activity module table not present for this soul
   }

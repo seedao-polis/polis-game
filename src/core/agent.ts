@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { assembleSoul, soulExists } from './soul.js';
-import { runKimi, runKimiAsync, KimiError } from './kimi.js';
+import { runKimiAsync, KimiError } from './kimi.js';
 import { resolveSessionDir, validateSession, quarantineSession, quarantineCorruptSessionsFor, healSessionFor } from './kimi-session.js';
 import { skillsDirsForSoul } from './skills.js';
 import { appendJournal } from './memory.js';
@@ -16,17 +16,7 @@ import type { KimiProfile } from './configs.js';
 import { loadLpStrategy, buildJudgeInstruction } from './lp-strategy.js';
 import { buildMeetupContextBlock } from './meetup-context.js';
 
-/** Block the current thread for ms milliseconds (respond() is synchronous end-to-end). */
-function sleepSync(ms: number): void {
-  if (ms <= 0) return;
-  try {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  } catch {
-    /* SharedArrayBuffer unavailable — skip the backoff rather than fail */
-  }
-}
-
-/** Inputs to the self-heal loop (shared by the sync and async runners). */
+/** Inputs to the self-heal loop. */
 interface HealArgs {
   prompt: string;
   /** Moderation-safe fallback: persona + bare user message, no injected memory / backstory / context. */
@@ -122,9 +112,9 @@ export class Agent {
    * The soul is reassembled on every call so changes to persona files and chat policies are
    * picked up without a restart. Long-term memories from the DB are injected after the
    * identity context and before the user message, filtered by the caller's policy context.
-   * Shared by the sync ({@link respond}) and async ({@link respondAsync}) entry points.
+   * The sole preparation step behind {@link respondAsync}.
    */
-  private prepare(input: RespondInput): { prompt: string; workDir: string; heal: HealArgs } {
+  private async prepare(input: RespondInput): Promise<{ prompt: string; workDir: string; heal: HealArgs }> {
     // Pass chatId so the soul assembler can append the per-group policy.
     const soul = assembleSoul(this.name, { chatId: input.chatId });
 
@@ -179,7 +169,7 @@ export class Agent {
     // the model to echo a (wrong) footer of its own. If asked, it can read the balance via the profile tool.
     let identity = '';
     if (input.userOpenId) {
-      const p = getProfile(input.userOpenId);
+      const p = await getProfile(input.userOpenId);
       const name = input.userName || p?.name || '';
       identity =
         `【当前对话者】${name ? `姓名：${name}；` : ''}open_id：${input.userOpenId}。` +
@@ -200,7 +190,7 @@ export class Agent {
           isAdmin: isAdmin(input.userOpenId),
         };
         const namespaces = allowedNamespaces(ctx);
-        const memories = getFilteredMemories(ctx, {
+        const memories = await getFilteredMemories(ctx, {
           namespaces,
           groupCharLimit: 500,
           userCharLimit: 300,
@@ -243,7 +233,7 @@ export class Agent {
     // Activity module context (serve only): inject current/upcoming community activities from the
     // activity_meetups DB so the agent answers "what's on today / recently" from real data with
     // links. Self-gates to '' when the soul has no activities, so non-activity souls are unaffected.
-    const meetupBlock = isServe ? buildMeetupContextBlock() : '';
+    const meetupBlock = isServe ? await buildMeetupContextBlock() : '';
 
     const prompt = `${scene}${nowLine}${turnLine}${filesLine}${identity}${memBlock}${meetupBlock}${body}\n\n${langRule}${judge ? '\n\n' + judge : ''}`;
     // Moderation-safe fallback prompt (used by the content-rejected retry in runWithHeal): persona +
@@ -276,7 +266,7 @@ export class Agent {
    */
   async summarizeUserMemory(chatId: string, userOpenId: string): Promise<void> {
     try {
-      const rows = getRecentUserMessagesInChat(chatId, userOpenId, 30);
+      const rows = await getRecentUserMessagesInChat(chatId, userOpenId, 30);
       if (rows.length === 0) return;
 
       const corpus = rows.map((r, i) => `${i + 1}. ${r.text}`).join('\n');
@@ -310,7 +300,7 @@ export class Agent {
       if (!summary.trim()) return;
 
       const { namespace, visibility } = resolveWriteScope(chatId, userOpenId);
-      upsertMemory({
+      await upsertMemory({
         namespace,
         key: 'auto-summary',
         content: summary.trim(),
@@ -333,20 +323,12 @@ export class Agent {
     }
   }
 
-  /** Have the agent respond to a single message (synchronous; blocks the event loop). */
-  respond(input: RespondInput): string {
-    const { heal } = this.prepare(input);
-    const reply = this.runWithHeal(heal);
-    this.writeJournal(input.message, reply);
-    return reply;
-  }
-
   /**
-   * Async twin of {@link respond}: generates the reply without blocking the event loop, so a
-   * channel can keep receiving and reacting to new messages while this one is being answered.
+   * Have the agent respond to a single message, without blocking the event loop, so a channel can
+   * keep receiving and reacting to new messages while this one is being answered.
    */
   async respondAsync(input: RespondInput): Promise<string> {
-    const { heal } = this.prepare(input);
+    const { heal } = await this.prepare(input);
     const reply = await this.runWithHealAsync(heal);
     this.writeJournal(input.message, reply);
     return reply;
@@ -361,41 +343,6 @@ export class Agent {
    * The thrown error stays generic at the channel layer (users get a short, friendly notice);
    * all the detail lives in the logs / postmortem files / ledger.
    */
-  private runWithHeal(args: HealArgs): string {
-    const { timeoutMs, extraArgs, skillsDirs, maxRetries, corrId } = this.healSetup();
-    let continueSession = args.useSession;
-    let lastErr: KimiError | null = null;
-    let triedReduced = false;
-
-    for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
-      try {
-        return runKimi({ prompt: args.prompt, workDir: args.workDir, continueSession, timeoutMs, extraArgs, skillsDirs });
-      } catch (e) {
-        const r = this.processAttemptError(e, args, corrId, attempt, maxRetries, continueSession);
-        lastErr = r.err;
-        // Content-moderation rejection (400 "high risk"): the trigger is the injected memory / group
-        // backstory / session history, not the benign user message. Retry ONCE with the reduced prompt
-        // (persona + bare message) and a fresh session, which passes moderation and still answers.
-        if (r.err.kind === 'content-rejected' && !triedReduced && args.reducedPrompt) {
-          triedReduced = true;
-          try {
-            const reduced = runKimi({ prompt: args.reducedPrompt, workDir: args.workDir, continueSession: false, timeoutMs, extraArgs, skillsDirs });
-            log.info(`[${corrId}] ${this.name} 内容风控回退：精简提示重试成功（已略去记忆/上下文）`);
-            return reduced;
-          } catch (e2) {
-            lastErr = this.processAttemptError(e2, { ...args, prompt: args.reducedPrompt }, corrId, attempt, maxRetries, false).err;
-          }
-        }
-        if (!r.willRetry) break;
-        continueSession = r.continueSession;
-        if (r.backoffMs) sleepSync(r.backoffMs);
-      }
-    }
-    this.finalHeal(args.workDir);
-    throw lastErr ?? new Error('kimi-code 执行失败：未知错误');
-  }
-
-  /** Async twin of {@link runWithHeal}; identical policy, non-blocking. */
   private async runWithHealAsync(args: HealArgs): Promise<string> {
     const { timeoutMs, extraArgs, skillsDirs, maxRetries, corrId } = this.healSetup();
     let continueSession = args.useSession;
@@ -406,7 +353,7 @@ export class Agent {
       try {
         return await runKimiAsync({ prompt: args.prompt, workDir: args.workDir, continueSession, timeoutMs, extraArgs, skillsDirs });
       } catch (e) {
-        const r = this.processAttemptError(e, args, corrId, attempt, maxRetries, continueSession);
+        const r = await this.processAttemptError(e, args, corrId, attempt, maxRetries, continueSession);
         lastErr = r.err;
         // Content-moderation rejection (400 "high risk"): the trigger is the injected memory / group
         // backstory / session history, not the benign user message. Retry ONCE with the reduced prompt
@@ -418,7 +365,7 @@ export class Agent {
             log.info(`[${corrId}] ${this.name} 内容风控回退：精简提示重试成功（已略去记忆/上下文）`);
             return reduced;
           } catch (e2) {
-            lastErr = this.processAttemptError(e2, { ...args, prompt: args.reducedPrompt }, corrId, attempt, maxRetries, false).err;
+            lastErr = (await this.processAttemptError(e2, { ...args, prompt: args.reducedPrompt }, corrId, attempt, maxRetries, false)).err;
           }
         }
         if (!r.willRetry) break;
@@ -449,16 +396,15 @@ export class Agent {
 
   /**
    * Classify + log + ledger + repair one failed attempt, and decide whether/how to retry.
-   * Shared by the sync and async heal loops.
    */
-  private processAttemptError(
+  private async processAttemptError(
     e: unknown,
     args: HealArgs,
     corrId: string,
     attempt: number,
     maxRetries: number,
     continueSession: boolean
-  ): { err: KimiError; willRetry: boolean; continueSession: boolean; backoffMs: number } {
+  ): Promise<{ err: KimiError; willRetry: boolean; continueSession: boolean; backoffMs: number }> {
     const err =
       e instanceof KimiError
         ? e
@@ -474,7 +420,7 @@ export class Agent {
 
     const willRetry = attempt <= maxRetries && err.retryable;
     const healed = this.healSession(err, args.workDir);
-    this.recordFailure(err, { chatId: args.chatId, source: args.source, attempt, healed, willRetry });
+    await this.recordFailure(err, { chatId: args.chatId, source: args.source, attempt, healed, willRetry });
 
     let nextContinue = continueSession;
     let backoffMs = 0;
@@ -521,10 +467,10 @@ export class Agent {
   }
 
   /** Log a classified one-liner + write a full postmortem file + append to the error ledger. */
-  private recordFailure(
+  private async recordFailure(
     err: KimiError,
     ctx: { chatId?: string; source?: string; attempt: number; healed: boolean; willRetry: boolean }
-  ): void {
+  ): Promise<void> {
     const corrId = err.corrId ?? '------';
     const pm = writePostmortem(corrId, err.postmortem());
     const tail = ctx.willRetry ? `重试中（第 ${ctx.attempt} 次后）` : '已放弃，回退通用回复';
@@ -534,7 +480,7 @@ export class Agent {
         (pm ? ` · 详见 ${pm}` : '') +
         ` · ${tail}`
     );
-    recordError({
+    await recordError({
       corrId,
       soul: this.name,
       chatId: ctx.chatId ?? null,

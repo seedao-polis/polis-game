@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { REPO_ROOT } from './paths.js';
 import * as store from './store.js';
+import { isPgUnavailableError, PG_UNAVAILABLE_REPLY_ZH } from './db.js';
 import {
   subscribeMeetupTag,
   unsubscribeMeetupTag,
@@ -52,7 +53,7 @@ export interface Command {
   /** usage string used by help <command> */
   usage?: string;
   /** execute: returns the plain-text reply to send */
-  run(args: string[], ctx: CommandContext): string;
+  run(args: string[], ctx: CommandContext): Promise<string>;
 }
 
 export interface DispatchResult {
@@ -205,7 +206,7 @@ export function parseRename(raw: string): string | null {
   return rest;
 }
 
-function applyRename(rawName: string, ctx: CommandContext): string {
+async function applyRename(rawName: string, ctx: CommandContext): Promise<string> {
   if (!ctx.senderOpenId) {
     return '无法确认你的身份（缺少 sender open_id），请在飞书群里 @ 我使用改名。';
   }
@@ -215,8 +216,8 @@ function applyRename(rawName: string, ctx: CommandContext): string {
     return `新名字不太合适（不能换行，且最多 ${MAX_NAME_LEN} 个字），请换一个短一点的再试。`;
   }
   // Resolve the current display name (already override-aware) before writing, so we can echo old → new.
-  const before = store.memberName(ctx.senderOpenId) || store.getProfile(ctx.senderOpenId)?.name || '';
-  const saved = store.setPreferredName(ctx.senderOpenId, name);
+  const before = (await store.memberName(ctx.senderOpenId)) || (await store.getProfile(ctx.senderOpenId))?.name || '';
+  const saved = await store.setPreferredName(ctx.senderOpenId, name);
   if (!saved) return RENAME_USAGE;
   return before && before !== saved
     ? `好的，已把你的名字从【${before}】改成【${saved}】，之后我在城邦里都会这样称呼你。`
@@ -247,8 +248,8 @@ function canManageMeetup(senderOpenId: string | undefined, creatorOpenId: string
 }
 
 /** Resolve a display name for a subscriber's open_id (roster → profile → fallback "你"). */
-function subscriberName(openId: string): string {
-  return store.memberName(openId) || store.getProfile(openId)?.name || '你';
+async function subscriberName(openId: string): Promise<string> {
+  return (await store.memberName(openId)) || (await store.getProfile(openId))?.name || '你';
 }
 
 // ── TC helper functions ──────────────────────────────────────
@@ -264,11 +265,11 @@ function canManageTc(senderOpenId: string, proposal: { createdBy: string }): boo
  * Build a plain-text reply describing the current state and bet distribution of a proposal.
  * Used by the tc-query command and the @土地神 TC-N shorthand.
  */
-function queryTcReply(num: number): string {
+async function queryTcReply(num: number): Promise<string> {
   if (isNaN(num)) return '请提供有效的 TC 编号，例如：TC-1 或 tc query 1';
-  const proposal = getTcByNum(num);
+  const proposal = await getTcByNum(num);
   if (!proposal) return `找不到 TC-${num}。`;
-  const bets = getTcBets(proposal.id);
+  const bets = await getTcBets(proposal.id);
   const activeBets = bets.filter(b => !b.isRefunded);
   const totalLp = activeBets.reduce((s, b) => s + b.lpAmount, 0);
   const participants = new Set(activeBets.map(b => b.userOpenId)).size;
@@ -314,13 +315,13 @@ function queryTcReply(num: number): string {
  * The caller should log any discrepancy for manual recovery.
  * Returns the count of successfully refunded bets.
  */
-function refundTcBets(proposal: { id: number; topMessageId: string }): { refunded: number } {
-  const pending = getUnrefundedBets(proposal.id);
+async function refundTcBets(proposal: { id: number; topMessageId: string }): Promise<{ refunded: number }> {
+  const pending = await getUnrefundedBets(proposal.id);
   let refunded = 0;
   for (const bet of pending) {
     try {
-      markBetRefunded(bet.id);
-      grantPt(bet.userOpenId, bet.lpAmount, 'tc_refund_cancel', proposal.topMessageId);
+      await markBetRefunded(bet.id);
+      await grantPt(bet.userOpenId, bet.lpAmount, 'tc_refund_cancel', proposal.topMessageId);
       refunded++;
     } catch {
       // grantPt failed after marking refunded — conservative under-refund; log externally
@@ -337,7 +338,7 @@ const COMMANDS: Command[] = [
     aliases: ['?', '命令', 'commands', 'menu'],
     summary: '显示命令列表，或某个命令的用法',
     usage: 'help [命令]',
-    run(args, ctx) {
+    async run(args, ctx) {
       if (args[0]) {
         const c = lookup(args[0]);
         if (!c) return `没有这个命令：${args[0]}。发送 help 查看全部命令。`;
@@ -358,19 +359,19 @@ const COMMANDS: Command[] = [
   {
     name: 'ping',
     summary: '测试我是否在线',
-    run: () => 'pong 🏓',
+    run: async () => 'pong 🏓',
   },
   {
     name: 'version',
     aliases: ['ver', 'v'],
     summary: '显示我的版本',
-    run: (_args, ctx) => `${ctx.agentName} v${readVersion()}`,
+    run: async (_args, ctx) => `${ctx.agentName} v${readVersion()}`,
   },
   {
     name: 'whoami',
     aliases: ['id'],
     summary: '显示我的身份与运行信息',
-    run: (_args, ctx) =>
+    run: async (_args, ctx) =>
       [
         `名字：${ctx.agentName}`,
         ctx.identity ? `身份：${ctx.identity}` : null,
@@ -385,15 +386,15 @@ const COMMANDS: Command[] = [
     aliases: ['我的', 'me'],
     summary: '查看自己的 LP 与已获徽章',
     usage: 'profile',
-    run(_args, ctx) {
+    async run(_args, ctx) {
       if (!ctx.senderOpenId) {
         return '无法确认你的身份（缺少 sender open_id），请在飞书群内使用此命令。';
       }
-      const p = store.getProfile(ctx.senderOpenId);
+      const p = await store.getProfile(ctx.senderOpenId);
       if (!p) {
         return '你还没有档案，和我互动一次就会自动建立！';
       }
-      const badges = store.listBadges(ctx.senderOpenId);
+      const badges = await store.listBadges(ctx.senderOpenId);
       const badgeStr = badges.length
         ? badges.map((b) => `${b.emoji || ''}${b.name}`).join('、')
         : '（暂无）';
@@ -409,15 +410,15 @@ const COMMANDS: Command[] = [
     aliases: ['积分', '生命点'],
     summary: '查看自己的 LP 与最近 3 笔变化',
     usage: 'lp',
-    run(_args, ctx) {
+    async run(_args, ctx) {
       if (!ctx.senderOpenId) {
         return '无法确认你的身份（缺少 sender open_id），请在飞书群内使用此命令。';
       }
-      const p = store.getProfile(ctx.senderOpenId);
+      const p = await store.getProfile(ctx.senderOpenId);
       if (!p) {
         return '你还没有档案，和我互动一次就会自动建立！';
       }
-      const recent = store.recentPtLedger(ctx.senderOpenId, 3);
+      const recent = await store.recentPtLedger(ctx.senderOpenId, 3);
       const lines = [`🌱 ${p.name || ctx.senderOpenId} 当前 LP：${p.ptBalance.toFixed(1)}`];
       if (recent.length === 0) {
         lines.push('', '（暂无 LP 变化记录）');
@@ -436,8 +437,8 @@ const COMMANDS: Command[] = [
     aliases: ['榜', '排行'],
     summary: '显示 LP 排行榜前十名',
     usage: 'leaderboard',
-    run() {
-      const rows = store.leaderboard(10);
+    async run() {
+      const rows = await store.leaderboard(10);
       if (rows.length === 0) return '（排行榜暂无数据）';
       const lines = rows.map((r, i) => `${i + 1}. ${r.name || r.openId}  ${r.ptBalance.toFixed(1)} LP`);
       return ['🏆 LP 排行榜', ...lines].join('\n');
@@ -448,16 +449,22 @@ const COMMANDS: Command[] = [
     aliases: ['签', '簽', '签到', '簽到', 'checkin'],
     summary: '每日签到，领取 LP',
     usage: 'sign',
-    run(_args, ctx) {
+    async run(_args, ctx) {
       if (!ctx.senderOpenId) {
         return '无法确认你的身份（缺少 sender open_id），请在飞书群内使用此命令。';
       }
-      const r = store.checkIn(ctx.senderOpenId);
+      let r: Awaited<ReturnType<typeof store.checkIn>>;
+      try {
+        r = await store.checkIn(ctx.senderOpenId);
+      } catch (e) {
+        if (isPgUnavailableError(e)) return PG_UNAVAILABLE_REPLY_ZH;
+        throw e;
+      }
       if (r.firstToday) {
-        return '在 SeeDAO 数字城邦签到' + store.buildStatusFooter(ctx.senderOpenId, r.awarded);
+        return '在 SeeDAO 数字城邦签到' + (await store.buildStatusFooter(ctx.senderOpenId, r.awarded));
       }
       const mmdd = `${r.date.slice(5, 7)}/${r.date.slice(8, 10)}`;
-      return `今天 (${mmdd}) 你已在 SeeDAO 数字城邦签到了` + store.buildStatusFooter(ctx.senderOpenId, 0);
+      return `今天 (${mmdd}) 你已在 SeeDAO 数字城邦签到了` + (await store.buildStatusFooter(ctx.senderOpenId, 0));
     },
   },
   {
@@ -467,19 +474,19 @@ const COMMANDS: Command[] = [
     usage: 'rename <新名字>',
     // "改名…" is normally intercepted by parseRename in dispatchCommand (to support the no-space and
     // spaces-in-name forms); this entry lists it in help and also handles the English "rename <name>".
-    run: (args, ctx) => applyRename(args.join(' '), ctx),
+    run: async (args, ctx) => applyRename(args.join(' '), ctx),
   },
   {
     name: 'follow',
     aliases: ['订阅'],
     summary: '订阅活动标签，有新会议时在群里收到 @ 提醒',
     usage: 'follow <标签>',
-    run(args, ctx) {
+    async run(args, ctx) {
       if (!ctx.senderOpenId) return '无法确认你的身份，请在飞书群内使用此命令。';
       const tag = args[0]?.trim();
       if (!tag) return '请提供标签名，例如：follow 共学';
-      const who = subscriberName(ctx.senderOpenId);
-      const added = subscribeMeetupTag(ctx.senderOpenId, tag);
+      const who = await subscriberName(ctx.senderOpenId);
+      const added = await subscribeMeetupTag(ctx.senderOpenId, tag);
       return added
         ? `${who}，已为你订阅标签【${tag}】，有该标签的活动我会在群里 @ 你。`
         : `${who}，你之前已经订阅过【${tag}】了，无需重复订阅。`;
@@ -490,12 +497,12 @@ const COMMANDS: Command[] = [
     aliases: ['取消订阅'],
     summary: '取消订阅活动标签',
     usage: 'unfollow <标签>',
-    run(args, ctx) {
+    async run(args, ctx) {
       if (!ctx.senderOpenId) return '无法确认你的身份，请在飞书群内使用此命令。';
       const tag = args[0]?.trim();
       if (!tag) return '请提供标签名，例如：unfollow 共学';
-      const who = subscriberName(ctx.senderOpenId);
-      const removed = unsubscribeMeetupTag(ctx.senderOpenId, tag);
+      const who = await subscriberName(ctx.senderOpenId);
+      const removed = await unsubscribeMeetupTag(ctx.senderOpenId, tag);
       return removed ? `${who}，已为你取消订阅【${tag}】。` : `${who}，你本来就没有订阅【${tag}】。`;
     },
   },
@@ -504,10 +511,10 @@ const COMMANDS: Command[] = [
     aliases: ['我的订阅'],
     summary: '查看你当前订阅的活动标签',
     usage: 'follows',
-    run(_args, ctx) {
+    async run(_args, ctx) {
       if (!ctx.senderOpenId) return '无法确认你的身份，请在飞书群内使用此命令。';
-      const who = subscriberName(ctx.senderOpenId);
-      const tags = listMeetupSubscriptions(ctx.senderOpenId);
+      const who = await subscriberName(ctx.senderOpenId);
+      const tags = await listMeetupSubscriptions(ctx.senderOpenId);
       if (tags.length === 0) return `${who}，你还没有订阅任何活动标签。发送 follow <标签> 即可订阅。`;
       return `${who}，你当前订阅的标签：${tags.map((t) => `【${t}】`).join('、')}`;
     },
@@ -516,14 +523,14 @@ const COMMANDS: Command[] = [
     name: 'meetup',
     summary: '管理活动会议（cancel / edit）',
     usage: 'meetup cancel <id>  |  meetup edit <id> --title <新标题>',
-    run(args, ctx) {
+    async run(args, ctx) {
       const sub = args[0]?.toLowerCase();
 
       // meetup cancel <id>: soft-cancel in DB and delete from Feishu calendar
       if (sub === 'cancel' || sub === '取消') {
         const id = Number(args[1]);
         if (!id) return '用法：meetup cancel <会议编号>（整数 id，见 agent meetup 列表）';
-        const mtg = getMeetupById(id);
+        const mtg = await getMeetupById(id);
         if (!mtg) return `找不到编号 ${id} 的会议。`;
         if (mtg.status === 'cancelled') return `会议【${mtg.title}】已经是已取消状态。`;
         if (!canManageMeetup(ctx.senderOpenId, mtg.createdBy)) {
@@ -537,9 +544,9 @@ const COMMANDS: Command[] = [
           calendarId = cfg.lark.activityCalendarId ?? calendarId;
         } catch { /* use the stored calendar_id as fallback */ }
 
-        const larkOk = cancelCalendarEvent(calendarId, mtg.larkEventId);
-        storeCancelMeetup(id);
-        refreshMeetupWiki(); // mirror the cancellation to the "SeeDAO 活动日历" wiki page
+        const larkOk = await cancelCalendarEvent(calendarId, mtg.larkEventId);
+        await storeCancelMeetup(id);
+        await refreshMeetupWiki(); // mirror the cancellation to the "SeeDAO 活动日历" wiki page
         return larkOk
           ? `已取消会议【${mtg.title}】（飞书日历已删除，本地已标记取消）。`
           : `本地已标记取消【${mtg.title}】，但飞书日历删除失败，请手动检查。`;
@@ -550,7 +557,7 @@ const COMMANDS: Command[] = [
       // that would not accept them anyway.
       if (sub === 'edit' || sub === '编辑') {
         const id = Number(args[1]);
-        const mtg = id ? getMeetupById(id) : null;
+        const mtg = id ? await getMeetupById(id) : null;
         if (mtg && !canManageMeetup(ctx.senderOpenId, mtg.createdBy)) {
           return `只有活动发起人才能编辑【${mtg.title}】。`;
         }
@@ -564,7 +571,7 @@ const COMMANDS: Command[] = [
     name: 'tc',
     summary: '管理投注提案（query / cancel / edit）',
     usage: 'tc query <编号>  |  tc cancel <编号>  |  tc edit <编号> [--max-bet N] [--end "YYYY-MM-DD HH:mm"]',
-    run(args, ctx) {
+    async run(args, ctx) {
       const sub = args[0]?.toLowerCase();
       if (!sub) return '用法：tc cancel <编号>  /  tc query <编号>\n或直接 @我 TC-1 查询进展';
 
@@ -576,7 +583,7 @@ const COMMANDS: Command[] = [
       if (sub === 'cancel' || sub === '撤销' || sub === '取消') {
         const num = parseInt(args[1] ?? '', 10);
         if (isNaN(num)) return '用法：tc cancel <编号>，例如：tc cancel 1';
-        const proposal = getTcByNum(num);
+        const proposal = await getTcByNum(num);
         if (!proposal) return `找不到 TC-${num}。`;
         if (proposal.status === 'cancelled') return `TC-${num} 已经是撤销状态。`;
         if (proposal.status === 'settled') return `TC-${num} 已结算，不能撤销。`;
@@ -584,13 +591,13 @@ const COMMANDS: Command[] = [
         if (!canManageTc(ctx.senderOpenId, proposal)) {
           return `只有提案发起人或管理员才能撤销 TC-${proposal.num}。`;
         }
-        const result = refundTcBets(proposal);
-        cancelTcProposal(proposal.id);
+        const result = await refundTcBets(proposal);
+        await cancelTcProposal(proposal.id);
         // Best-effort: update the original post to show cancelled state
         try {
-          const bets = getTcBets(proposal.id);
+          const bets = await getTcBets(proposal.id);
           const post = buildTcResultPost({ ...proposal, status: 'cancelled' }, bets);
-          updateMessage(proposal.topMessageId, post, { as: 'bot' });
+          await updateMessage(proposal.topMessageId, post, { as: 'bot' });
         } catch { /* ignore */ }
         return `TC-${proposal.num}【${proposal.title}】已撤销，已退还 ${result.refunded} 笔投注 LP。\n🌱 LP`;
       }
@@ -598,7 +605,7 @@ const COMMANDS: Command[] = [
       if (sub === 'edit' || sub === '编辑') {
         const num = parseInt(args[1] ?? '', 10);
         if (isNaN(num)) return '用法：tc edit <编号> [--max-bet N] [--end "YYYY-MM-DD HH:mm"]';
-        const proposal = getTcByNum(num);
+        const proposal = await getTcByNum(num);
         if (!proposal) return `找不到 TC-${num}。`;
         if (!ctx.senderOpenId || !isAdmin(ctx.senderOpenId)) {
           return 'TC 内容修改仅限管理员操作（提案人只能撤销）。';
@@ -620,7 +627,7 @@ const COMMANDS: Command[] = [
         if (Object.keys(updates).length === 0) {
           return 'tc edit：请提供 --max-bet 或 --end 参数。';
         }
-        const ok = updateTcProposal(proposal.id, updates);
+        const ok = await updateTcProposal(proposal.id, updates);
         return ok
           ? `TC-${num} 已更新（${Object.entries(updates).map(([k, v]) => `${k}=${v}`).join('  ')}）。`
           : `TC-${num} 更新失败（无有效变更）。`;
@@ -648,9 +655,9 @@ export function listCommands(): Command[] {
 }
 
 /** Run a resolved command body, treating a throw as handled (returns an error reply, never falls to the LLM). */
-function handle(command: string, args: string[], run: () => string): DispatchResult {
+async function handle(command: string, args: string[], run: () => Promise<string>): Promise<DispatchResult> {
   try {
-    return { handled: true, command, args, reply: run() };
+    return { handled: true, command, args, reply: await run() };
   } catch (e) {
     return { handled: true, command, args, reply: `命令【${command}】执行出错：${(e as Error).message}` };
   }
@@ -660,7 +667,7 @@ function handle(command: string, args: string[], run: () => string): DispatchRes
  * Try to handle the message as a command. Hit → { handled:true, reply }; miss → { handled:false }.
  * If the command itself throws, it is still treated as handled and returns an error message (does not fall back to the LLM).
  */
-export function dispatchCommand(raw: string, ctx: CommandContext): DispatchResult {
+export async function dispatchCommand(raw: string, ctx: CommandContext): Promise<DispatchResult> {
   // Self-service rename ("改名 <名字>") — checked before the tokenizer so the name may be glued to 改名
   // or contain spaces. A bare "改名" (empty name) is still handled, replying with usage.
   const renameName = parseRename(raw);

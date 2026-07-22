@@ -35,7 +35,7 @@ export interface TranscriptMessage {
  * Persist a message to the database, deduplicating by message_id.
  * Returns true when the row was newly inserted, false when already present.
  */
-export function append(chatId: string, msg: TranscriptMessage): boolean {
+export async function append(chatId: string, msg: TranscriptMessage): Promise<boolean> {
   if (!chatId || !msg.message_id) return false;
   const row: MessageRow = {
     messageId: msg.message_id,

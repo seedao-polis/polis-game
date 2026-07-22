@@ -10,6 +10,7 @@ import { getProfile, spendPt, grantPt } from './store/gamification.js';
 import { memberName } from './store/members.js';
 import { buildTcResultPost } from './tc-post.js';
 import { updateMessage } from './lark.js';
+import { isPgUnavailableError, PG_UNAVAILABLE_REPLY_ZH } from './db.js';
 
 export interface TcBetParse {
   optionValue: string;
@@ -89,13 +90,13 @@ export function parseTcBetInput(rawText: string, proposal: TcProposal): TcBetPar
  *   insertTcBet() second (per-soul db) — if this throws, roll back via grantPt().
  *   This avoids the inverse (recording the bet then failing to deduct LP) which is harder to detect.
  */
-export function tryParseTcBet(
+export async function tryParseTcBet(
   rawText: string,
   proposal: TcProposal,
   senderOpenId: string,
   messageId: string,
   larkProfile?: string,
-): { reply: string } | false {
+): Promise<{ reply: string } | false> {
   const parsed = parseTcBetInput(rawText, proposal);
   if (!parsed) return false;
   const { optionValue, lpAmount } = parsed;
@@ -133,7 +134,7 @@ export function tryParseTcBet(
   }
 
   // Validate cumulative upper bound for this user on this proposal
-  const alreadyBet = getUserTotalBetLp(proposal.id, senderOpenId);
+  const alreadyBet = await getUserTotalBetLp(proposal.id, senderOpenId);
   if (alreadyBet + lpAmount > proposal.maxBetLp) {
     const remaining = proposal.maxBetLp - alreadyBet;
     return {
@@ -142,25 +143,33 @@ export function tryParseTcBet(
     };
   }
 
-  // Pre-check balance (avoids calling spendPt when obviously insufficient)
-  const userProfile = getProfile(senderOpenId);
-  const balance = userProfile?.ptBalance ?? 0;
-  if (balance < lpAmount) {
-    return {
-      reply: `投注失败：LP 不足。需要 ${lpAmount} LP，你目前只有 ${balance.toFixed(1)} LP。`,
-    };
+  // Pre-check balance (avoids calling spendPt when obviously insufficient), then deduct LP from shared
+  // db and insertTcBet into per-soul db. Both getProfile and spendPt touch the shared LP database, so
+  // both are inside this one try: the circuit breaker can be open before either call is reached.
+  let userProfile: Awaited<ReturnType<typeof getProfile>>;
+  let spent: boolean;
+  try {
+    userProfile = await getProfile(senderOpenId);
+    const balance = userProfile?.ptBalance ?? 0;
+    if (balance < lpAmount) {
+      return {
+        reply: `投注失败：LP 不足。需要 ${lpAmount} LP，你目前只有 ${balance.toFixed(1)} LP。`,
+      };
+    }
+    // If insertTcBet (below) fails, roll back with grantPt to restore the deducted amount.
+    spent = await spendPt(senderOpenId, lpAmount, 'tc_bet', messageId);
+  } catch (e) {
+    // Shared LP pool's circuit breaker is open: refuse quietly, no local write of any kind.
+    if (isPgUnavailableError(e)) return { reply: PG_UNAVAILABLE_REPLY_ZH };
+    throw e;
   }
-
-  // Deduct LP from shared db first; insertTcBet into per-soul db second.
-  // If insertTcBet fails, roll back with grantPt to restore the deducted amount.
-  const spent = spendPt(senderOpenId, lpAmount, 'tc_bet', messageId);
   if (!spent) {
     // Race condition: balance dropped between the pre-check and spendPt
     return { reply: `投注失败：LP 余额不足。` };
   }
 
   try {
-    insertTcBet({
+    await insertTcBet({
       proposalId: proposal.id,
       userOpenId: senderOpenId,
       optionValue,
@@ -169,15 +178,15 @@ export function tryParseTcBet(
     });
   } catch (e) {
     // insertTcBet failed: roll back the LP deduction
-    grantPt(senderOpenId, lpAmount, 'tc_bet_rollback', messageId);
+    await grantPt(senderOpenId, lpAmount, 'tc_bet_rollback', messageId);
     return { reply: `投注失败：记录出错，LP 已退还。请重试。` };
   }
 
   // Update the canonical proposal post in-place (best-effort: failures are logged, not thrown)
   try {
-    const allBets = getTcBets(proposal.id);
+    const allBets = await getTcBets(proposal.id);
     const post = buildTcResultPost(proposal, allBets);
-    const ok = updateMessage(proposal.topMessageId, post, { as: 'bot', profile: larkProfile });
+    const ok = await updateMessage(proposal.topMessageId, post, { as: 'bot', profile: larkProfile });
     if (!ok) {
       log.warn(`TC 投注：更新原帖失败（TC-${proposal.num}  topMsgId=${proposal.topMessageId}）`);
     }
@@ -185,7 +194,7 @@ export function tryParseTcBet(
     log.warn(`TC 投注：更新原帖异常：${(e as Error).message}`);
   }
 
-  const userName = memberName(senderOpenId) || userProfile?.name || senderOpenId;
+  const userName = (await memberName(senderOpenId)) || userProfile?.name || senderOpenId;
   return {
     reply: `${userName} 对 TC-${proposal.num}【${proposal.title}】 投注成功！\n` +
            `本次投注选项【${optionValue}】投注 ${lpAmount} LP\n` +

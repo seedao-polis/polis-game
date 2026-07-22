@@ -105,16 +105,16 @@ export interface RecordSelfIntroCtx {
  * is only a fallback for envelopes that carried none. Returns '' when nothing is resolvable (or it
  * points at the command itself).
  */
-function resolveSelfIntroTarget(
+async function resolveSelfIntroTarget(
   commandMessageId: string,
   eventRootId: string,
   eventParentId: string,
   profile?: string
-): string {
+): Promise<string> {
   const fromEvent = eventRootId || eventParentId;
   if (fromEvent && fromEvent !== commandMessageId) return fromEvent;
   if (commandMessageId) {
-    const cmd = getMessageById(commandMessageId, { as: 'bot', profile });
+    const cmd = await getMessageById(commandMessageId, { as: 'bot', profile });
     const t = cmd?.rootId || cmd?.parentId || '';
     if (t) return t === commandMessageId ? '' : t;
   }
@@ -127,7 +127,7 @@ function resolveSelfIntroTarget(
  * has already confirmed the text is the command (via {@link isRecordSelfIntroCommand}); this validates
  * permission, resolves the target, checks the author + idempotency, grants, and returns the reply text.
  */
-export function handleRecordSelfIntro(ctx: RecordSelfIntroCtx): string {
+export async function handleRecordSelfIntro(ctx: RecordSelfIntroCtx): Promise<string> {
   const { commandMessageId, eventRootId, eventParentId, senderOpenId, profile } = ctx;
 
   // 1) operator whitelist — only trusted operators may award the reward (prevents self-farming).
@@ -135,27 +135,27 @@ export function handleRecordSelfIntro(ctx: RecordSelfIntroCtx): string {
     return '「收录自介」仅限运营使用～';
   }
   // 2) trace back to the self-intro message (topic/reply root).
-  const targetId = resolveSelfIntroTarget(commandMessageId, eventRootId ?? '', eventParentId ?? '', profile);
+  const targetId = await resolveSelfIntroTarget(commandMessageId, eventRootId ?? '', eventParentId ?? '', profile);
   if (!targetId) {
     return `请「回复 / 引用」该成员的自我介绍消息（或在其自我介绍所在的话题下），再 @我 写「收录自介」，即可为对方发放 ${SELF_INTRO_REWARD_PT} LP。`;
   }
   // 3) resolve the self-intro's author.
-  const quoted = getMessageById(targetId, { as: 'bot', profile });
+  const quoted = await getMessageById(targetId, { as: 'bot', profile });
   if (!quoted || !quoted.senderOpenId) {
     return '没能读取到那条自我介绍消息，请确认是回复 / 引用群内成员的发言后重试。';
   }
   if (quoted.senderType === 'app') {
     return '追溯到的消息不是成员发言（像是机器人消息），无法收录；请回复 / 引用该成员本人的自我介绍。';
   }
-  const name = store.memberName(quoted.senderOpenId) || quoted.senderName || '这位成员';
+  const name = (await store.memberName(quoted.senderOpenId)) || quoted.senderName || '这位成员';
   // 4) idempotency — a given self-intro pays out only once, however many times 收录自介 is repeated.
-  if (store.hasPtGrantForRef(SELF_INTRO_GRANT_REASON, targetId)) {
+  if (await store.hasPtGrantForRef(SELF_INTRO_GRANT_REASON, targetId)) {
     return `${name} 的这条自我介绍已经收录过啦，不重复发放。`;
   }
   // 5) grant, keyed to the self-intro message id for the idempotency gate above.
-  store.grantPt(quoted.senderOpenId, SELF_INTRO_REWARD_PT, SELF_INTRO_GRANT_REASON, targetId);
+  await store.grantPt(quoted.senderOpenId, SELF_INTRO_REWARD_PT, SELF_INTRO_GRANT_REASON, targetId);
   try {
-    store.recordActivity('welcome_self_intro', senderOpenId, null, targetId, {
+    await store.recordActivity('welcome_self_intro', senderOpenId, null, targetId, {
       target: quoted.senderOpenId,
     });
   } catch {
@@ -166,6 +166,6 @@ export function handleRecordSelfIntro(ctx: RecordSelfIntroCtx): string {
   );
   // Append the recipient's standard LP status footer (e.g. "\n\n[乔伊] 🌱 LP : 119.9 → 179.9 (+60.0)"),
   // computed AFTER the grant so it carries the before→after arrow. buildStatusFooter prepends a blank line.
-  const footer = store.buildStatusFooter(quoted.senderOpenId, SELF_INTRO_REWARD_PT);
+  const footer = await store.buildStatusFooter(quoted.senderOpenId, SELF_INTRO_REWARD_PT);
   return `已收录 ${name} 的自我介绍，发放 ${SELF_INTRO_REWARD_PT} LP 🎉${footer}`;
 }

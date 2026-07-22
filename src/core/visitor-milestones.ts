@@ -47,8 +47,8 @@ export function loadLedger(soul: string, chatId: string): Ledger {
 }
 
 /** True when the milestone is recorded in either the DB ledger or the JSON file. */
-export function isMilestoneRecorded(soul: string, chatId: string, milestone: number): boolean {
-  if (hasVisitorMilestone(chatId, milestone)) return true;
+export async function isMilestoneRecorded(soul: string, chatId: string, milestone: number): Promise<boolean> {
+  if (await hasVisitorMilestone(chatId, milestone)) return true;
   const ledger = loadLedger(soul, chatId);
   return Boolean(ledger.milestones[String(milestone)]);
 }
@@ -57,11 +57,11 @@ export function isMilestoneRecorded(soul: string, chatId: string, milestone: num
  * Freeze a milestone in both the DB and the JSON file. Idempotent: re-recording the same milestone
  * keeps the first entry. Returns the entry written (or the existing one).
  */
-export function recordMilestone(soul: string, chatId: string, milestone: number, person: VisitorPerson, reachedAt: number): LedgerEntry {
+export async function recordMilestone(soul: string, chatId: string, milestone: number, person: VisitorPerson, reachedAt: number): Promise<LedgerEntry> {
   const entry: LedgerEntry = { openId: person.openId, name: person.name, reachedAt };
 
   // DB mirror (INSERT OR IGNORE — keeps first).
-  try { storeRecordVisitorMilestone(chatId, milestone, person.openId, person.name, reachedAt); }
+  try { await storeRecordVisitorMilestone(chatId, milestone, person.openId, person.name, reachedAt); }
   catch (e) { log.warn(`访客里程碑写库失败【${milestone}】：`, (e as Error).message); }
 
   // JSON ledger (keep first entry for a milestone).
@@ -86,8 +86,8 @@ function fmtDate(sec: number): string {
 }
 
 /** Render the "访客里程碑" wiki page body from the DB snapshot (deterministic, no LLM). */
-export function renderMilestonesMarkdown(chatId: string): string {
-  const rows = listVisitorMilestones(chatId);
+export async function renderMilestonesMarkdown(chatId: string): Promise<string> {
+  const rows = await listVisitorMilestones(chatId);
   const updated = new Date().toLocaleString('sv-SE', { hour12: false }).slice(0, 16).replace('T', ' ');
   const head = `# 访客里程碑\n\n> 记录 SeeDAO 围观群每满 100 人时的第 100·N 位访客。最后更新：${updated}（自动更新）\n\n`;
   const table = `| 里程碑 | 第 N 位访客 | 达成日期 |\n|--------|-------------|----------|\n`;
@@ -102,10 +102,10 @@ export function renderMilestonesMarkdown(chatId: string): string {
  * Overwrite the "访客里程碑" wiki page with the current milestone table. Returns false when the wiki
  * document id is not configured or the write fails (non-fatal).
  */
-export function refreshVisitorMilestonesWiki(chatId: string, opts: { profile?: string } = {}): boolean {
+export async function refreshVisitorMilestonesWiki(chatId: string, opts: { profile?: string } = {}): Promise<boolean> {
   let docId: string | undefined;
   try { docId = loadConfigs().lark.visitorMilestoneWikiDocId; }
   catch { return false; }
   if (!docId) return false;
-  return appendDocxContent(docId, renderMilestonesMarkdown(chatId), { profile: opts.profile, overwrite: true, format: 'markdown' });
+  return appendDocxContent(docId, await renderMilestonesMarkdown(chatId), { profile: opts.profile, overwrite: true, format: 'markdown' });
 }

@@ -65,13 +65,13 @@ function isLoggedInFrom(auth: any): boolean {
  * - Write .agent/auth/<profile>.json (checkedAt / refreshExpiresAt / loggedIn)
  * - When near expiry or already expired, log.warn and (if notifyChat is given) send a reminder message
  */
-export function checkAndRecord(
+export async function checkAndRecord(
   profile: string,
   notifyChat?: string
-): AuthCheckResult {
+): Promise<AuthCheckResult> {
   let auth: any;
   try {
-    auth = authStatus(profile);
+    auth = await authStatus(profile);
   } catch (e) {
     log.error(`auth status 查询失败（profile=${profile}）：`, (e as Error).message);
     auth = {};
@@ -117,7 +117,7 @@ export function checkAndRecord(
     log.warn(msg);
     if (notifyChat) {
       try {
-        sendText({ chatId: notifyChat }, `⚠ ${msg}`, { as: 'user', profile });
+        await sendText({ chatId: notifyChat }, `⚠ ${msg}`, { as: 'user', profile });
       } catch (e) {
         log.warn('发送到期提醒失败：', (e as Error).message);
       }

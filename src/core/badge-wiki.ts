@@ -184,7 +184,7 @@ function imageCellAnchorIds(content: string): string[] {
  * Returns false when the wiki document id is not configured or the text overwrite fails; callers treat
  * that as a non-fatal no-op.
  */
-export function refreshBadgeWiki(opts: { profile?: string } = {}): boolean {
+export async function refreshBadgeWiki(opts: { profile?: string } = {}): Promise<boolean> {
   let docId: string | undefined;
   try {
     docId = loadConfigs().lark.badgeWikiDocId;
@@ -193,8 +193,8 @@ export function refreshBadgeWiki(opts: { profile?: string } = {}): boolean {
   }
   if (!docId) return false;
 
-  const badges = listBadgeDefinitions();
-  const ok = appendDocxContent(docId, renderBadgeWikiXml(badges), {
+  const badges = await listBadgeDefinitions();
+  const ok = await appendDocxContent(docId, renderBadgeWikiXml(badges), {
     profile: opts.profile,
     overwrite: true,
     format: 'xml',
@@ -207,12 +207,12 @@ export function refreshBadgeWiki(opts: { profile?: string } = {}): boolean {
     .filter((x) => x.rel);
   if (withArt.length === 0) return true;
 
-  const anchors = imageCellAnchorIds(fetchDocxRawContent(docId, { profile: opts.profile }));
+  const anchors = imageCellAnchorIds(await fetchDocxRawContent(docId, { profile: opts.profile }));
   for (const { index, rel } of withArt) {
     const anchor = anchors[index];
     if (!anchor) continue;
-    const inserted = insertDocxImageBlock(docId, rel, { profile: opts.profile, width: BADGE_IMG_WIDTH });
-    if (inserted) moveDocxBlocksAfter(docId, anchor, [inserted.blockId], { profile: opts.profile });
+    const inserted = await insertDocxImageBlock(docId, rel, { profile: opts.profile, width: BADGE_IMG_WIDTH });
+    if (inserted) await moveDocxBlocksAfter(docId, anchor, [inserted.blockId], { profile: opts.profile });
   }
   return true;
 }

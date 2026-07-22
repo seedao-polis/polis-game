@@ -45,8 +45,8 @@ function buildAlert(profile: string, mark: number, scopes: string[]): string {
 }
 
 /** Human-readable summary of the user token's remaining lifetime, for CLI inspection. */
-export function describeTokenExpiry(profile: string): string {
-  const user = authStatus(profile)?.identities?.user;
+export async function describeTokenExpiry(profile: string): Promise<string> {
+  const user = (await authStatus(profile))?.identities?.user;
   const expiryIso = user?.refreshExpiresAt;
   if (typeof expiryIso !== 'string' || !expiryIso) return '无法读取 user token 到期时间（可能未登录或字段缺失）。';
   const ms = Date.parse(expiryIso);
@@ -63,7 +63,7 @@ export function describeTokenExpiry(profile: string): string {
  */
 export async function checkUserTokenExpiry(profile: string): Promise<void> {
   try {
-    const user = authStatus(profile)?.identities?.user;
+    const user = (await authStatus(profile))?.identities?.user;
     const expiryIso = user?.refreshExpiresAt;
     if (typeof expiryIso !== 'string' || !expiryIso) return;
     const expiryMs = Date.parse(expiryIso);
@@ -76,9 +76,16 @@ export async function checkUserTokenExpiry(profile: string): Promise<void> {
     const daysLeft = (expiryMs - Date.now()) / MS_PER_DAY;
     const scopes = typeof user?.scope === 'string' ? user.scope.split(/\s+/).filter(Boolean) : [];
 
-    const crossed = ALERT_THRESHOLDS_DAYS.filter(
-      (mark) => daysLeft <= mark && !wasTokenExpiryAlertSent(grantKey, mark)
+    // Resolve each threshold's "already sent" check concurrently, then filter synchronously on the
+    // resolved values — .filter() itself cannot await, and an unresolved Promise is always truthy, so
+    // negating it inline would silently disable every reminder.
+    const checked = await Promise.all(
+      ALERT_THRESHOLDS_DAYS.map(async (mark) => ({
+        mark,
+        eligible: daysLeft <= mark && !(await wasTokenExpiryAlertSent(grantKey, mark)),
+      })),
     );
+    const crossed = checked.filter((c) => c.eligible).map((c) => c.mark);
     if (crossed.length === 0) return;
 
     const closest = Math.min(...crossed);
@@ -86,7 +93,7 @@ export async function checkUserTokenExpiry(profile: string): Promise<void> {
     if (ok) {
       // Record every crossed mark so passed thresholds never re-fire, while a send failure leaves them
       // unmarked to retry on the next tick.
-      for (const mark of crossed) markTokenExpiryAlertSent(grantKey, mark);
+      for (const mark of crossed) await markTokenExpiryAlertSent(grantKey, mark);
       log.info(`已推送 token 到期提醒（${THRESHOLD_LABEL[closest]}）到 Telegram。`);
     } else {
       log.warn('token 到期提醒推送失败，下一轮重试。');

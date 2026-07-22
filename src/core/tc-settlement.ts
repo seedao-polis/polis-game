@@ -186,7 +186,7 @@ export function distributePool(
  * Fallback: if updateMessage() fails, a plain-text summary is sent to the proposal's chat.
  */
 export async function settleTc(proposal: TcProposal, larkProfile: string): Promise<void> {
-  const bets: TcBet[] = getTcBets(proposal.id).filter(b => !b.isRefunded);
+  const bets: TcBet[] = (await getTcBets(proposal.id)).filter(b => !b.isRefunded);
 
   let noBonusWhenNoLoser = false;
   try {
@@ -202,7 +202,7 @@ export async function settleTc(proposal: TcProposal, larkProfile: string): Promi
   );
 
   // Mark settled first (idempotency gate); abort if already settled by another process
-  const didSettle = settleTcProposal(proposal.id, result.settledValue, result.settledOption);
+  const didSettle = await settleTcProposal(proposal.id, result.settledValue, result.settledOption);
   if (!didSettle) {
     log.info(`TC-${proposal.num} 已结算，跳过重复结算。`);
     return;
@@ -212,8 +212,8 @@ export async function settleTc(proposal: TcProposal, larkProfile: string): Promi
   const winnerNames: Array<{ userOpenId: string; userName: string; amount: number }> = [];
   for (const w of result.winners) {
     if (w.payout > 0) {
-      grantPt(w.userOpenId, w.payout, 'tc_reward', proposal.topMessageId);
-      const name = memberName(w.userOpenId) || getProfile(w.userOpenId)?.name || w.userOpenId;
+      await grantPt(w.userOpenId, w.payout, 'tc_reward', proposal.topMessageId);
+      const name = (await memberName(w.userOpenId)) || (await getProfile(w.userOpenId))?.name || w.userOpenId;
       winnerNames.push({ userOpenId: w.userOpenId, userName: name, amount: w.payout });
     }
   }
@@ -230,7 +230,7 @@ export async function settleTc(proposal: TcProposal, larkProfile: string): Promi
     settledOption: result.settledOption,
   };
   const settledPost = buildTcSettledPost(updatedProposal, bets, winnerNames);
-  const ok = updateMessage(proposal.topMessageId, settledPost, { as: 'bot', profile: larkProfile });
+  const ok = await updateMessage(proposal.topMessageId, settledPost, { as: 'bot', profile: larkProfile });
   if (!ok) {
     log.warn(`TC-${proposal.num} 结算原帖更新失败（topMsgId=${proposal.topMessageId}），发送新消息补充`);
     try {
@@ -241,7 +241,7 @@ export async function settleTc(proposal: TcProposal, larkProfile: string): Promi
       const fallbackText = agg.length > 0
         ? `【TC-${proposal.num}】已结算。基准值：${baseDesc}\n获奖：${agg.map(w => `${w.userName} +${w.amount.toFixed(1)} LP`).join('  ')}`
         : `【TC-${proposal.num}】已结算（无参与者）。`;
-      sendText({ chatId: proposal.chatId }, fallbackText, { as: 'bot', profile: larkProfile });
+      await sendText({ chatId: proposal.chatId }, fallbackText, { as: 'bot', profile: larkProfile });
     } catch (fe) {
       log.error(`TC-${proposal.num} fallback 消息发送也失败：${(fe as Error).message}`);
     }

@@ -16,7 +16,7 @@ import {
   localDateTimeFromEpochSec,
   localDateFromEpochSec,
 } from './time.js';
-import { loadConfigs, listAgents, resolveAgent, resolveChatTarget } from './configs.js';
+import { loadConfigs, listAgents, resolveAgentProfile, resolveChatTarget } from './configs.js';
 import { generateWeeklyNarrative } from './weekly-narrative.js';
 
 export interface WeeklyReportOptions {
@@ -70,7 +70,7 @@ function resolveProfile(opts: WeeklyReportOptions): string | undefined {
   try {
     const cfg = loadConfigs();
     for (const id of listAgents(cfg)) {
-      if (cfg.agents.agents[id]?.enabled) return resolveAgent(id, cfg).larkProfile;
+      if (cfg.agents.agents[id]?.enabled) return resolveAgentProfile(id, cfg).larkProfile;
     }
   } catch {
     // config unavailable
@@ -97,7 +97,7 @@ function mdInline(text: string): string {
  * emoji-prefixed headings with bullet lists, ready to render as native docx blocks.
  */
 function buildDataSectionMarkdown(
-  weekData: ReturnType<typeof gatherDayData>,
+  weekData: Awaited<ReturnType<typeof gatherDayData>>,
   eventsInWindow: Array<{ eventId: string; title: string; startTime: number }>,
 ): string {
   const sections: string[] = ['## 📊 数据摘要'];
@@ -171,8 +171,8 @@ export async function generateAndSendWeeklyReport(
   log.info(`周报生成开始（${fromStr} ~ ${toStr}，dryRun=${dryRun}）`);
 
   // Gather one week of community data.
-  const weekData = gatherDayData(range);
-  const eventsInWindow = eventsStartingBetween(range.from, range.to);
+  const weekData = await gatherDayData(range);
+  const eventsInWindow = await eventsStartingBetween(range.from, range.to);
   log.info(
     `周报数据采集完成：${weekData.totalMessages} 条消息，${weekData.chats.length} 个群，` +
       `${eventsInWindow.length} 个本周活动，${weekData.upcomingEvents.length} 个即将到来的活动。`,
@@ -212,7 +212,7 @@ export async function generateAndSendWeeklyReport(
   } else {
     const wiki = resolveWikiCoords(opts);
     log.info(`周报：创建知识库节点（space=${wiki.spaceId}，parent=${wiki.parentNodeToken}）…`);
-    const created = createWikiNode(wiki.spaceId, wiki.parentNodeToken, reportTitle, { profile });
+    const created = await createWikiNode(wiki.spaceId, wiki.parentNodeToken, reportTitle, { profile });
     nodeToken = created.nodeToken;
     documentId = created.documentId;
   }
@@ -221,7 +221,7 @@ export async function generateAndSendWeeklyReport(
 
   // Write report content into the docx, replacing any existing content so re-runs stay idempotent.
   log.info('周报：写入文档内容…');
-  const appendOk = appendDocxContent(documentId, mdContent, {
+  const appendOk = await appendDocxContent(documentId, mdContent, {
     profile,
     overwrite: true,
     format: 'markdown',
@@ -237,7 +237,7 @@ export async function generateAndSendWeeklyReport(
     opts.notify === false ? undefined : (opts.notifyChatId ?? resolveChatTarget('运营小天地'));
   if (notifyChatId) {
     try {
-      sendText(
+      await sendText(
         { chatId: notifyChatId },
         `【社区动态周报已发布】${reportTitle}\n统计范围：${fromStr} ~ ${toStr}\n查看详情：${wikiUrl}`,
         { as: 'bot' },

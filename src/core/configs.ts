@@ -285,7 +285,7 @@ export interface ResolvedAgent {
   /** listen==='all': listen to as many chats as possible (bot applies no whitelist; user scans all chats) */
   listenAll: boolean;
   /** Re-discover the chat list (for the user channel to periodically rescan and pick up newly joined chats) */
-  rediscover: () => ResolvedChat[];
+  rediscover: () => Promise<ResolvedChat[]>;
   /** Rescan interval (milliseconds, from lark.discovery.refreshMs ?? refreshMinutes) */
   discoveryRefreshMs: number;
   /** Gap (ms) inserted between consecutive per-chat/per-item polls within one cycle, to spread the
@@ -411,11 +411,11 @@ export function resolveChatTarget(alias: string, cfg?: Configs): string | null {
  * - array of aliases: resolve each alias -> chat_id.
  * When "all" / "all-internal" fails, fall back to knownInternalChats (at least the known chats are available).
  */
-function resolveListen(
+async function resolveListen(
   raw: RawAgentConfig,
   lark: LarkFile,
   larkProfile: string
-): ResolvedChat[] {
+): Promise<ResolvedChat[]> {
   if (raw.listen === 'all' || raw.listen === 'all-internal') {
     const internalOnly = raw.listen === 'all-internal';
     const excludeIds = new Set(
@@ -423,7 +423,7 @@ function resolveListen(
     );
     let chats: ResolvedChat[] = [];
     try {
-      chats = listChats(larkProfile)
+      chats = (await listChats(larkProfile))
         .filter((c) => !internalOnly || c.external === false)
         .filter((c) => !excludeIds.has(c.chatId))
         .map((c) => ({ chatId: c.chatId, name: c.name, external: c.external }));
@@ -471,11 +471,41 @@ export function resolveLarkProfileName(
   );
 }
 
+/** The profile-only slice of a resolved agent: everything derivable from config files alone. */
+export interface ResolvedAgentProfile {
+  larkProfileName: string;
+  larkProfile: string;
+  larkProfileMeta: LarkProfile;
+  /** Notification chat (chat_id after alias resolution). */
+  notifyChatId: string;
+}
+
+/**
+ * Resolve just an agent's lark profile pieces (and notify chat) WITHOUT the listen → chat discovery
+ * that resolveAgent performs. Stays synchronous: it reads only config files, so callers that need no
+ * chat list (CLI one-shots, schedulers picking a send profile) avoid the async chat-discovery path.
+ */
+export function resolveAgentProfile(agentId: string, cfg?: Configs): ResolvedAgentProfile {
+  const c = cfg ?? loadConfigs();
+  const raw = c.agents.agents[agentId];
+  if (!raw) {
+    throw new Error(`找不到 agent【${agentId}】（configs/agents.json）`);
+  }
+  const larkProfileName = resolveLarkProfileName(raw, c.agents.defaults, c.lark.profiles);
+  const larkProfileMeta = c.lark.profiles[larkProfileName]!;
+  return {
+    larkProfileName,
+    larkProfile: larkProfileMeta.larkProfile,
+    larkProfileMeta,
+    notifyChatId: resolveAlias(c.lark, c.lark.notifyChat),
+  };
+}
+
 /**
  * Resolve a single agent: merge defaults, obtain the lark/kimi profile, and resolve listen into a list of oc_ chats.
  * "all-internal" calls listChats on the fly to discover and filter by external===false.
  */
-export function resolveAgent(agentId: string, cfg?: Configs): ResolvedAgent {
+export async function resolveAgent(agentId: string, cfg?: Configs): Promise<ResolvedAgent> {
   const c = cfg ?? loadConfigs();
   const raw = c.agents.agents[agentId];
   if (!raw) {
@@ -493,8 +523,8 @@ export function resolveAgent(agentId: string, cfg?: Configs): ResolvedAgent {
   }
 
   const larkProfile = larkMeta.larkProfile;
-  const rediscover = (): ResolvedChat[] => resolveListen(raw, c.lark, larkProfile);
-  const chats = rediscover();
+  const rediscover = (): Promise<ResolvedChat[]> => resolveListen(raw, c.lark, larkProfile);
+  const chats = await rediscover();
   const listenAll = raw.listen === 'all';
   // Prefer an explicit refreshMs so the cadence can sit off whole-minute / 整点 boundaries (e.g. 7m17s),
   // which avoids phase-locking to the top of the hour; fall back to the legacy whole-minute refreshMinutes.

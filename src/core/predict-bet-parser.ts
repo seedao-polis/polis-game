@@ -10,6 +10,7 @@ import { getProfile, spendPt, grantPt } from './store/gamification.js';
 import { memberName } from './store/members.js';
 import { buildPredictResultPost } from './predict-post.js';
 import { updateMessage } from './lark.js';
+import { isPgUnavailableError, PG_UNAVAILABLE_REPLY_ZH } from './db.js';
 
 export interface PredictBetParse {
   optionValue: string;
@@ -84,13 +85,13 @@ export function parsePredictBetInput(rawText: string, proposal: Pick<PredictProp
  *   spendPt() first (shared db) — if insufficient balance, return immediately with no side effect.
  *   insertPredictBet() second (per-soul db) — if this throws, roll back via grantPt().
  */
-export function tryParsePredictBet(
+export async function tryParsePredictBet(
   rawText: string,
   proposal: PredictProposal,
   senderOpenId: string,
   messageId: string,
   larkProfile?: string,
-): { reply: string } | false {
+): Promise<{ reply: string } | false> {
   const parsed = parsePredictBetInput(rawText, proposal);
   if (!parsed) return false;
   const { optionValue, lpAmount } = parsed;
@@ -113,7 +114,7 @@ export function tryParsePredictBet(
   }
 
   // Validate cumulative upper bound for this user on this proposal.
-  const alreadyBet = getUserTotalBetLp(proposal.id, senderOpenId);
+  const alreadyBet = await getUserTotalBetLp(proposal.id, senderOpenId);
   if (alreadyBet + lpAmount > proposal.maxBetLp) {
     const remaining = proposal.maxBetLp - alreadyBet;
     return {
@@ -122,25 +123,34 @@ export function tryParsePredictBet(
     };
   }
 
-  // Pre-check balance (avoids calling spendPt when obviously insufficient).
-  const userProfile = getProfile(senderOpenId);
-  const balance = userProfile?.ptBalance ?? 0;
-  if (balance < lpAmount) {
-    return {
-      reply: `投注失败：LP 不足。需要 ${lpAmount} LP，你目前只有 ${balance.toFixed(1)} LP。`,
-    };
+  // Pre-check balance (avoids calling spendPt when obviously insufficient), then deduct LP from shared
+  // db and insertPredictBet into per-soul db. Both getProfile and spendPt touch the shared LP
+  // database, so both are inside this one try: the circuit breaker can be open before either call is
+  // reached.
+  let userProfile: Awaited<ReturnType<typeof getProfile>>;
+  let spent: boolean;
+  try {
+    userProfile = await getProfile(senderOpenId);
+    const balance = userProfile?.ptBalance ?? 0;
+    if (balance < lpAmount) {
+      return {
+        reply: `投注失败：LP 不足。需要 ${lpAmount} LP，你目前只有 ${balance.toFixed(1)} LP。`,
+      };
+    }
+    // If insertPredictBet (below) fails, roll back with grantPt to restore the deducted amount.
+    spent = await spendPt(senderOpenId, lpAmount, 'predict_bet', messageId);
+  } catch (e) {
+    // Shared LP pool's circuit breaker is open: refuse quietly, no local write of any kind.
+    if (isPgUnavailableError(e)) return { reply: PG_UNAVAILABLE_REPLY_ZH };
+    throw e;
   }
-
-  // Deduct LP from shared db first; insertPredictBet into per-soul db second.
-  // If insertPredictBet fails, roll back with grantPt to restore the deducted amount.
-  const spent = spendPt(senderOpenId, lpAmount, 'predict_bet', messageId);
   if (!spent) {
     // Race condition: balance dropped between the pre-check and spendPt.
     return { reply: `投注失败：LP 余额不足。` };
   }
 
   try {
-    insertPredictBet({
+    await insertPredictBet({
       proposalId: proposal.id,
       userOpenId: senderOpenId,
       optionValue,
@@ -149,15 +159,15 @@ export function tryParsePredictBet(
     });
   } catch (e) {
     // insertPredictBet failed: roll back the LP deduction.
-    grantPt(senderOpenId, lpAmount, 'predict_bet_rollback', messageId);
+    await grantPt(senderOpenId, lpAmount, 'predict_bet_rollback', messageId);
     return { reply: `投注失败：记录出错，LP 已退还。请重试。` };
   }
 
   // Update the canonical proposal post in-place (best-effort: failures are logged, not thrown).
   try {
-    const allBets = getPredictBets(proposal.id);
+    const allBets = await getPredictBets(proposal.id);
     const post = buildPredictResultPost(proposal, allBets);
-    const ok = updateMessage(proposal.topMessageId, post, { as: 'bot', profile: larkProfile });
+    const ok = await updateMessage(proposal.topMessageId, post, { as: 'bot', profile: larkProfile });
     if (!ok) {
       log.warn(`BET 投注：更新原帖失败（BET-${proposal.num}  topMsgId=${proposal.topMessageId}）`);
     }
@@ -165,7 +175,7 @@ export function tryParsePredictBet(
     log.warn(`BET 投注：更新原帖异常：${(e as Error).message}`);
   }
 
-  const userName = memberName(senderOpenId) || userProfile?.name || senderOpenId;
+  const userName = (await memberName(senderOpenId)) || userProfile?.name || senderOpenId;
   return {
     reply: `${userName} 对 BET-${proposal.num}【${proposal.title}】 投注成功！\n` +
            `本次投注选项【${optionValue}】投注 ${lpAmount} LP\n` +

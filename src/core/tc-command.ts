@@ -17,21 +17,21 @@ import { buildTcCancelledPost } from './tc-post.js';
  * then mark the proposal cancelled. Shared by the in-group command and the CLI so the refund logic
  * lives in one place. Returns how many bets were refunded and the total LP returned.
  */
-export function cancelTcWithRefund(proposal: TcProposal): { refunded: number; refundedLp: number } {
-  const pending = getUnrefundedBets(proposal.id);
+export async function cancelTcWithRefund(proposal: TcProposal): Promise<{ refunded: number; refundedLp: number }> {
+  const pending = await getUnrefundedBets(proposal.id);
   let refunded = 0;
   let refundedLp = 0;
   for (const bet of pending) {
     try {
-      markBetRefunded(bet.id);
-      grantPt(bet.userOpenId, bet.lpAmount, 'tc_refund_cancel', proposal.topMessageId);
+      await markBetRefunded(bet.id);
+      await grantPt(bet.userOpenId, bet.lpAmount, 'tc_refund_cancel', proposal.topMessageId);
       refunded++;
       refundedLp += bet.lpAmount;
     } catch (e) {
       log.warn(`TC 撤销退款失败（bet.id=${bet.id}）：${(e as Error).message}`);
     }
   }
-  cancelTcProposal(proposal.id);
+  await cancelTcProposal(proposal.id);
   return { refunded, refundedLp };
 }
 
@@ -48,11 +48,11 @@ const STATUS_ZH: Record<string, string> = { active: '进行中', settled: '已�
  * This must run before the bet pre-intercept: "tc cancel 51" ends in a number and would otherwise be
  * misread as a bet on the chat's active proposal.
  */
-export function tryHandleTcCommand(
+export async function tryHandleTcCommand(
   rawText: string,
   senderOpenId: string,
   larkProfile?: string,
-): { reply: string } | false {
+): Promise<{ reply: string } | false> {
   const cmd = parseCommand(rawText);
   if (!cmd || cmd.name !== 'tc') return false;
   const sub = (cmd.args[0] ?? '').toLowerCase();
@@ -62,7 +62,7 @@ export function tryHandleTcCommand(
   const num = /^\d+$/.test(numStr) ? parseInt(numStr, 10) : NaN;
   if (isNaN(num)) return { reply: '用法：@我 tc cancel <编号>，例如「tc cancel 51」。' };
 
-  const proposal = getTcByNum(num);
+  const proposal = await getTcByNum(num);
   if (!proposal) return { reply: `找不到 TC-${num}。` };
   if (proposal.status !== 'active') {
     return { reply: `TC-${num} 当前状态为「${STATUS_ZH[proposal.status] ?? proposal.status}」，无法撤销。` };
@@ -71,12 +71,12 @@ export function tryHandleTcCommand(
     return { reply: `只有发起人或管理员才能撤销 TC-${num}。` };
   }
 
-  const { refunded, refundedLp } = cancelTcWithRefund(proposal);
+  const { refunded, refundedLp } = await cancelTcWithRefund(proposal);
 
   // Reflect the cancellation on the original pinned post (best-effort; never blocks the reply).
   try {
     const post = buildTcCancelledPost(proposal, refunded);
-    updateMessage(proposal.topMessageId, post, { as: 'bot', profile: larkProfile });
+    await updateMessage(proposal.topMessageId, post, { as: 'bot', profile: larkProfile });
   } catch (e) {
     log.warn(`TC 撤销：更新原帖失败（TC-${proposal.num}）：${(e as Error).message}`);
   }

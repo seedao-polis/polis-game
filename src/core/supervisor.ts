@@ -5,7 +5,7 @@ import { RUNTIME_DIR } from './paths.js';
 import { log } from './log.js';
 import * as store from './store.js';
 import { scanCorruptSessions, quarantineSession } from './kimi-session.js';
-import { loadConfigs, listAgents, resolveAgent, resolveChatTarget, loadChatPolicies, type WorkerTarget } from './configs.js';
+import { loadConfigs, listAgents, resolveAgentProfile, resolveChatTarget, loadChatPolicies, type WorkerTarget } from './configs.js';
 import { sendText, sendPost, appendDocxContent, type PostElement } from './lark.js';
 import { flushTelegramSync } from './telegram.js';
 import { listScheduledEvents, rollScheduledEvent, type EventSchedule } from './events.js';
@@ -15,6 +15,9 @@ import { meetupsOnDate, subscribersForTag, listAllMeetupsForWiki } from './store
 import { listExpiredActiveTcs } from './store/tc.js';
 import { settleTc } from './tc-settlement.js';
 import { chatMemberOpenIds } from './store/members.js';
+import { isLpPgCircuitOpen, isSoulPgCircuitOpen, soulCircuit, lpCircuit } from './db.js';
+import { replayOutbox, outboxBacklogCount } from './pg-outbox.js';
+import { isMeaninglessMessage, isFanoutFlood, newFanoutState } from './outbound-guard.js';
 import { buildNewcomerWelcomePost } from './self-intro.js';
 import { generateMeetupWikiMarkdown } from './meetup-wiki.js';
 import { refreshBadgeWiki } from './badge-wiki.js';
@@ -91,10 +94,17 @@ function scheduleDailyPtReset(): void {
   const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 5, 0, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
   const msUntilNext = next.getTime() - now.getTime();
-  setTimeout(() => {
+  setTimeout(async () => {
     try {
-      const result = store.resetDailyPtFloor();
-      log.info(`每日 LP 补底完成：补足 ${result.affected} 名用户`);
+      if (isLpPgCircuitOpen()) {
+        // Known-unavailable: skip this run quietly rather than flooding the log with a PgUnavailableError
+        // every attempt. Self-corrects tomorrow — the daily cadence is coarse enough that a same-day
+        // retry loop is not worth the added complexity (see Phase 1's accepted seconds/minutes outage window).
+        log.warn('每日 LP 补底跳过：LP 数据库断路器 open（PG 当前不可用），明天再试。');
+      } else {
+        const result = await store.resetDailyPtFloor();
+        log.info(`每日 LP 补底完成：补足 ${result.affected} 名用户`);
+      }
     } catch (e) {
       log.error('每日 LP 补底失败：', (e as Error).message);
     }
@@ -207,7 +217,7 @@ function eventSendProfile(): string | undefined {
   try {
     const cfg = loadConfigs();
     for (const id of listAgents(cfg)) {
-      if (cfg.agents.agents[id]?.enabled) return resolveAgent(id, cfg).larkProfile;
+      if (cfg.agents.agents[id]?.enabled) return resolveAgentProfile(id, cfg).larkProfile;
     }
   } catch {
     /* config unavailable */
@@ -323,7 +333,7 @@ function armMinuteEvents(): void {
  *
  * Exported for testability; the supervisor is the only production caller.
  */
-export function planAndArmEvents(): void {
+export async function planAndArmEvents(): Promise<void> {
   const now = new Date();
   const nowSec = Math.floor(now.getTime() / 1000);
   const todayIdx = logicalDayIndex(now.getTime());
@@ -331,10 +341,10 @@ export function planAndArmEvents(): void {
     const sch = cfg.schedule!;
     if (sch.kind === 'minutes') continue; // recurring; armed by armMinuteEvents
     try {
-      const st = store.getScheduleState(cfg.eventTypeId);
+      const st = await store.getScheduleState(cfg.eventTypeId);
       // future plan -> arm; recently past -> catch up (brief restart); long past (downtime spanned the
       // window) -> abandon as a missed window rather than ping at an odd hour. Slot consumed either way.
-      const armOrCatchUp = (fireSec: number): void => {
+      const armOrCatchUp = async (fireSec: number): Promise<void> => {
         if (fireSec > nowSec) {
           armEventTimer(cfg.eventTypeId, (fireSec - nowSec) * 1000);
           log.info(`事件待命【${cfg.eventTypeId}】${formatHHMM(fireSec * 1000)} 判定（概率 ${Math.round(sch.probability * 100)}%）`);
@@ -343,12 +353,12 @@ export function planAndArmEvents(): void {
           void fireScheduledNow(cfg.eventTypeId);
         } else {
           log.info(`事件错过时段【${cfg.eventTypeId}】（计划 ${formatHHMM(fireSec * 1000)} 已过太久，本轮作废）`);
-          store.resolveScheduleRoll(cfg.eventTypeId, 'missed');
+          await store.resolveScheduleRoll(cfg.eventTypeId, 'missed');
         }
       };
       // 1) A plan is already pending for this cycle — re-arm / catch up / abandon it.
       if (st.nextFireAt != null) {
-        armOrCatchUp(st.nextFireAt);
+        await armOrCatchUp(st.nextFireAt);
         continue;
       }
       // 2) No pending plan. If we already planned/resolved today, do nothing more today.
@@ -359,9 +369,9 @@ export function planAndArmEvents(): void {
       // 4) Plan a random within-window time for today, persist it, then arm/catch-up/abandon.
       const [startMin, endMin] = windowMinutes(sch);
       const fireSec = Math.floor(randomFireTimeMs(now, startMin, endMin) / 1000);
-      store.planScheduleFire(cfg.eventTypeId, fireSec, nowSec);
+      await store.planScheduleFire(cfg.eventTypeId, fireSec, nowSec);
       log.info(`事件已排程【${cfg.eventTypeId}】今天 ${formatHHMM(fireSec * 1000)} 判定`);
-      armOrCatchUp(fireSec);
+      await armOrCatchUp(fireSec);
     } catch (e) {
       log.error(`事件排程失败【${cfg.eventTypeId}】：`, (e as Error).message);
     }
@@ -377,9 +387,9 @@ function scheduleEventDayPlanner(): void {
   const now = new Date();
   const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), DAY_START_HOUR, 0, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
-  setTimeout(() => {
+  setTimeout(async () => {
     try {
-      planAndArmEvents();
+      await planAndArmEvents();
     } catch (e) {
       log.error('事件日规划失败：', (e as Error).message);
     }
@@ -404,19 +414,19 @@ function scheduleDailyMemoryMaintenance(): void {
   setTimeout(async () => {
     try {
       // 1) Purge expired memory entries.
-      const purged = purgeExpiredMemories();
+      const purged = await purgeExpiredMemories();
       if (purged > 0) log.info(`记忆维护：已清理 ${purged} 条已过期记忆`);
 
       // 2) Aggregate group topics for all known chats.
       //    Collect chat ids from: (a) messages history, (b) chat-policies entries.
-      const fromMessages = listKnownChatIds();
+      const fromMessages = await listKnownChatIds();
       const fromPolicies = Object.keys(loadChatPolicies().chatPolicies);
       const chatIds = [...new Set([...fromMessages, ...fromPolicies])];
 
       let aggregated = 0;
       for (const chatId of chatIds) {
         try {
-          const summary = aggregateGroupTopics(chatId);
+          const summary = await aggregateGroupTopics(chatId);
           if (summary) aggregated++;
         } catch (e) {
           log.warn(`记忆维护：群话题聚合失败（${chatId}）：${(e as Error).message}`);
@@ -452,7 +462,7 @@ function notifyTarget(): { chatId: string; profile: string } | null {
     const cfg = loadConfigs();
     for (const id of listAgents(cfg)) {
       if (!cfg.agents.agents[id]?.enabled) continue;
-      const r = resolveAgent(id, cfg);
+      const r = resolveAgentProfile(id, cfg);
       if (r.notifyChatId) return { chatId: r.notifyChatId, profile: r.larkProfile };
     }
   } catch {
@@ -478,15 +488,14 @@ function scheduleSessionJanitor(): void {
         if (process.env.SESSION_JANITOR_NOTIFY !== '0') {
           const t = notifyTarget();
           if (t) {
-            try {
-              sendText(
-                { chatId: t.chatId },
-                `⚙️ 自愈：清理了 ${healed} 个损坏的对话会话，受影响的群下次对话会自动重建（无需人工处理）。`,
-                { as: 'bot', profile: t.profile }
-              );
-            } catch (e) {
+            // Fire-and-forget: the janitor loop is synchronous and the notify is best-effort.
+            void sendText(
+              { chatId: t.chatId },
+              `⚙️ 自愈：清理了 ${healed} 个损坏的对话会话，受影响的群下次对话会自动重建（无需人工处理）。`,
+              { as: 'bot', profile: t.profile }
+            ).catch((e) => {
               log.warn('session 守护通知失败：', (e as Error).message);
-            }
+            });
           }
         }
       }
@@ -523,12 +532,12 @@ function scheduleDailyMeetupDigest(): void {
   const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 8, 0, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
 
-  setTimeout(() => {
+  setTimeout(async () => {
     try {
       const today = new Date();
       const dayStart = Math.floor(new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0).getTime() / 1000);
       const dayEnd = Math.floor(new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1, 0, 0, 0).getTime() / 1000);
-      const meetups = meetupsOnDate(dayStart, dayEnd);
+      const meetups = await meetupsOnDate(dayStart, dayEnd);
 
       if (meetups.length === 0) {
         log.info('08:00 会议播报：今日无会议，静默。');
@@ -553,7 +562,7 @@ function scheduleDailyMeetupDigest(): void {
       const d = new Date(dayStart * 1000);
       const dateSlash = fmtDate(dayStart).replace(/-/g, '/'); // YYYY/MM/DD
       const weekday = '日一二三四五六'[d.getDay()];
-      const groupMembers = chatMemberOpenIds([chatId]);
+      const groupMembers = await chatMemberOpenIds([chatId]);
       const lines: PostElement[][] = [];
       lines.push([{ tag: 'text', text: `📅 ${dateSlash} (${weekday}) 今日活动` }]);
 
@@ -579,7 +588,7 @@ function scheduleDailyMeetupDigest(): void {
         const atElements: PostElement[] = [];
         const mentioned = new Set<string>();
         for (const tag of m.tags) {
-          for (const uid of subscribersForTag(tag)) {
+          for (const uid of await subscribersForTag(tag)) {
             if (groupMembers.has(uid) && !mentioned.has(uid)) {
               mentioned.add(uid);
               atElements.push({ tag: 'at', user_id: uid });
@@ -596,7 +605,7 @@ function scheduleDailyMeetupDigest(): void {
         }
       }
 
-      sendPost({ chatId }, { content: lines }, { as: 'bot', profile });
+      await sendPost({ chatId }, { content: lines }, { as: 'bot', profile });
       log.info(`08:00 会议播报已发送（${meetups.length} 场会议，@${mentionTotal} 人次）→ ${chatId}`);
     } catch (e) {
       log.error('08:00 会议播报失败：', (e as Error).message);
@@ -628,39 +637,39 @@ function nextWelcomeDigestTime(now: Date): Date {
 }
 
 /** Send the batched newcomer welcome to the visitor group, then clear the queue. Best-effort. */
-function runWelcomeDigest(): void {
+async function runWelcomeDigest(): Promise<void> {
   const chatId = resolveChatTarget('围观群');
   if (!chatId) {
     log.warn('迎新播报：未配置围观群，跳过。');
     return;
   }
-  const pending = store.listPendingWelcome(chatId);
+  const pending = await store.listPendingWelcome(chatId);
   if (pending.length === 0) {
     log.info('迎新播报：队列为空，静默。');
     return;
   }
   // Only welcome members who are still present in the group (someone who joined and left within the
   // window is dropped). The queue is cleared wholesale afterwards regardless.
-  const present = chatMemberOpenIds([chatId]);
+  const present = await chatMemberOpenIds([chatId]);
   const joiners = pending.filter((p) => present.has(p.openId));
   const post = buildNewcomerWelcomePost(joiners, WELCOME_DIGEST_MAX_MENTIONS);
   if (post) {
     const profile = eventSendProfile();
-    sendPost({ chatId }, post, { as: 'bot', profile });
+    await sendPost({ chatId }, post, { as: 'bot', profile });
     log.info(`迎新播报已发送（${joiners.length}/${pending.length} 位在群新成员）→ ${chatId}`);
   } else {
     log.info(`迎新播报：队列 ${pending.length} 人均已离群，静默。`);
   }
-  store.clearPendingWelcome(chatId);
+  await store.clearPendingWelcome(chatId);
 }
 
 /** Fire the welcome digest at the next 08:30 / 14:30 / 20:30, then re-anchor to the following one. */
 function scheduleWelcomeDigest(): void {
   const now = new Date();
   const next = nextWelcomeDigestTime(now);
-  setTimeout(() => {
+  setTimeout(async () => {
     try {
-      runWelcomeDigest();
+      await runWelcomeDigest();
     } catch (e) {
       log.error('迎新播报失败：', (e as Error).message);
     }
@@ -683,7 +692,7 @@ function scheduleDailyMeetupWikiUpdate(): void {
   const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 8, 1, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
 
-  setTimeout(() => {
+  setTimeout(async () => {
     try {
       let docId: string | undefined;
       try {
@@ -697,9 +706,9 @@ function scheduleDailyMeetupWikiUpdate(): void {
       }
 
       const profile = eventSendProfile();
-      const meetups = listAllMeetupsForWiki();
+      const meetups = await listAllMeetupsForWiki();
       const markdown = generateMeetupWikiMarkdown(meetups);
-      const ok = appendDocxContent(docId, markdown, { profile, overwrite: true, format: 'markdown' });
+      const ok = await appendDocxContent(docId, markdown, { profile, overwrite: true, format: 'markdown' });
       if (ok) {
         log.info(`08:01 SeeDAO 活动日历 wiki 已更新（${meetups.length} 条记录）`);
       } else {
@@ -727,10 +736,10 @@ function scheduleDailyBadgeWikiUpdate(): void {
   const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 5, 0, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
 
-  setTimeout(() => {
+  setTimeout(async () => {
     try {
       const profile = eventSendProfile();
-      if (refreshBadgeWiki({ profile })) {
+      if (await refreshBadgeWiki({ profile })) {
         log.info('05:00 徽章列表 wiki 已刷新。');
       } else {
         log.warn('05:00 徽章列表 wiki 刷新失败或未配置 badgeWikiDocId。');
@@ -756,14 +765,22 @@ function scheduleTcSettlement(): void {
   const INTERVAL_MS = 60_000;
   const tick = async (): Promise<void> => {
     try {
-      const expired = listExpiredActiveTcs();
-      for (const proposal of expired) {
-        try {
-          const profile = eventSendProfile() ?? '';
-          await settleTc(proposal, profile);
-          log.info(`TC 结算完成：TC-${proposal.num}  title=${proposal.title}`);
-        } catch (e) {
-          log.error(`TC-${proposal.num} 结算失败：${(e as Error).message}`);
+      if (isLpPgCircuitOpen()) {
+        // Known-unavailable: skip this tick entirely rather than settling in a loop that would fail
+        // on every proposal's grantPt call every minute. The idempotent status guard (settleTcProposal's
+        // WHERE status='active') already makes the next tick's retry safe once the breaker closes, so
+        // this reuses the existing self-rescheduling skeleton unchanged — just skips known-wasted work.
+        log.warn('TC 结算跳过本轮：LP 数据库断路器 open（PG 当前不可用），下一轮自动重试。');
+      } else {
+        const expired = await listExpiredActiveTcs();
+        for (const proposal of expired) {
+          try {
+            const profile = eventSendProfile() ?? '';
+            await settleTc(proposal, profile);
+            log.info(`TC 结算完成：TC-${proposal.num}  title=${proposal.title}`);
+          } catch (e) {
+            log.error(`TC-${proposal.num} 结算失败：${(e as Error).message}`);
+          }
         }
       }
     } catch (e) {
@@ -772,6 +789,59 @@ function scheduleTcSettlement(): void {
     setTimeout(tick, INTERVAL_MS);
   };
   setTimeout(tick, 0);
+}
+
+// ── PG circuit breaker resilience: alerts + outbox replay (Phase 4 / Phase 2) ────────────────────
+// Reuses the deterministic outbound-guard safeguards (isMeaninglessMessage / isFanoutFlood) that
+// mcp-server.ts applies to the LLM-facing feishu_send tool, so a flapping breaker cannot spam the
+// ops chat with the same transition line repeatedly inside a short window.
+const _pgAlertFanout = newFanoutState();
+
+const CIRCUIT_STATE_ZH: Record<string, string> = {
+  closed: '已恢复正常（closed）',
+  open: '已判定不可用（open）',
+  'half-open': '正在尝试恢复（half-open）',
+};
+
+function sendPgCircuitAlert(text: string): void {
+  const t = notifyTarget();
+  if (!t) return;
+  if (isMeaninglessMessage(text)) return; // defensive; this text is never actually empty/placeholder
+  if (isFanoutFlood(_pgAlertFanout, text, t.chatId, Date.now())) return; // guards against a flapping breaker
+  void sendText({ chatId: t.chatId }, text, { as: 'bot', profile: t.profile }).catch((e) => {
+    log.warn('PG 断路器告警发送失败：', (e as Error).message);
+  });
+}
+
+/**
+ * Wire up the two circuit breakers' state-change listeners (ops-chat alerts for both; outbox replay
+ * for the soul breaker specifically) and a periodic safety-net sweep. The sweep exists because the
+ * replay-on-close trigger is an in-memory event: if the supervisor process itself restarts while the
+ * soul pool is down, it never observes the open→closed transition that would otherwise fire the
+ * replay, and a stale backlog would sit unreplayed until the next natural transition (which may never
+ * come again). Called once from runSupervisor().
+ */
+function installPgResilienceHooks(): void {
+  soulCircuit.subscribe((from, to, label) => {
+    log.warn(`PG 断路器状态变化（${label} 库）：${from} → ${to}`);
+    sendPgCircuitAlert(`⚠️ PG 断路器（${label} 库）状态变化：${CIRCUIT_STATE_ZH[to] ?? to}`);
+    if (to === 'closed') {
+      replayOutbox().catch((e) => log.error('PG 降级队列回放失败：', (e as Error).message));
+    }
+  });
+  lpCircuit.subscribe((from, to, label) => {
+    log.warn(`PG 断路器状态变化（${label} 库）：${from} → ${to}`);
+    sendPgCircuitAlert(`⚠️ PG 断路器（${label} 库）状态变化：${CIRCUIT_STATE_ZH[to] ?? to}`);
+  });
+
+  const REPLAY_SWEEP_MS = 5 * 60_000;
+  const sweep = (): void => {
+    if (!isSoulPgCircuitOpen() && outboxBacklogCount() > 0) {
+      replayOutbox().catch((e) => log.error('PG 降级队列回放失败：', (e as Error).message));
+    }
+    setTimeout(sweep, REPLAY_SWEEP_MS);
+  };
+  setTimeout(sweep, REPLAY_SWEEP_MS);
 }
 
 /** Start the supervisor: stays resident, watches over the worker child process, and SIGHUP triggers a graceful restart. */
@@ -886,13 +956,14 @@ export function runSupervisor(opts: SupervisorOptions): Promise<void> {
   if (opts.quiet) {
     log.info('静默模式（--quiet）：worker 照常采集对话与数据、但不回复任何飞书 p2p/群/@；定时事件仍照常运行。');
   }
+  installPgResilienceHooks(); // PG circuit breaker ops-chat alerts + soul outbox replay (Phase 2/4)
   scheduleDailyPtReset();
   scheduleDailyMemoryMaintenance(); // daily 04:50 memory TTL purge + group topic aggregation
   scheduleDailyOpsReport();    // daily 04:55 ops report (closing logical day) -> 运营小天地 + Telegram
   scheduleMonthlyOpsReport();  // monthly on 1st at 04:55 ops report (closing logical month)
   scheduleWeeklyOpsReport();   // weekly Thursday 21:00 community ops report -> wiki + 运营小天地
   scheduleEventDayPlanner(); // daily 05:00 logical-day planner
-  planAndArmEvents();        // and plan/arm today's day-based events now (covers a mid-day start)
+  void planAndArmEvents();   // and plan/arm today's day-based events now (covers a mid-day start)
   armMinuteEvents();         // start recurring ticks for minute-cadence events
   scheduleSessionJanitor();
   scheduleDailyMeetupDigest();     // daily 08:00 today's meetup broadcast → 围观群

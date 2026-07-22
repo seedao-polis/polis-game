@@ -55,12 +55,12 @@ export async function settlePredict(
     return { ok: false, error: 'invalid_option', winners: [], totalPool: 0, chestContribution: 0, dust: 0 };
   }
 
-  const bets: PredictBet[] = getPredictBets(proposal.id).filter(b => !b.isRefunded);
+  const bets: PredictBet[] = (await getPredictBets(proposal.id)).filter(b => !b.isRefunded);
   const totalAllLp = bets.reduce((s, b) => s + b.lpAmount, 0);
   const totalPool = totalAllLp * 1.05;
 
   // Idempotency gate: only the first successful call transitions active -> settled and grants LP.
-  const didSettle = settlePredictProposal(proposal.id, winnerOption, announcerOpenId);
+  const didSettle = await settlePredictProposal(proposal.id, winnerOption, announcerOpenId);
   if (!didSettle) {
     return { ok: false, error: 'already_settled', winners: [], totalPool: 0, chestContribution: 0, dust: 0 };
   }
@@ -82,8 +82,8 @@ export async function settlePredict(
 
     for (const w of winners) {
       if (w.payout > 0) {
-        grantPt(w.userOpenId, w.payout, 'predict_reward', proposal.topMessageId);
-        const name = memberName(w.userOpenId) || getProfile(w.userOpenId)?.name || w.userOpenId;
+        await grantPt(w.userOpenId, w.payout, 'predict_reward', proposal.topMessageId);
+        const name = (await memberName(w.userOpenId)) || (await getProfile(w.userOpenId))?.name || w.userOpenId;
         winnerNames.push({ userOpenId: w.userOpenId, userName: name, amount: w.payout });
       }
     }
@@ -96,17 +96,17 @@ export async function settlePredict(
     // share) — the only condition is that the proposal drew at least one bet at all. Rounded to 2
     // decimal places purely to keep the ledger free of floating-point noise (e.g. 1.0499999999999998);
     // the 10% factor itself is not part of the 0.1 LP payout-flooring rule.
-    ensurePublicWelfareChest();
+    await ensurePublicWelfareChest();
     chestContribution = Math.round(totalPool * 0.10 * 100) / 100;
-    grantPt(PUBLIC_WELFARE_CHEST_ID, chestContribution, 'predict_chest_contribute', proposal.topMessageId);
+    await grantPt(PUBLIC_WELFARE_CHEST_ID, chestContribution, 'predict_chest_contribute', proposal.topMessageId);
     log.info(`BET-${proposal.num} 公益宝箱注资：+${chestContribution.toFixed(2)} LP`);
   }
 
   // Update the original proposal post in-place; fall back to a new text message on failure.
-  const announcerName = memberName(announcerOpenId) || getProfile(announcerOpenId)?.name || announcerOpenId;
+  const announcerName = (await memberName(announcerOpenId)) || (await getProfile(announcerOpenId))?.name || announcerOpenId;
   const updatedProposal: PredictProposal = { ...proposal, status: 'settled', settledOption: winnerOption, announcedBy: announcerOpenId };
   const settledPost = buildPredictSettledPost(updatedProposal, bets, winnerNames, announcerName, chestContribution);
-  const ok = updateMessage(proposal.topMessageId, settledPost, { as: 'bot', profile: larkProfile });
+  const ok = await updateMessage(proposal.topMessageId, settledPost, { as: 'bot', profile: larkProfile });
   if (!ok) {
     log.warn(`BET-${proposal.num} 结算原帖更新失败（topMsgId=${proposal.topMessageId}），发送新消息补充`);
     try {
@@ -114,7 +114,7 @@ export async function settlePredict(
       const fallbackText = agg.length > 0
         ? `【BET-${proposal.num}】已结算。裁判宣布结果：${winnerOption}\n获奖：${agg.map(w => `${w.userName} +${w.amount.toFixed(1)} LP`).join('  ')}`
         : `【BET-${proposal.num}】已结算。裁判宣布结果：${winnerOption}（无人押中）。`;
-      sendText({ chatId: proposal.chatId }, fallbackText, { as: 'bot', profile: larkProfile });
+      await sendText({ chatId: proposal.chatId }, fallbackText, { as: 'bot', profile: larkProfile });
     } catch (fe) {
       log.error(`BET-${proposal.num} fallback 消息发送也失败：${(fe as Error).message}`);
     }

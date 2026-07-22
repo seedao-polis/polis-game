@@ -27,21 +27,21 @@ const STATUS_ZH: Record<string, string> = { active: '进行中', settled: '已�
  * Refund every outstanding bet on a proposal (per-soul markBetRefunded + shared-db grantPt), then mark
  * it cancelled. Shared by the in-group command and the CLI so the refund logic lives in one place.
  */
-export function cancelPredictWithRefund(proposal: PredictProposal): { refunded: number; refundedLp: number } {
-  const pending = getUnrefundedBets(proposal.id);
+export async function cancelPredictWithRefund(proposal: PredictProposal): Promise<{ refunded: number; refundedLp: number }> {
+  const pending = await getUnrefundedBets(proposal.id);
   let refunded = 0;
   let refundedLp = 0;
   for (const bet of pending) {
     try {
-      markBetRefunded(bet.id);
-      grantPt(bet.userOpenId, bet.lpAmount, 'predict_refund_cancel', proposal.topMessageId);
+      await markBetRefunded(bet.id);
+      await grantPt(bet.userOpenId, bet.lpAmount, 'predict_refund_cancel', proposal.topMessageId);
       refunded++;
       refundedLp += bet.lpAmount;
     } catch (e) {
       log.warn(`BET 撤销退款失败（bet.id=${bet.id}）：${(e as Error).message}`);
     }
   }
-  cancelPredictProposal(proposal.id);
+  await cancelPredictProposal(proposal.id);
   return { refunded, refundedLp };
 }
 
@@ -53,11 +53,11 @@ function parsePredictNum(raw: string | undefined): number {
 }
 
 /** Build a plain-text reply describing a proposal's current state and bet distribution. */
-export function queryPredictReply(num: number): string {
+export async function queryPredictReply(num: number): Promise<string> {
   if (isNaN(num)) return '请提供有效的编号，例如：BET-1 或 预测 查询 1';
-  const proposal = getPredictByNum(num);
+  const proposal = await getPredictByNum(num);
   if (!proposal) return `找不到 BET-${num}。`;
-  const bets = getPredictBets(proposal.id);
+  const bets = await getPredictBets(proposal.id);
   const activeBets = bets.filter(b => !b.isRefunded);
   const totalLp = activeBets.reduce((s, b) => s + b.lpAmount, 0);
   const participants = new Set(activeBets.map(b => b.userOpenId)).size;
@@ -99,11 +99,11 @@ export function queryPredictReply(num: number): string {
  * could otherwise be misread as a bet on the chat's active proposal (same lesson as TC's "tc cancel 51"
  * regression — see tc.test.ts).
  */
-export function tryHandlePredictCommand(
+export async function tryHandlePredictCommand(
   rawText: string,
   senderOpenId: string,
   larkProfile?: string,
-): { reply: string } | false {
+): Promise<{ reply: string } | false> {
   const cmd = parseCommand(rawText);
   if (!cmd) return false;
   if (cmd.name !== '预测' && cmd.name !== 'predict') return false;
@@ -115,12 +115,12 @@ export function tryHandlePredictCommand(
     if (isNaN(num) || !winnerOption) {
       return { reply: '用法：预测 宣布 <编号> <获胜选项>，例如「预测 宣布 3 巴西」。' };
     }
-    const proposal = getPredictByNum(num);
+    const proposal = await getPredictByNum(num);
     if (!proposal) return { reply: `找不到 BET-${num}。` };
     if (proposal.status !== 'active') {
       return { reply: `BET-${num} 当前状态为「${STATUS_ZH[proposal.status] ?? proposal.status}」，无法宣布结果。` };
     }
-    if (!hasBadge(senderOpenId, PREDICT_JUDGE_BADGE_ID)) {
+    if (!(await hasBadge(senderOpenId, PREDICT_JUDGE_BADGE_ID))) {
       return { reply: '只有社区预测裁判可以宣布结果。' };
     }
     if (!proposal.options.includes(winnerOption)) {
@@ -129,9 +129,9 @@ export function tryHandlePredictCommand(
                `有效选项：${proposal.options.map(o => `【${o}】`).join(' / ')}`,
       };
     }
-    // settlePredict is async (it performs the in-place message edit / fallback send); the caller here
-    // is itself sync, so kick it off and let the post update land shortly after this reply. LP grants
-    // and the idempotent status transition are already fully applied by the time settlePredict resolves.
+    // settlePredict performs the in-place message edit / fallback send and can take a moment; it is
+    // deliberately not awaited so the command reply returns immediately ("正在结算并更新原帖…"), with the
+    // LP grants and idempotent status transition landing shortly after in the background.
     void settlePredict(proposal, winnerOption, senderOpenId, larkProfile).catch((e) => {
       log.error(`BET-${num} 结算失败：${(e as Error).message}`);
     });
@@ -141,18 +141,18 @@ export function tryHandlePredictCommand(
   if (sub === '撤销' || sub === '取消' || sub === 'cancel') {
     const num = parsePredictNum(cmd.args[1]);
     if (isNaN(num)) return { reply: '用法：预测 撤销 <编号>，例如「预测 撤销 3」。' };
-    const proposal = getPredictByNum(num);
+    const proposal = await getPredictByNum(num);
     if (!proposal) return { reply: `找不到 BET-${num}。` };
     if (proposal.status !== 'active') {
       return { reply: `BET-${num} 当前状态为「${STATUS_ZH[proposal.status] ?? proposal.status}」，无法撤销。` };
     }
-    if (proposal.createdBy !== senderOpenId && !hasBadge(senderOpenId, PREDICT_JUDGE_BADGE_ID)) {
+    if (proposal.createdBy !== senderOpenId && !(await hasBadge(senderOpenId, PREDICT_JUDGE_BADGE_ID))) {
       return { reply: `只有发起人或社区预测裁判才能撤销 BET-${num}。` };
     }
-    const { refunded, refundedLp } = cancelPredictWithRefund(proposal);
+    const { refunded, refundedLp } = await cancelPredictWithRefund(proposal);
     try {
       const post = buildPredictCancelledPost(proposal, refunded);
-      updateMessage(proposal.topMessageId, post, { as: 'bot', profile: larkProfile });
+      await updateMessage(proposal.topMessageId, post, { as: 'bot', profile: larkProfile });
     } catch (e) {
       log.warn(`BET 撤销：更新原帖失败（BET-${proposal.num}）：${(e as Error).message}`);
     }
@@ -166,7 +166,7 @@ export function tryHandlePredictCommand(
   }
 
   if (sub === '查询' || sub === 'query') {
-    return { reply: queryPredictReply(parsePredictNum(cmd.args[1])) };
+    return { reply: await queryPredictReply(parsePredictNum(cmd.args[1])) };
   }
 
   return { reply: '用法：预测 宣布 <编号> <选项> | 预测 撤销 <编号> | 预测 查询 <编号>' };

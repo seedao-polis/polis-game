@@ -158,18 +158,18 @@ function resolveRange(period: Period, ref: Date): { from: number; to: number } {
  * classification is refreshed each time a report is generated. Falls back to the locally-synced
  * member directory when the live fetch yields nothing.
  */
-function resolveStaffOpenIds(): Set<string> {
+async function resolveStaffOpenIds(): Promise<Set<string>> {
   const set = new Set<string>();
   const chatIds = staffChatIds();
   for (const chatId of chatIds) {
     try {
-      for (const openId of listChatMembers(chatId).keys()) set.add(openId);
+      for (const openId of (await listChatMembers(chatId)).keys()) set.add(openId);
     } catch {
       // skip this chat on failure and rely on the remaining chats or the fallback
     }
   }
   if (set.size === 0 && chatIds.length > 0) {
-    for (const id of chatMemberOpenIds(chatIds)) set.add(id);
+    for (const id of await chatMemberOpenIds(chatIds)) set.add(id);
   }
   return set;
 }
@@ -178,8 +178,8 @@ function resolveStaffOpenIds(): Set<string> {
  * Build the member-count line series from member_sync_rounds as raw 5-minute points across the
  * whole range (daily and monthly alike).
  */
-function buildMemberLine(range: { from: number; to: number }): LineSeries {
-  const rounds = dropMemberDips(memberSyncRoundsBetween(range.from, range.to));
+async function buildMemberLine(range: { from: number; to: number }): Promise<LineSeries> {
+  const rounds = dropMemberDips(await memberSyncRoundsBetween(range.from, range.to));
   return {
     name: 'SeeDAO 2.0 围观群',
     points: rounds.map((r) => ({ t: r.syncedAt, y: r.presentExternal })),
@@ -227,28 +227,28 @@ export function bucketSignupPoints(points: ChartPoint[], endSec: number): ChartP
  *    drop them all.
  * Internal-meeting titles are excluded in both modes.
  */
-function buildSignupLines(period: Period, range: { from: number; to: number }): LineSeries[] {
+async function buildSignupLines(period: Period, range: { from: number; to: number }): Promise<LineSeries[]> {
   return period === 'monthly' ? buildMonthlySignupLines(range) : buildDailySignupLines(range);
 }
 
-function buildDailySignupLines(range: { from: number; to: number }): LineSeries[] {
+async function buildDailySignupLines(range: { from: number; to: number }): Promise<LineSeries[]> {
   const nowSec = Math.floor(Date.now() / 1000);
-  const events = upcomingTrackedEventIds(nowSec).filter((ev) => isTrackedEventTitle(ev.title));
+  const events = (await upcomingTrackedEventIds(nowSec)).filter((ev) => isTrackedEventTitle(ev.title));
   const lines: LineSeries[] = [];
   for (const ev of events) {
-    const rounds = calendarEventRsvpHistory(ev.eventId, range.from, range.to);
+    const rounds = await calendarEventRsvpHistory(ev.eventId, range.from, range.to);
     if (rounds.length === 0) continue;
     lines.push({ name: ev.title, points: rounds.map((r) => ({ t: r.syncedAt, y: r.accepted })) });
   }
   return lines;
 }
 
-function buildMonthlySignupLines(range: { from: number; to: number }): LineSeries[] {
-  const events = eventsStartingBetween(range.from, range.to).filter((ev) => isTrackedEventTitle(ev.title));
+async function buildMonthlySignupLines(range: { from: number; to: number }): Promise<LineSeries[]> {
+  const events = (await eventsStartingBetween(range.from, range.to)).filter((ev) => isTrackedEventTitle(ev.title));
   const lines: LineSeries[] = [];
   for (const ev of events) {
     // Full history up to the event start (RSVP polling already stops at start, so this is the whole curve).
-    const rounds = calendarEventRsvpAll(ev.eventId).filter((r) => r.syncedAt <= ev.startTime);
+    const rounds = (await calendarEventRsvpAll(ev.eventId)).filter((r) => r.syncedAt <= ev.startTime);
     if (rounds.length === 0) continue;
     const points = bucketSignupPoints(rounds.map((r) => ({ t: r.syncedAt, y: r.accepted })), ev.startTime);
     lines.push({ name: ev.title, points });
@@ -264,16 +264,16 @@ function buildMonthlySignupLines(range: { from: number; to: number }): LineSerie
  * Returns an empty array when no readers were found (caller skips the tree chart).
  */
 async function buildWikiTreeNodes(range: { from: number; to: number }): Promise<TreeNode[]> {
-  const spaceIds = wikiSpacesBetween(range.from, range.to);
+  const spaceIds = await wikiSpacesBetween(range.from, range.to);
   if (spaceIds.length === 0) return [];
 
-  const viewersByToken = docViewersBetween(range.from, range.to);
-  const staffSet = resolveStaffOpenIds();
+  const viewersByToken = await docViewersBetween(range.from, range.to);
+  const staffSet = await resolveStaffOpenIds();
 
   // Collect all wiki nodes across all active spaces.
   const allNodes: WikiNode[] = [];
   for (const spaceId of spaceIds) {
-    const nodes = listWikiNodesDeep(spaceId);
+    const nodes = await listWikiNodesDeep(spaceId);
     allNodes.push(...nodes);
   }
 
@@ -428,12 +428,12 @@ function renderViaPython(specPath: string): Promise<Record<string, string>> {
  * images. Targets a group chat or a P2P user (open_id). Images upload under the bot identity, and
  * must live under the process cwd for lark-cli's file sandbox.
  */
-function sendReportToLark(
+async function sendReportToLark(
   target: { chatId?: string; userId?: string },
   title: string,
   textSummary: string,
   pngPaths: string[],
-): void {
+): Promise<void> {
   const content: PostElement[][] = [];
   for (const line of textSummary.split('\n')) {
     content.push([{ tag: 'text', text: line }]);
@@ -441,12 +441,12 @@ function sendReportToLark(
   // A blank line before each image separates the summary from the charts and the charts from
   // one another, so the images are not cramped together.
   for (const png of pngPaths) {
-    const key = uploadImage(png);
+    const key = await uploadImage(png);
     if (!key) continue;
     content.push([{ tag: 'text', text: '' }]);
     content.push([{ tag: 'img', image_key: key }]);
   }
-  sendPost(target, { title, content }, { as: 'bot' });
+  await sendPost(target, { title, content }, { as: 'bot' });
 }
 
 /** Format the report date label in local time: YYYY-MM-DD for daily, YYYY-MM for monthly. */
@@ -505,8 +505,8 @@ async function generateAndSendReport(period: Period, ref: Date, targets: ReportT
 
   log.info(`运营报告生成开始（period=${period}，date=${dateLabel}）`);
 
-  const memberLine = buildMemberLine(range);
-  const signupLines = buildSignupLines(period, range);
+  const memberLine = await buildMemberLine(range);
+  const signupLines = await buildSignupLines(period, range);
   const wikiNodes = await buildWikiTreeNodes(range);
 
   // Output under the repo so lark-cli's cwd-relative file sandbox can upload the images.
@@ -595,7 +595,7 @@ async function generateAndSendReport(period: Period, ref: Date, targets: ReportT
   // Optional Feishu delivery (group chat or P2P preview), independent of Telegram.
   if (targets.larkChat || targets.larkUser) {
     try {
-      sendReportToLark(
+      await sendReportToLark(
         { chatId: targets.larkChat, userId: targets.larkUser },
         `SeeDAO ${label}运营数据 · ${dateLabel}`,
         deliveryBody,

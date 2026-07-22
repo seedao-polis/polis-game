@@ -102,8 +102,8 @@ export function topTokens(texts: string[], topN = 8): string[] {
  *
  * Returns the generated summary string (useful for testing and logging).
  */
-export function aggregateGroupTopics(chatId: string): string {
-  const rows = getRecentMessagesForChat(chatId, 300);
+export async function aggregateGroupTopics(chatId: string): Promise<string> {
+  const rows = await getRecentMessagesForChat(chatId, 300);
   const texts = rows.map((r) => r.text).filter(Boolean);
 
   if (texts.length === 0) return '';
@@ -113,7 +113,7 @@ export function aggregateGroupTopics(chatId: string): string {
 
   const summary = `近期话题热词：${top.join('、')}`;
 
-  upsertMemory({
+  await upsertMemory({
     namespace: `group:${chatId}`,
     key: 'topics',
     content: summary,

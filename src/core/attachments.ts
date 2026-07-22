@@ -34,10 +34,11 @@ export interface AttachmentMessage {
 
 export interface RenderOptions {
   /**
-   * Download a message's file resource to a local path (absolute), or null on failure. Injected so the
-   * pure rendering/extraction logic stays testable without spawning the lark-cli subprocess.
+   * Download a message's file resource to a local path (absolute), or null on failure. May be async
+   * (the production downloader shells out to lark-cli). Injected so the pure rendering/extraction
+   * logic stays testable without spawning the lark-cli subprocess.
    */
-  fetchFile?: (messageId: string, fileKey: string, fileName: string) => string | null;
+  fetchFile?: (messageId: string, fileKey: string, fileName: string) => string | null | Promise<string | null>;
   /** Read a downloaded file's text. Defaults to a bounded fs reader; injectable for tests. */
   readFile?: (localPath: string) => string;
   /** Cap on inlined characters per file (default {@link DEFAULT_MAX_INLINE_CHARS}). */
@@ -164,7 +165,7 @@ function defaultReadFile(p: string): string {
  * and '' for message types that should not appear in the context (caller filters empties). Text and
  * post messages are handled by the caller and are NOT rendered here (returns '' for them).
  */
-export function renderMessageBody(msg: AttachmentMessage, opts: RenderOptions = {}): string {
+export async function renderMessageBody(msg: AttachmentMessage, opts: RenderOptions = {}): Promise<string> {
   const maxChars = opts.maxInlineChars ?? DEFAULT_MAX_INLINE_CHARS;
   const read = opts.readFile ?? defaultReadFile;
 
@@ -174,7 +175,7 @@ export function renderMessageBody(msg: AttachmentMessage, opts: RenderOptions = 
     const label = ref.name ? `[文件：${ref.name}]` : '[文件]';
     if (!isTextExtractable(ref.name)) return `${label}（二进制文件，未展开内容）`;
     if (!opts.fetchFile || !msg.messageId) return `${label}（未能读取内容）`;
-    const local = opts.fetchFile(msg.messageId, ref.key, ref.name);
+    const local = await opts.fetchFile(msg.messageId, ref.key, ref.name);
     if (!local) return `${label}（未能读取内容）`;
     try {
       const excerpt = extractText(read(local), ref.name, maxChars);

@@ -109,7 +109,7 @@ export interface GatherOptions {
  * SECONDS; pass the same [from,to) window resolveRange produces. Content for chats outside contentTiers
  * (e.g. work groups) is dropped here — not just hidden later — so it never reaches the prompt.
  */
-export function gatherDayData(range: { from: number; to: number }, opts: GatherOptions = {}): DayData {
+export async function gatherDayData(range: { from: number; to: number }, opts: GatherOptions = {}): Promise<DayData> {
   const contentTiers = opts.contentTiers ?? DEFAULT_CONTENT_TIERS;
   const maxLines = opts.maxLinesPerChat ?? 400;
   const tierOf = opts.tierOf ?? getChatTier;
@@ -118,7 +118,7 @@ export function gatherDayData(range: { from: number; to: number }, opts: GatherO
 
   // ── chats (from messages) ──
   const byChat = new Map<string, MessageRow[]>();
-  for (const m of messagesBetween(range.from, range.to)) {
+  for (const m of await messagesBetween(range.from, range.to)) {
     if (bots.has(m.senderOpenId)) continue; // the bot's own posts are not community activity
     const arr = byChat.get(m.chatId) ?? [];
     arr.push(m);
@@ -128,19 +128,21 @@ export function gatherDayData(range: { from: number; to: number }, opts: GatherO
   let totalMessages = 0;
   for (const [chatId, rows] of byChat) {
     if (excludeChat(chatId)) continue; // omit configured chats (e.g. agent-collaboration rooms) from the report entirely
-    const meta = getChatMeta(chatId);
+    const meta = await getChatMeta(chatId);
     const tier = tierOf(chatId);
     const includeContent = contentTiers.includes(tier);
     const active = new Set(rows.map((r) => r.senderOpenId).filter(Boolean));
     const lines = includeContent
-      ? rows
-          .filter((r) => r.msgType === 'text' && r.text.trim() !== '')
-          .slice(-maxLines)
-          .map((r) => ({
-            name: applyNameOverride(r.senderOpenId, r.senderName || memberName(r.senderOpenId) || '匿名'),
-            text: r.text.trim(),
-            threadId: r.threadId,
-          }))
+      ? await Promise.all(
+          rows
+            .filter((r) => r.msgType === 'text' && r.text.trim() !== '')
+            .slice(-maxLines)
+            .map(async (r) => ({
+              name: await applyNameOverride(r.senderOpenId, r.senderName || (await memberName(r.senderOpenId)) || '匿名'),
+              text: r.text.trim(),
+              threadId: r.threadId,
+            })),
+        )
       : [];
     totalMessages += rows.length;
     chats.push({
@@ -157,7 +159,7 @@ export function gatherDayData(range: { from: number; to: number }, opts: GatherO
   chats.sort((a, b) => b.messageCount - a.messageCount);
 
   // ── member changes (dedupe across the window's sync rounds) ──
-  const rounds = memberSyncRoundsBetween(range.from, range.to);
+  const rounds = await memberSyncRoundsBetween(range.from, range.to);
   const joinedMap = new Map<string, string>();
   const leftMap = new Map<string, string>();
   let renamed = 0;
@@ -177,17 +179,19 @@ export function gatherDayData(range: { from: number; to: number }, opts: GatherO
   };
 
   // ── docs (title + reader count, privacy-safe) ──
-  const docs = docReaderDigestBetween(range.from, range.to);
+  const docs = await docReaderDigestBetween(range.from, range.to);
 
   // ── upcoming events with their latest in-window accepted count ──
-  const upcomingEvents = upcomingTrackedEventIds(range.to).map((ev) => {
-    const hist = calendarEventRsvpHistory(ev.eventId, range.from, range.to);
-    return {
-      title: ev.title,
-      accepted: hist.length ? hist[hist.length - 1]!.accepted : 0,
-      startTime: ev.startTime,
-    };
-  });
+  const upcomingEvents = await Promise.all(
+    (await upcomingTrackedEventIds(range.to)).map(async (ev) => {
+      const hist = await calendarEventRsvpHistory(ev.eventId, range.from, range.to);
+      return {
+        title: ev.title,
+        accepted: hist.length ? hist[hist.length - 1]!.accepted : 0,
+        startTime: ev.startTime,
+      };
+    }),
+  );
 
   return { range, contentTiers, chats, totalMessages, members, docs, upcomingEvents };
 }
@@ -395,7 +399,7 @@ export async function generateOpsNarrative(
   opts: NarrativeOptions = {},
 ): Promise<string | null> {
   const soul = opts.soul ?? 'tudigong';
-  const data = gatherDayData(range, {
+  const data = await gatherDayData(range, {
     contentTiers: opts.contentTiers,
     maxLinesPerChat: opts.maxLinesPerChat,
   });
